@@ -1,0 +1,82 @@
+name: News Alpha Radar (24/7 Free)
+
+on:
+  schedule:
+    # 평일 장전·정규장·장마감 직후 (월~금 07:00~17:59 KST): 15분마다 초고속 감지
+    - cron: "*/15 22-23 * * 0-4"
+    - cron: "*/15 0-8 * * 1-5"
+    # 평일 야간·새벽 및 주말: 1시간마다 해외/사건사고 감지 (Public 무제한, Private도 월 2,000분 이내)
+    - cron: "0 9-21 * * 1-5"
+    - cron: "0 22-23 * * 5"
+    - cron: "0 * * * 6"
+    - cron: "0 0-21 * * 0"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "실행 모드 (demo: 텔레그램 즉시 테스트 / live: 실제 실시간 뉴스 분석)"
+        required: true
+        default: "demo"
+        type: choice
+        options:
+          - demo
+          - live
+      dry_run:
+        description: "체크 시 텔레그램 발송 없이 로그에만 출력"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: news-alpha-radar
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore state and KRX cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: radar-state-${{ github.run_id }}
+          restore-keys: |
+            radar-state-
+
+      - name: Run News Alpha Radar
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MIN_CATALYST_SCORE: ${{ vars.MIN_CATALYST_SCORE || '7.5' }}
+          MAX_ALERTS_PER_RUN: ${{ vars.MAX_ALERTS_PER_RUN || '2' }}
+          MAX_DAILY_ALERTS: ${{ vars.MAX_DAILY_ALERTS || '10' }}
+          THEME_COOLDOWN_HOURS: ${{ vars.THEME_COOLDOWN_HOURS || '12' }}
+        run: |
+          mkdir -p data
+          MODE="${{ inputs.mode || 'live' }}"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ -z "$GEMINI_API_KEY" ]; then
+            echo "GEMINI_API_KEY Secret 등록 대기 중..."
+            exit 0
+          fi
+          EXTRA_ARGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            EXTRA_ARGS="--dry-run"
+          fi
+          python3 radar.py --mode "$MODE" $EXTRA_ARGS
+
+      - name: Save updated state and KRX cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: radar-state-${{ github.run_id }}
