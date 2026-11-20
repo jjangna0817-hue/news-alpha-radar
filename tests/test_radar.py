@@ -1156,9 +1156,119 @@ class TestPR3DedupTriggerDaemonAndDashboard(unittest.TestCase):
                         probe_res = json.loads(resp.read().decode("utf-8"))
                 self.assertTrue(probe_res["ok"])
                 self.assertEqual(len(probe_res["rows"]), 1)
+
+                # 7) POST /api/actions/self-update returns structured result
+                fake_upd = {"ok": True, "status": "UPDATED", "updated": True, "before": "50f0c0c", "after": "abc1234", "message": "업데이트 완료"}
+                with mock.patch.object(dashboard, "run_self_update", return_value=fake_upd):
+                    req_upd = urllib.request.Request(f"{base}/api/actions/self-update", data=b"{}", headers={"Authorization": auth_hdr, "Content-Type": "application/json"}, method="POST")
+                    with urllib.request.urlopen(req_upd, timeout=5) as resp:
+                        upd_res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(upd_res["ok"])
+                self.assertTrue(upd_res["updated"])
+                self.assertEqual(upd_res["after"], "abc1234")
             finally:
                 srv.shutdown()
                 srv.server_close()
+
+
+class TestRealtimeCallbackFlashAndSelfUpdate(unittest.TestCase):
+    def test_telegram_listener_parsing_spam_filter_and_inbox_enqueue(self) -> None:
+        import telegram_listener
+
+        ch = telegram_listener.parse_channel_list("@Yonhap_News, https://t.me/fast_kr/123\nt.me/AlphaFeed?foo=1\nyonhap_news")
+        self.assertEqual(ch, ["Yonhap_News", "fast_kr", "AlphaFeed"])
+
+        now = datetime(2026, 11, 20, 10, 0, tzinfo=KST)
+        # Spam & too-short messages filtered
+        self.assertIsNone(telegram_listener.extract_message_payload("[광고] 무료리딩방 급등주 추천인 코드", "스팸채널", 1, now=now))
+        self.assertIsNone(telegram_listener.extract_message_payload("짧음", "속보", 2, now=now))
+
+        # Valid breaking message with embedded URL
+        ev = telegram_listener.extract_message_payload(
+            "**[속보] 대형 통신사 네트워크 해킹 피해 확산**\n정부 긴급 조사 착수 https://yna.co.kr/view/123",
+            "연합속보",
+            42,
+            channel_username="yonhap_news",
+            now=now,
+        )
+        assert ev is not None
+        self.assertEqual(ev["priority"], 0)
+        self.assertEqual(ev["url"], "https://yna.co.kr/view/123")
+        self.assertIn("대형 통신사 네트워크 해킹 피해 확산", ev["title"])
+        self.assertEqual(ev["source"], "텔레그램_연합속보")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            written = telegram_listener.enqueue_inbox_event(tmp_dir, ev)
+            self.assertTrue(written.exists())
+            self.assertEqual((tmp_dir / "trigger_now").read_text(encoding="utf-8"), "inbox")
+            drained = radar.ingest_inbox_events(tmp_dir, now=now)
+            self.assertEqual(len(drained), 1)
+            self.assertEqual(drained[0].priority, 0)
+            self.assertFalse(written.exists())  # consumed!
+
+    def test_inbox_fastpath_bypasses_rss_and_sends_two_stage_flash_then_deep(self) -> None:
+        import telegram_listener
+
+        t0 = datetime(2026, 11, 20, 10, 0, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            # Pre-seed last_stage1_at 1 minute ago so normal waiting batch would NOT fire
+            st = radar.StateStore(tmp_dir / "state.json")
+            st.last_stage1_at = (t0 - timedelta(minutes=1)).isoformat()
+            st.save(now=t0)
+
+            ev = telegram_listener.extract_message_payload(
+                "신규 차세대 위성통신 국산화 프로젝트 정부 본사업 확정 https://ex.com/sat",
+                "속보봇",
+                77,
+                now=t0,
+            )
+            assert ev is not None
+            telegram_listener.enqueue_inbox_event(tmp_dir, ev)
+
+            sent_msgs: list[str] = []
+
+            def fake_gemini(api_key, models, sp, up, **kw):
+                if sp == radar.SCREENING_PROMPT:
+                    cls = json.loads(up)["clusters"]
+                    return {
+                        "selected_events": [{
+                            "cluster_id": cls[0]["cluster_id"],
+                            "catalyst_score": 8.6,
+                            "theme_key": "위성통신_국산화",
+                            "event_summary": "정부가 위성통신 국산화 본사업을 확정했습니다.",
+                            "why_notable": "보안·전파탐지 및 위성 단말 장비 2차 수혜 기대",
+                            "first_order_keywords": ["위성"],
+                            "second_order_keywords": ["전파탐지"],
+                        }]
+                    }, "gemini-3.5-flash-lite"
+                return {
+                    "title": "위성통신 국산화 본사업 확정 → 전파·보안장비 2차 수혜",
+                    "event_summary": "정부 본사업 확정",
+                    "stocks": [{"code": "446840", "name": "지슨", "direction": "상승수혜"}],
+                }, "gemini-3.6-flash"
+
+            env = {"GEMINI_API_KEY": "k", "TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.object(radar, "fetch_rss_news", side_effect=AssertionError("inbox_only must skip RSS")),
+                mock.patch.object(radar, "call_gemini", side_effect=fake_gemini),
+                mock.patch.object(radar, "load_krx_master", return_value={c["code"]: dict(c) for c in radar.SEED_COMPANIES}),
+                mock.patch.object(radar, "fetch_naver_quotes", return_value={}),
+                mock.patch.object(radar, "send_telegram", side_effect=lambda t, c, m, start_chunk=0: sent_msgs.append(m) or 1),
+            ):
+                radar.run_live(dry_run=False, cycles=1, data_dir=tmp_dir, now_fn=lambda: t0, daemon_mode=True, inbox_only=True)
+
+            # 2-stage push: 1st message is ⚡ [속보 1보], 2nd message is 🚨 [이슈 레이더] deep report!
+            self.assertEqual(len(sent_msgs), 2)
+            self.assertIn("⚡ <b>[속보 1보]", sent_msgs[0])
+            self.assertIn("🚨 <b>[이슈 레이더]", sent_msgs[1])
+            self.assertIn("지슨", sent_msgs[1])
+
+            recs = [json.loads(l) for l in (tmp_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertTrue(any(r["type"] == "trigger_decision" and r["reason"] == "realtime_callback_inbox" for r in recs))
+            self.assertTrue(any(r["type"] == "flash_alert_sent" for r in recs))
 
 
 if __name__ == "__main__":

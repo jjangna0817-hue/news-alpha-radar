@@ -13,7 +13,7 @@ fi
 "${PYTHON_BIN}" -c 'import sys; assert sys.version_info >= (3, 11), f"Python 3.11+ 필요 (현재 {sys.version})"'
 echo "[확인] Python: $(${PYTHON_BIN} --version)"
 
-mkdir -p "${REPO_DIR}/data"
+mkdir -p "${REPO_DIR}/data/inbox"
 
 if [ ! -f "${REPO_DIR}/.env" ]; then
   cp "${REPO_DIR}/.env.example" "${REPO_DIR}/.env"
@@ -32,11 +32,12 @@ if grep -q "여기에_" "${REPO_DIR}/.env"; then
 fi
 
 chmod 600 "${REPO_DIR}/.env"
+chmod +x "${SCRIPT_DIR}/update.sh" "${SCRIPT_DIR}/install.sh" || true
 
 UNIT_DIR="${HOME}/.config/systemd/user"
 mkdir -p "${UNIT_DIR}"
 
-for svc in news-alpha-radar.service news-alpha-dashboard.service; do
+for svc in news-alpha-radar.service news-alpha-dashboard.service news-alpha-updater.service news-alpha-updater.timer news-alpha-telegram.service; do
   sed \
     -e "s|__WORKDIR__|${REPO_DIR}|g" \
     -e "s|__PYTHON__|${PYTHON_BIN}|g" \
@@ -45,7 +46,26 @@ for svc in news-alpha-radar.service news-alpha-dashboard.service; do
 done
 
 systemctl --user daemon-reload
-systemctl --user enable --now news-alpha-radar.service news-alpha-dashboard.service
+systemctl --user enable --now news-alpha-radar.service news-alpha-dashboard.service news-alpha-updater.timer
+
+# 선택 기능: TELEGRAM_API_ID & TELEGRAM_API_HASH가 설정되어 있으면 실시간 콜백용 .venv 준비
+TG_API_ID="$(grep -E '^TELEGRAM_API_ID=' "${REPO_DIR}/.env" | tail -n 1 | cut -d= -f2- | tr -d ' "\r' || true)"
+TG_API_HASH="$(grep -E '^TELEGRAM_API_HASH=' "${REPO_DIR}/.env" | tail -n 1 | cut -d= -f2- | tr -d ' "\r' || true)"
+TG_STATE="미설정 (.env에 TELEGRAM_API_ID/HASH 입력 시 활성화)"
+
+if [ -n "${TG_API_ID}" ] && [ -n "${TG_API_HASH}" ]; then
+  echo "[설치] 텔레그램 0초 콜백용 가상환경(.venv) 및 telethon 설치 중..."
+  if [ ! -x "${REPO_DIR}/.venv/bin/python" ]; then
+    "${PYTHON_BIN}" -m venv "${REPO_DIR}/.venv"
+  fi
+  "${REPO_DIR}/.venv/bin/pip" install --quiet -r "${REPO_DIR}/requirements-realtime.txt"
+  if [ -f "${REPO_DIR}/data/telegram_user.session" ]; then
+    systemctl --user enable --now news-alpha-telegram.service
+    TG_STATE="가동 중 (0초 콜백 활성)"
+  else
+    TG_STATE="1회 로그인 대기 중 -> 아래 명령 실행 필요"
+  fi
+fi
 
 if command -v loginctl >/dev/null 2>&1; then
   loginctl enable-linger "${USER}" 2>/dev/null || \
@@ -58,14 +78,19 @@ LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo '127.0.0.1')"
 
 echo ""
 echo "============================================================"
-echo " News Alpha Radar 상시 서버 + 웹 대시보드 가동 완료!"
+echo " News Alpha Radar 상시 서버 + 웹 대시보드 + 자동 업데이트 완료!"
 echo "============================================================"
-echo " • 로컬 대시보드 : http://127.0.0.1:${PORT}"
-echo " • 집 Wi-Fi 접속 : http://${LAN_IP}:${PORT}"
-echo " • 상태 확인     : systemctl --user status news-alpha-radar news-alpha-dashboard"
-echo " • 실시간 로그   : journalctl --user -u news-alpha-radar -f"
+echo " • 로컬 대시보드   : http://127.0.0.1:${PORT}"
+echo " • 맥북/폰 접속    : http://${LAN_IP}:${PORT}"
+echo " • GitHub 자동반영 : 2분마다 main 체크 (news-alpha-updater.timer 활성)"
+echo " • 텔레그램 콜백   : ${TG_STATE}"
+if [ -n "${TG_API_ID}" ] && [ -n "${TG_API_HASH}" ] && [ ! -f "${REPO_DIR}/data/telegram_user.session" ]; then
+  echo ""
+  echo " [텔레그램 콜백 최초 1회 로그인 명령]"
+  echo "   cd ${REPO_DIR} && .venv/bin/python telegram_listener.py --login"
+  echo "   systemctl --user enable --now news-alpha-telegram.service"
+fi
 echo ""
-echo "[필수 체크 2가지]"
-echo " 1) 노트북 덮개 닫아도 유지: docs/UBUNTU_SERVER_GUIDE.md 참고"
-echo " 2) 중복 알림 방지: 정상 작동 확인 후 GitHub Actions 워크플로 Disable"
+echo " • 상태 확인       : systemctl --user status news-alpha-radar news-alpha-dashboard news-alpha-updater.timer"
+echo " • 실시간 로그     : journalctl --user -u news-alpha-radar -f"
 echo "============================================================"

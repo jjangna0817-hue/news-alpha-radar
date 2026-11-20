@@ -1,110 +1,109 @@
-# News Alpha Radar — 우분투 노트북 24/7 상시 서버 설치 가이드
+# News Alpha Radar — 우분투 노트북 24/7 상시 서버 & 맥북 원격 개발 가이드
 
-남는 우분투 노트북 1대로 **장중 1분 단위 초실시간 감시 + 자체 관리 웹 대시보드**를 추가 비용 0원으로 운영하는 방법입니다.
+남는 우분투 노트북 1대로 **텔레그램 속보 0초 실시간 콜백 + 2단 초고속 1보 푸시(3~5초) + 백업 RSS 60초 감시 + 자체 관리 웹 대시보드 + GitHub 자동 업데이트**를 추가 비용 0원으로 운영하는 방법입니다.
 
 ---
 
-## 1. 5분 만에 설치 및 실행
-
-우분투 터미널을 열고 아래 명령을 순서대로 실행합니다.
+## 1. 최초 1회 설치 (우분투 노트북)
 
 ```bash
-# 1) 저장소 받기 (이미 있으면 git pull)
+# 1) 저장소 받기 (이미 있으면 cd news-alpha-radar && git pull)
 git clone https://github.com/jjangna0817-hue/news-alpha-radar.git
 cd news-alpha-radar
 
-# 2) 최초 1회 실행 (.env 파일 자동 생성)
+# 2) 최초 실행 (.env 파일 자동 생성)
 bash deploy/ubuntu/install.sh
 
-# 3) API 키·텔레그램 정보·대시보드 비밀번호 입력
+# 3) API 키·텔레그램 정보 입력 (저장: Ctrl+O -> Enter -> Ctrl+X)
 nano .env
-```
 
-`.env`에서 아래 3가지를 입력하고 저장(`Ctrl+O` → `Enter` → `Ctrl+X`)합니다.
-- `GEMINI_API_KEY` (Google AI Studio API 키)
-- `TELEGRAM_BOT_TOKEN` (텔레그램 봇 토큰)
-- `TELEGRAM_CHAT_ID` (텔레그램 채팅 ID)
-- *(선택)* `DASHBOARD_PASSWORD` (외부 스마트폰 접속을 쓸 경우 반드시 비밀번호 설정!)
-
-```bash
-# 4) 상시 데몬 + 웹 대시보드 자동 등록 및 가동
+# 4) 상시 데몬 + 웹 대시보드 + 2분 자동 업데이트 타이머 일괄 등록
 bash deploy/ubuntu/install.sh
 ```
 
-설치가 끝나면 브라우저에서 아래 주소로 접속할 수 있습니다.
-- 노트북 본인: `http://127.0.0.1:8787`
-- 같은 집 Wi-Fi의 스마트폰/PC: `http://<노트북_IP>:8787` *(설치 완료 화면에 주소 자동 표시)*
+> **맥북/스마트폰에서 대시보드 접속 시 방화벽 허용 (최초 1회)**:
+> ```bash
+> sudo ufw allow 8787/tcp
+> echo "http://$(hostname -I | awk '{print $1}'):8787"
+> ```
 
 ---
 
-## 2. 노트북 24시간 운영 필수 설정
+## 2. 텔레그램 0초 실시간 콜백 활성화 (최초 1회 로그인)
 
-### ① 덮개를 닫아도 꺼지지 않게 설정
+일반 뉴스 RSS(1~3분 지연)보다 훨씬 빠르게, **텔레그램 공개 속보 채널에 메시지가 뜨는 그 순간(0초 콜백)** 받아서 **3~5초 내 1보 속보 푸시 → 15초 뒤 2보 심층 리포트**를 보냅니다.
+
+1. **무료 API 발급 (1분)**: https://my.telegram.org 로그인 → **API development tools** → 앱 이름 아무거나 입력 → **`App api_id`**(숫자)와 **`App api_hash`**(문자열) 복사
+2. **`.env`에 추가**:
+   ```bash
+   nano ~/news-alpha-radar/.env
+   ```
+   ```env
+   TELEGRAM_API_ID=12345678
+   TELEGRAM_API_HASH=여기에_api_hash_입력
+   TELEGRAM_SOURCE_CHANNELS=@구독할_속보채널1,@구독할_속보채널2
+   INSTANT_FLASH_ALERT=true
+   ```
+   *(구독할 채널은 나중에 맥북 웹 대시보드 → `운영 설정` 탭에서 언제든 추가/삭제할 수 있습니다.)*
+3. **가상환경 설치 및 최초 1회 로그인**:
+   ```bash
+   cd ~/news-alpha-radar
+   bash deploy/ubuntu/install.sh
+   .venv/bin/python telegram_listener.py --login
+   # -> 휴대폰 번호(+8210...) + 텔레그램 앱으로 온 인증코드 입력 (딱 1번!)
+   systemctl --user enable --now news-alpha-telegram.service
+   ```
+   이후에는 웹 대시보드 상단에 초록색 **`0초 콜백 · N채널`** 배지가 뜹니다!
+
+---
+
+## 3. 맥북에서 작업하고 우분투 손 안 대고 자동 반영하기
+
+`install.sh`를 한 번 실행하면 **`news-alpha-updater.timer`** 가 자동으로 켜집니다.
+
+- **자동 반영 (무조작)**: 맥북에서 수정 후 GitHub `main`에 머지/푸시하면 **최대 2분 이내**에 우분투가 자동으로:
+  1. `git pull --ff-only origin main`
+  2. 오프라인 단위 테스트(`unittest`) 통과 여부 검증 *(실패 시 자동 롤백!)*
+  3. 데몬·콜백 리스너·웹 대시보드 자동 재시작
+- **즉시 반영 (원클릭)**: 2분도 기다리기 싫을 때는 맥북 브라우저에서 웹 대시보드 오른쪽 위 **`최신 코드 업데이트`** 버튼만 클릭하면 바로 반영됩니다.
+
+---
+
+## 4. 노트북 24시간 운영 설정 (절전·덮개·재부팅)
+
 ```bash
-sudo nano /etc/systemd/logind.conf
-```
-아래 두 줄의 앞 `#`을 지우고 값을 `ignore`로 바꾼 뒤 저장합니다.
-```ini
+# 1) 절전 모드 끄기
+sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+
+# 2) 덮개 닫아도 꺼지지 않게 설정
+sudo mkdir -p /etc/systemd/logind.conf.d
+sudo tee /etc/systemd/logind.conf.d/99-ignore-lid.conf <<'EOF'
+[Login]
 HandleLidSwitch=ignore
 HandleLidSwitchExternalPower=ignore
-```
-적용:
-```bash
-sudo systemctl restart systemd-logind
-```
+HandleLidSwitchDocked=ignore
+EOF
 
-### ② 재부팅 후 로그인 안 해도 자동 실행되게 설정
-```bash
+# 3) 재부팅 후 로그인 안 해도 자동 시작
 sudo loginctl enable-linger "$USER"
 ```
 
-### ③ 배터리 수명 보호 (중요!)
-24시간 충전기를 꽂아두면 배터리가 부풀 수 있습니다.
-- 노트북 BIOS 설정(또는 TLP/제조사 도구)에서 **배터리 충전 상한을 60~80%** 로 제한하는 것을 권장합니다.
+---
+
+## 5. 중복 알림 방지 — GitHub Actions 예약 끄기
+
+우분투 노트북에서 정상 가동이 확인되면:
+- GitHub 저장소 → **Actions** → **News Alpha Radar (24/7 Free)** → 오른쪽 위 **`...`** → **Disable workflow**
 
 ---
 
-## 3. 중복 알림 방지 — GitHub Actions 자동 예약 끄기
-
-노트북 대시보드에서 **`텔레그램 테스트`** 와 **`지금 즉시 스캔`** 이 정상 동작하는 것을 확인했다면, 기존 GitHub Actions와 중복 알림이 오지 않도록 Actions 예약 실행만 꺼두세요.
-
-1. GitHub 저장소 상단 **Actions** 탭 클릭
-2. 왼쪽 목록에서 **News Alpha Radar (24/7 Free)** 클릭
-3. 오른쪽 위 **`...`** 버튼 클릭 → **Disable workflow** 선택
-
-*(언제든 노트북을 끄고 싶을 때 같은 자리에서 **Enable workflow**를 누르면 바로 GitHub Actions로 복귀할 수 있습니다.)*
-
----
-
-## 4. (선택) 밖에서 스마트폰으로 대시보드 접속하기 — Cloudflare Tunnel (무료)
-
-공유기 포트포워딩 없이 안전하게 HTTPS로 접속하는 가장 쉬운 방법입니다.
-
-1. 먼저 `.env`에 `DASHBOARD_PASSWORD=안전한비밀번호`를 넣고 대시보드를 재시작합니다:
-   ```bash
-   systemctl --user restart news-alpha-dashboard
-   ```
-2. `cloudflared` 설치 후 터널 실행:
-   ```bash
-   # 빠른 임시 테스트 URL 발급 (계정 불필요)
-   cloudflared tunnel --url http://127.0.0.1:8787
-   ```
-   *(고정 도메인이 필요하면 Cloudflare Zero Trust 무료 계정에서 Tunnel을 생성해 서비스로 등록하면 됩니다.)*
-
----
-
-## 5. 자주 쓰는 운영 명령어
+## 6. 자주 쓰는 확인 명령어
 
 ```bash
-# 실행 상태 확인
-systemctl --user status news-alpha-radar news-alpha-dashboard
+# 전체 서비스 상태 확인
+systemctl --user status news-alpha-radar news-alpha-dashboard news-alpha-telegram news-alpha-updater.timer --no-pager
 
-# 레이더 실시간 로그 보기 (종료: Ctrl+C)
+# 레이더 / 텔레그램 콜백 실시간 로그
 journalctl --user -u news-alpha-radar -f
-
-# 최신 코드 업데이트 후 재시작
-cd ~/news-alpha-radar && git pull && systemctl --user restart news-alpha-radar news-alpha-dashboard
-
-# 완전 중지
-systemctl --user stop news-alpha-radar news-alpha-dashboard
+journalctl --user -u news-alpha-telegram -f
 ```

@@ -1,0 +1,17 @@
+[Unit]
+Description=News Alpha Radar Telegram 0-Second Realtime Callback Listener
+After=network-online.target news-alpha-radar.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__WORKDIR__
+EnvironmentFile=-__WORKDIR__/.env
+ExecStart=__WORKDIR__/.venv/bin/python -u __WORKDIR__/telegram_listener.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

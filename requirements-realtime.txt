@@ -1,0 +1,3 @@
+# 우분투 상시 서버에서 텔레그램 실시간 속보 채널 콜백(telegram_listener.py)을 쓸 때만 설치하는 선택 패키지
+# radar.py / dashboard.py / GitHub Actions CI는 외부 패키지 0개(표준 라이브러리 전용)를 유지합니다.
+telethon>=1.36,<2
