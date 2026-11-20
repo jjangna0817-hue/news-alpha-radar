@@ -1,0 +1,11 @@
+[Unit]
+Description=Check GitHub main for News Alpha Radar updates every 2 minutes
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=2min
+Unit=news-alpha-updater.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

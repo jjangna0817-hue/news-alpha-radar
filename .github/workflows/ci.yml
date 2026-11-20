@@ -22,6 +22,6 @@ jobs:
 
       - name: Syntax check & unit tests (no secrets, offline mocked)
         run: |
-          python3 -m py_compile radar.py dashboard.py
-          bash -n deploy/ubuntu/install.sh
+          python3 -m py_compile radar.py dashboard.py telegram_listener.py
+          bash -n deploy/ubuntu/install.sh deploy/ubuntu/update.sh
           python3 -m unittest discover -s tests -v

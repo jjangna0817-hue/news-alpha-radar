@@ -1,0 +1,11 @@
+[Unit]
+Description=News Alpha Radar Auto-Updater (GitHub main sync)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__WORKDIR__
+ExecStart=/usr/bin/env bash __WORKDIR__/deploy/ubuntu/update.sh
+StandardOutput=journal
+StandardError=journal

@@ -1,8 +1,10 @@
-# 비밀 키 및 런타임 상태 파일 보호 (Public 저장소 노출 방지)
+# 비밀 키, 텔레그램 세션, 런타임 상태 파일 보호 (Public 저장소 노출 방지)
 .env
 .env.*
 !.env.example
 data/
+*.session
+*.session-journal
 __pycache__/
 *.py[cod]
 .venv/

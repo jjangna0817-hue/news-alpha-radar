@@ -18,6 +18,7 @@ import io
 import json
 import logging
 import os
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import radar
+import telegram_listener
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,6 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("news_alpha_dashboard")
 
+REPO_DIR = Path(__file__).resolve().parent
 DEFAULT_DASHBOARD_HOST = "0.0.0.0"
 DEFAULT_DASHBOARD_PORT = 8787
 MAX_REQUEST_BODY_BYTES = 64 * 1024
@@ -60,8 +63,21 @@ def _effective_config(data_dir: Path) -> dict[str, Any]:
     if trigger_mode not in ("shadow", "enforce"):
         trigger_mode = "enforce"
 
+    if raw.get("instant_flash_alert") is not None:
+        instant_flash = bool(raw["instant_flash_alert"])
+    else:
+        fe = (os.getenv("INSTANT_FLASH_ALERT") or "true").strip().lower()
+        instant_flash = fe not in ("0", "false", "no", "off")
+
+    if isinstance(raw.get("telegram_source_channels"), list):
+        tg_channels = telegram_listener.parse_channel_list(raw["telegram_source_channels"])
+    else:
+        tg_channels = telegram_listener.parse_channel_list(os.getenv("TELEGRAM_SOURCE_CHANNELS", ""))
+
     return {
         "paused": bool(raw.get("paused", False)),
+        "instant_flash_alert": instant_flash,
+        "telegram_source_channels": tg_channels,
         "min_catalyst_score": float(
             raw["min_catalyst_score"]
             if raw.get("min_catalyst_score") is not None
@@ -132,11 +148,102 @@ def _read_status(data_dir: Path, now: datetime) -> dict[str, Any]:
     return st
 
 
+def _read_listener_status(data_dir: Path, now: datetime) -> dict[str, Any]:
+    path = data_dir / "listener_status.json"
+    if not path.exists():
+        return {"state": "offline", "alive": False, "channels": [], "received_count": 0}
+    try:
+        st = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(st, dict):
+            return {"state": "offline", "alive": False, "channels": [], "received_count": 0}
+    except Exception:
+        return {"state": "offline", "alive": False, "channels": [], "received_count": 0}
+
+    hb = radar.parse_iso_kst(st.get("heartbeat_at"))
+    age_sec = int((now - hb).total_seconds()) if hb is not None else 999999
+    alive = st.get("state") in ("running", "waiting_channels") and age_sec <= 90
+    st["heartbeat_age_sec"] = age_sec if hb is not None else None
+    st["alive"] = alive
+    if not alive and st.get("state") not in ("stopped", "needs_login"):
+        st["state"] = "offline"
+    return st
+
+
+def _read_git_version(repo_dir: Path = REPO_DIR) -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            ["git", "log", "-1", "--format=%h|%s|%ci"],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return {}
+        parts = proc.stdout.strip().split("|", 2)
+        return {
+            "commit": parts[0] if len(parts) > 0 else "",
+            "subject": parts[1][:80] if len(parts) > 1 else "",
+            "date": parts[2] if len(parts) > 2 else "",
+        }
+    except Exception:
+        return {}
+
+
+def run_self_update(repo_dir: Path = REPO_DIR) -> dict[str, Any]:
+    """deploy/ubuntu/update.sh --defer-dashboard 실행 결과를 구조화된 JSON으로 반환."""
+    script = repo_dir / "deploy" / "ubuntu" / "update.sh"
+    if not script.exists():
+        return {"ok": False, "status": "MISSING_SCRIPT", "message": "update.sh 스크립트를 찾을 수 없습니다."}
+    try:
+        proc = subprocess.run(
+            ["bash", str(script), "--defer-dashboard"],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except Exception as exc:
+        return {"ok": False, "status": "ERROR", "message": str(exc)}
+
+    kv: dict[str, str] = {}
+    for line in (proc.stdout or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            kv[k.strip()] = v.strip()
+
+    status = kv.get("STATUS") or ("OK" if proc.returncode == 0 else "ERROR")
+    if status == "UP_TO_DATE":
+        msg = f"이미 최신 버전({kv.get('COMMIT', '')})입니다."
+    elif status == "UPDATED":
+        msg = f"업데이트 완료 ({kv.get('BEFORE', '')} → {kv.get('AFTER', '')}). 서비스가 1초 뒤 자동 재시작됩니다."
+    elif status == "DIRTY_SKIP":
+        msg = "우분투 로컬 파일에 미커밋 변경이 있어 업데이트를 건너뛰었습니다."
+    elif status == "ROLLBACK":
+        msg = "테스트 실패로 이전 버전으로 자동 롤백했습니다."
+    elif status == "BUSY":
+        msg = "이미 다른 업데이트 작업이 진행 중입니다."
+    else:
+        msg = (proc.stderr or proc.stdout or f"exit={proc.returncode}").strip()[:200]
+
+    return {
+        "ok": proc.returncode == 0 and status not in ("ROLLBACK", "ERROR"),
+        "status": status,
+        "updated": status == "UPDATED",
+        "before": kv.get("BEFORE") or kv.get("COMMIT"),
+        "after": kv.get("AFTER") or kv.get("COMMIT"),
+        "message": msg,
+    }
+
+
 def build_overview_payload(data_dir: Path, now: datetime | None = None) -> dict[str, Any]:
     ref = radar.StateStore._now_kst(now)
     cfg = _effective_config(data_dir)
     state = radar.StateStore(data_dir / "state.json")
     daemon_status = _read_status(data_dir, ref)
+    listener_status = _read_listener_status(data_dir, ref)
     poll_sec, window_label = radar.resolve_daemon_interval_sec(now=ref, runtime_cfg=cfg)
 
     pt_today = radar.pt_date_str(ref)
@@ -204,7 +311,9 @@ def build_overview_payload(data_dir: Path, now: datetime | None = None) -> dict[
     return {
         "now_kst": ref.isoformat(),
         "pt_date": pt_today,
+        "git": _read_git_version(),
         "daemon": daemon_status,
+        "listener": listener_status,
         "config": cfg,
         "metrics": {
             "sent_today": state.sent_today(now=ref),
@@ -257,6 +366,13 @@ def validate_and_merge_config(data_dir: Path, patch: dict[str, Any]) -> dict[str
     cur = _effective_config(data_dir)
     if "paused" in patch:
         cur["paused"] = bool(patch["paused"])
+    if "instant_flash_alert" in patch:
+        cur["instant_flash_alert"] = bool(patch["instant_flash_alert"])
+    if "telegram_source_channels" in patch:
+        raw_ch = patch["telegram_source_channels"]
+        if not isinstance(raw_ch, (list, str)):
+            raise ValueError("telegram_source_channels는 문자열 또는 배열이어야 합니다.")
+        cur["telegram_source_channels"] = telegram_listener.parse_channel_list(raw_ch)
     if "min_catalyst_score" in patch:
         val = float(patch["min_catalyst_score"])
         cur["min_catalyst_score"] = round(max(1.0, min(10.0, val)), 1)
@@ -664,7 +780,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     .field input[type="number"],
-    .field select {
+    .field select,
+    .field textarea {
       width: 100%;
       padding: 9px 11px;
       border: 1px solid var(--border-strong);
@@ -676,7 +793,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       font-variant-numeric: tabular-nums;
     }
 
-    .field input:focus, .field select:focus {
+    .field textarea {
+      min-height: 78px;
+      resize: vertical;
+      line-height: 1.45;
+    }
+
+    .field input:focus, .field select:focus, .field textarea:focus {
       outline: 2px solid var(--accent-soft);
       border-color: var(--accent);
     }
@@ -780,11 +903,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="brand">
         <h1>News Alpha Radar</h1>
         <span id="daemon-chip" class="status-chip"><span class="status-dot"></span><span id="daemon-label">연결 중...</span></span>
+        <span id="listener-chip" class="status-chip"><span class="status-dot"></span><span id="listener-label">콜백 확인 중</span></span>
       </div>
       <div class="actions">
         <button id="btn-scan-now" class="primary" type="button">지금 즉시 스캔</button>
         <button id="btn-toggle-pause" type="button">일시정지</button>
         <button id="btn-demo-alert" type="button">텔레그램 테스트</button>
+        <button id="btn-self-update" type="button">최신 코드 업데이트</button>
         <button id="btn-refresh" type="button">새로고침</button>
       </div>
     </div>
@@ -882,15 +1007,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <label for="cfg-rpd-limit">Stage 1 일일 RPD 기준 한도 (70%/80%/90% 자동 절전)</label>
               <input id="cfg-rpd-limit" type="number" step="10" min="10" max="10000" />
             </div>
+            <div class="field">
+              <label for="cfg-flash-alert">2단 초고속 1보 푸시 (3초 내 1보 → 15초 뒤 2보 심층)</label>
+              <select id="cfg-flash-alert">
+                <option value="true">켜짐 — Stage 1 통과 즉시 1보 속보 먼저 푸시 (추천)</option>
+                <option value="false">꺼짐 — Stage 2 심층 리포트만 1회 발송</option>
+              </select>
+            </div>
           </div>
 
           <div class="card">
             <div class="section-head">
-              <h2>적응형 감시 주기 &amp; 활성 RSS 피드</h2>
-              <span class="muted">체크한 피드만 병렬 수집</span>
+              <h2>0초 텔레그램 콜백 &amp; 백업 RSS 주기</h2>
+              <span class="muted">채널 저장 시 20초 내 리스너에 자동 반영</span>
             </div>
             <div class="field">
-              <label for="cfg-int-market">정규장/장전 (08:00~15:30) 주기 (초)</label>
+              <label for="cfg-tg-channels">구독할 텔레그램 속보 채널 (@아이디 또는 t.me 링크, 줄바꿈·쉼표 구분)</label>
+              <textarea id="cfg-tg-channels" placeholder="예:&#10;@yonhap_news&#10;https://t.me/some_breaking_channel"></textarea>
+            </div>
+            <div class="field">
+              <label for="cfg-int-market">정규장/장전 (08:00~15:30) 백업 RSS 주기 (초)</label>
               <input id="cfg-int-market" type="number" step="5" min="15" max="600" />
             </div>
             <div class="field">
@@ -967,6 +1103,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div style="display:flex; gap:8px; align-items:center;">
             <select id="trace-filter" style="padding:6px 10px; border:1px solid var(--border-strong); border-radius:8px; font-size:12.5px;">
               <option value="all">전체 이벤트</option>
+              <option value="flash_alert_sent">초고속 1보 푸시</option>
               <option value="cycle_summary">사이클 요약</option>
               <option value="trigger_decision">PR-3 트리거 판정</option>
               <option value="dedup_decision">PR-3 중복 판정</option>
@@ -1032,6 +1169,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function renderOverview(data) {
       latestOverview = data;
       const d = data.daemon || {};
+      const l = data.listener || {};
+      const g = data.git || {};
       const m = data.metrics || {};
       const cfg = data.config || {};
 
@@ -1046,6 +1185,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         label.textContent = "일시 오류 복구 대기";
       } else {
         label.textContent = "데몬 오프라인";
+      }
+
+      const lChip = document.getElementById("listener-chip");
+      const lLabel = document.getElementById("listener-label");
+      if (l.alive && l.state === "running") {
+        lChip.className = "status-chip running";
+        lLabel.textContent = "0초 콜백 · " + (l.connected_count || (l.channels || []).length) + "채널 (수신 " + (l.received_count || 0) + ")";
+      } else if (l.alive && l.state === "waiting_channels") {
+        lChip.className = "status-chip paused";
+        lLabel.textContent = "콜백 대기 (채널 미지정)";
+      } else if (l.state === "needs_login") {
+        lChip.className = "status-chip paused";
+        lLabel.textContent = "콜백 1회 로그인 필요";
+      } else {
+        lChip.className = "status-chip";
+        lLabel.textContent = "콜백 미연결 (RSS 전용)";
+      }
+
+      const updBtn = document.getElementById("btn-self-update");
+      if (g.commit) {
+        updBtn.title = "현재 버전: " + g.commit + " — " + (g.subject || "");
       }
 
       const pauseBtn = document.getElementById("btn-toggle-pause");
@@ -1210,6 +1370,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById("cfg-dedup-mode").value = cfg.dedup_mode;
       document.getElementById("cfg-trigger-mode").value = cfg.trigger_mode;
       document.getElementById("cfg-rpd-limit").value = cfg.stage1_daily_rpd_limit;
+      document.getElementById("cfg-flash-alert").value = cfg.instant_flash_alert ? "true" : "false";
+      document.getElementById("cfg-tg-channels").value = (cfg.telegram_source_channels || []).join("\\n");
       document.getElementById("cfg-int-market").value = cfg.daemon_interval_market_sec;
       document.getElementById("cfg-int-ext").value = cfg.daemon_interval_extended_sec;
       document.getElementById("cfg-int-off").value = cfg.daemon_interval_offhours_sec;
@@ -1268,7 +1430,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           tdType.appendChild(b);
 
           const tdDesc = document.createElement("td");
-          if (r.type === "cycle_summary") {
+          if (r.type === "flash_alert_sent") {
+            tdDesc.textContent = "⚡ 1보 속보 발송 · " + (r.headline || r.theme_key || "") + " (촉매 " + Number(r.catalyst_score || 0).toFixed(1) + ")";
+          } else if (r.type === "cycle_summary") {
             tdDesc.textContent = "신규 " + (r.fresh_count || 0) + "건 · 클러스터 " + (r.cluster_count || 0) + " · 발송 " + (r.alerts_sent || 0) + "건 · pending " + (r.pending_remaining ?? "-") + (r.note ? " (" + r.note + ")" : "");
           } else if (r.type === "trigger_decision") {
             tdDesc.textContent = "[" + r.mode + "] 실행=" + r.executed + " · 사유=" + r.reason + " · tier=" + r.rpd_tier + " · RPD " + r.rpd_used + "/" + r.rpd_limit + " · pending=" + r.pending_count;
@@ -1312,6 +1476,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         dedup_mode: document.getElementById("cfg-dedup-mode").value,
         trigger_mode: document.getElementById("cfg-trigger-mode").value,
         stage1_daily_rpd_limit: parseInt(document.getElementById("cfg-rpd-limit").value, 10),
+        instant_flash_alert: document.getElementById("cfg-flash-alert").value === "true",
+        telegram_source_channels: document.getElementById("cfg-tg-channels").value,
         daemon_interval_market_sec: parseInt(document.getElementById("cfg-int-market").value, 10),
         daemon_interval_extended_sec: parseInt(document.getElementById("cfg-int-ext").value, 10),
         daemon_interval_offhours_sec: parseInt(document.getElementById("cfg-int-off").value, 10),
@@ -1363,6 +1529,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         toast("테스트 발송 실패: " + err.message);
       } finally {
         btn.disabled = false;
+      }
+    });
+
+    document.getElementById("btn-self-update").addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      btn.textContent = "업데이트 확인 중...";
+      try {
+        const res = await api("/api/actions/self-update", { method: "POST", body: "{}" });
+        toast(res.message || "업데이트 확인 완료");
+        if (res.updated) {
+          setTimeout(() => window.location.reload(), 3500);
+        }
+      } catch (err) {
+        toast("업데이트 실패: " + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "최신 코드 업데이트";
       }
     });
 
@@ -1581,6 +1765,12 @@ def create_dashboard_server(
                     self._send_json({"ok": True, "checked_at": datetime.now(radar.KST).isoformat(), "rows": rows})
                 except Exception as exc:
                     self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
+            if path == "/api/actions/self-update":
+                res = run_self_update()
+                status = HTTPStatus.OK if res.get("ok") else HTTPStatus.INTERNAL_SERVER_ERROR
+                self._send_json(res, status)
                 return
 
             self._send_json({"error": "Not Found"}, HTTPStatus.NOT_FOUND)

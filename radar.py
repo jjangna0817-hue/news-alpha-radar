@@ -1130,6 +1130,8 @@ def evaluate_stage1_trigger(
             if cl_soft and len(outlets) >= 2:
                 has_soft_plus_multi_outlet = True
 
+    has_realtime_inbox = any(it.priority == 0 for it in pending_items)
+
     should_run = False
     reason = "waiting_batch_or_trigger"
 
@@ -1139,6 +1141,9 @@ def evaluate_stage1_trigger(
     elif rpd_tier == "h_only":
         should_run = False
         reason = "rpd_90_h_only_guard"
+    elif has_realtime_inbox:
+        should_run = True
+        reason = "realtime_callback_inbox"
     elif best_soft_in_cluster >= 2 and rpd_tier in ("normal", "caution"):
         should_run = True
         reason = "soft_keywords_2plus"
@@ -1165,6 +1170,7 @@ def evaluate_stage1_trigger(
         "hard_hits": hard_hits[:5],
         "soft_hits": soft_hits_all[:5],
         "max_outlets": max_non_pol_outlets,
+        "has_realtime_inbox": has_realtime_inbox,
         "pending_count": len(pending_items),
         "elapsed_min": round(elapsed_min, 1) if elapsed_min is not None else None,
         "batch_threshold": batch_th,
@@ -1190,6 +1196,42 @@ def resolve_daemon_interval_sec(
         if (7, 0) <= hm < (8, 0) or (15, 30) < hm < (21, 0):
             return ext_sec, "장전초/장후"
     return off_sec, "심야/주말"
+
+
+def ingest_inbox_events(data_dir: Path, now: datetime | None = None) -> list[NewsItem]:
+    """텔레그램 실시간 콜백 리스너 등이 data/inbox/*.json 에 적재한 속보 이벤트를 안전하게 수거."""
+    inbox_dir = data_dir / "inbox"
+    if not inbox_dir.exists():
+        return []
+    ref = StateStore._now_kst(now)
+    items: list[NewsItem] = []
+    for path in sorted(inbox_dir.glob("*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                title = strip_html(str(raw.get("title") or ""))
+                url = str(raw.get("url") or "").strip()
+                if title and url:
+                    items.append(
+                        NewsItem(
+                            title=title,
+                            url=url,
+                            source=str(raw.get("source") or "텔레그램_속보"),
+                            category=str(raw.get("category") or "속보"),
+                            published_at=str(raw.get("published_at") or ref.isoformat()),
+                            summary=strip_html(str(raw.get("summary") or ""))[:360],
+                            priority=int(raw.get("priority", 0)),
+                            first_seen=str(raw.get("first_seen") or ref.isoformat()),
+                        )
+                    )
+        except Exception as exc:
+            logger.warning("인박스 이벤트 파싱 스킵 (%s): %s", path.name, exc)
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return items
 
 
 def _fetch_single_feed(
@@ -1485,7 +1527,7 @@ def cluster_news_ranked(items: list[NewsItem], now: datetime | None = None) -> l
         age_min = max(0.0, (ref - newest).total_seconds() / 60.0) if newest is not None else 60.0
         recency_bonus = max(0.0, 2.0 - (age_min / 30.0))
         min_prio = min((i.priority for i in c.items), default=2)
-        priority_bonus = 0.6 if min_prio == 1 else 0.0
+        priority_bonus = 3.0 if min_prio == 0 else (0.6 if min_prio == 1 else 0.0)
         score = len(c.items) * 1.5 + recency_bonus + priority_bonus
         newest_epoch = newest.timestamp() if newest is not None else 0.0
         return (-round(score, 4), -newest_epoch)
@@ -1956,6 +1998,43 @@ def format_telegram_html(
     return "\n".join(lines)
 
 
+def format_flash_alert_html(
+    cluster: EventCluster,
+    cand: dict[str, Any],
+    *,
+    escalated: bool = False,
+    now: datetime | None = None,
+) -> str:
+    """Stage 1 통과 즉시 3초 내 1차 속보 푸시 HTML 메시지 생성 (2보 심층 리포트 직전 발송)."""
+    esc = lambda s: html.escape(str(s or ""), quote=False)
+    esc_a = lambda s: html.escape(str(s or ""), quote=True)
+    ref = StateStore._now_kst(now)
+    score = float(cand.get("catalyst_score", 0.0) or 0.0)
+    prefix = "[후속 속보 1보]" if escalated else "[속보 1보]"
+    summary = str(cand.get("event_summary") or cluster.headline)
+    why = str(cand.get("why_notable") or "").strip()
+    kws = [str(k) for k in (cand.get("second_order_keywords") or [])[:5] if str(k).strip()]
+
+    lines = [
+        f"⚡ <b>{prefix} {esc(cluster.headline)}</b>",
+        f"⭐ 촉매 점수: <b>{score:.1f}/10</b>  |  🕒 {ref.strftime('%H:%M:%S KST')}",
+        "",
+        f"📰 {esc(summary)}",
+    ]
+    if why:
+        lines.append(f"💡 <b>2차 파급 포인트</b>: {esc(why)}")
+    if kws:
+        lines.append(f"🎯 <b>추적 키워드</b>: {esc(', '.join(kws))}")
+    if cluster.items:
+        first = cluster.items[0]
+        lines.append(f"📎 <a href=\"{esc_a(first.url)}\">원문 보기</a> ({esc(first.source)})")
+    lines += [
+        "",
+        "<i>🔎 KRX 관련주 검증 및 실시간 시세 심층 리포트를 10~15초 내 이어서 발송합니다...</i>",
+    ]
+    return "\n".join(lines)
+
+
 class TelegramPartialSendError(RuntimeError):
     """텔레그램 청크 발송 중 실패 시 이미 전송된 청크 수를 함께 전달."""
 
@@ -2340,6 +2419,7 @@ def run_live(
     data_dir: Path | None = None,
     now_fn: Callable[[], datetime] | None = None,
     daemon_mode: bool = False,
+    inbox_only: bool = False,
 ) -> None:
     def _now() -> datetime:
         dt = now_fn() if now_fn is not None else datetime.now(KST)
@@ -2396,6 +2476,16 @@ def run_live(
             else _env_int("STAGE1_DAILY_RPD_LIMIT", DEFAULT_STAGE1_DAILY_RPD_LIMIT)
         ),
     )
+    if runtime_cfg.get("instant_flash_alert") is not None:
+        instant_flash_alert = bool(runtime_cfg["instant_flash_alert"])
+    else:
+        flash_env = (os.getenv("INSTANT_FLASH_ALERT") or "").strip().lower()
+        if flash_env in ("1", "true", "yes", "on"):
+            instant_flash_alert = True
+        elif flash_env in ("0", "false", "no", "off"):
+            instant_flash_alert = False
+        else:
+            instant_flash_alert = bool(daemon_mode)
     active_feeds = resolve_active_feeds(runtime_cfg, daemon_mode=daemon_mode)
 
     screen_models = [m.strip() for m in _env_str("GEMINI_SCREEN_MODELS", DEFAULT_SCREEN_MODELS).split(",") if m.strip()]
@@ -2727,12 +2817,33 @@ def run_live(
                     logger.info("%s Deferred 발송으로 알림 한도 도달 — 이번 사이클 RSS 수집을 생략합니다.", tag)
                     break
 
-                # 2) RSS 수집 → seen("수집함") + pending 큐 적재 + TTL 만료 처리
+                # 2) 실시간 콜백 인박스(data/inbox) + RSS 수집 → seen("수집함") + pending 큐 적재
                 fetch_now = _now()
-                if active_feeds is not None:
-                    fresh = fetch_rss_news(state, now=fetch_now, feeds=active_feeds)
-                else:
-                    fresh = fetch_rss_news(state, now=fetch_now)
+                inbox_raw = ingest_inbox_events(base_dir, now=fetch_now)
+                fresh: list[NewsItem] = []
+                batch_seen_keys: set[str] = set()
+                for item in inbox_raw:
+                    if any(p.search(item.title) for p in NOISE_PATTERNS):
+                        continue
+                    if state.is_seen(item.url, item.title) or state.is_evaluated(item.url, item.title):
+                        continue
+                    nk = norm_key(item.title)
+                    if not nk or nk in batch_seen_keys:
+                        continue
+                    batch_seen_keys.add(nk)
+                    fresh.append(item)
+
+                if not inbox_only:
+                    if active_feeds is not None:
+                        rss_fresh = fetch_rss_news(state, now=fetch_now, feeds=active_feeds)
+                    else:
+                        rss_fresh = fetch_rss_news(state, now=fetch_now)
+                    for item in rss_fresh:
+                        nk = norm_key(item.title)
+                        if nk and nk not in batch_seen_keys:
+                            batch_seen_keys.add(nk)
+                            fresh.append(item)
+
                 row_summary["fresh_count"] = len(fresh)
                 for item in fresh:
                     state.mark_seen(item.url, item.title, now=fetch_now)
@@ -2975,6 +3086,32 @@ def run_live(
                                     logger.info("%s 알림 한도 도달 — 후순위 후보 deferred 보관: %s", tag, tkey)
                                     continue
 
+                                # 2단 초고속 1보 푸시: Stage 2(10~15초) 대기 전에 3초 만에 1차 속보 먼저 발송
+                                if instant_flash_alert:
+                                    flash_msg = format_flash_alert_html(
+                                        cluster,
+                                        cand,
+                                        escalated=bool(dedup_mode == "enforce" and dedup_pre["escalated"]),
+                                        now=cand_now,
+                                    )
+                                    try:
+                                        if dry_run:
+                                            print(flash_msg)
+                                        else:
+                                            send_telegram(tg_token, tg_chat, flash_msg, start_chunk=0)
+                                            logger.info("%s 초고속 1보 속보 푸시 발송 완료: %s", tag, cluster.headline[:60])
+                                        trace.emit({
+                                            "ts": cand_now.isoformat(),
+                                            "type": "flash_alert_sent",
+                                            "cycle": cycle,
+                                            "cluster_id": cid,
+                                            "theme_key": tkey,
+                                            "catalyst_score": score_val,
+                                            "headline": cluster.headline[:160],
+                                        })
+                                    except Exception as flash_exc:
+                                        logger.warning("%s 1보 속보 푸시 실패 (2보 심층 리포트 계속 진행): %s", tag, flash_exc)
+
                                 # 후보별 개별 try/except: 한 후보 실패 시 나머지 후보 중단 및 유실 방지
                                 try:
                                     msg, title_str, deep_model, alert_meta = _build_stage2_message(
@@ -3211,7 +3348,15 @@ def run_daemon(
 
     base_dir = data_dir if data_dir is not None else Path("data")
     base_dir.mkdir(parents=True, exist_ok=True)
+    inbox_dir = base_dir / "inbox"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
     trigger_file = base_dir / "trigger_now"
+
+    def _has_inbox_files() -> bool:
+        try:
+            return any(inbox_dir.glob("*.json"))
+        except OSError:
+            return False
 
     stop_evt = stop_event if stop_event is not None else threading.Event()
     if stop_event is None and threading.current_thread() is threading.main_thread():
@@ -3226,6 +3371,8 @@ def run_daemon(
 
     iterations = 0
     last_error: str | None = None
+    next_rss_deadline = 0.0
+    run_inbox_only = False
 
     while not stop_evt.is_set():
         iter_now = _now()
@@ -3233,12 +3380,19 @@ def run_daemon(
         poll_sec, window_label = resolve_daemon_interval_sec(now=iter_now, runtime_cfg=runtime_cfg)
         active_feeds = resolve_active_feeds(runtime_cfg, daemon_mode=True) or RSS_FEEDS
         paused = bool(runtime_cfg.get("paused", False))
-        manual_wake = trigger_file.exists()
-        if manual_wake:
+
+        manual_wake = False
+        if trigger_file.exists():
             try:
+                trig_txt = trigger_file.read_text(encoding="utf-8", errors="ignore").strip().lower()
                 trigger_file.unlink(missing_ok=True)
             except OSError:
-                pass
+                trig_txt = ""
+            if trig_txt != "inbox":
+                manual_wake = True
+                run_inbox_only = False
+            elif time.monotonic() < next_rss_deadline:
+                run_inbox_only = True
 
         if paused and not manual_wake:
             write_status_snapshot(
@@ -3260,13 +3414,14 @@ def run_daemon(
             iterations += 1
             if max_iterations is not None and iterations >= max_iterations:
                 break
-            for _ in range(5):
+            for _ in range(10):
                 if stop_evt.is_set() or trigger_file.exists():
                     break
-                time.sleep(2)
+                stop_evt.wait(timeout=1.0)
             continue
 
         cycle_t0 = time.monotonic()
+        is_fast_inbox = bool(run_inbox_only and not manual_wake and time.monotonic() < next_rss_deadline)
         try:
             run_live(
                 dry_run=dry_run,
@@ -3275,19 +3430,24 @@ def run_daemon(
                 data_dir=base_dir,
                 now_fn=now_fn,
                 daemon_mode=True,
+                inbox_only=is_fast_inbox,
             )
             last_error = None
         except GeminiAuthError as auth_exc:
             last_error = str(auth_exc)
             logger.error("데몬 치명적 API 키 오류: %s — 5분 후 재확인합니다.", auth_exc)
             poll_sec = max(poll_sec, 300)
+            is_fast_inbox = False
         except Exception as exc:
             last_error = str(exc)
             logger.warning("데몬 사이클 일시 오류 (다음 주기에 자동 복구): %s", exc)
 
         done_now = _now()
         elapsed = time.monotonic() - cycle_t0
-        wait_sec = max(1.0, poll_sec - elapsed)
+        now_mono = time.monotonic()
+        if not is_fast_inbox or next_rss_deadline <= now_mono:
+            next_rss_deadline = now_mono + max(1.0, poll_sec - elapsed)
+        wait_sec = max(0.5, next_rss_deadline - now_mono)
         next_at = done_now + timedelta(seconds=wait_sec)
         write_status_snapshot(
             base_dir,
@@ -3299,6 +3459,7 @@ def run_daemon(
                 "heartbeat_at": done_now.isoformat(),
                 "last_cycle_at": done_now.isoformat(),
                 "last_cycle_sec": round(elapsed, 2),
+                "last_cycle_kind": "inbox_fast" if is_fast_inbox else "full_rss",
                 "next_cycle_at": next_at.isoformat(),
                 "poll_interval_sec": poll_sec,
                 "window_label": window_label,
@@ -3311,13 +3472,17 @@ def run_daemon(
         if max_iterations is not None and iterations >= max_iterations:
             break
 
-        deadline = time.monotonic() + wait_sec
-        while not stop_evt.is_set() and time.monotonic() < deadline:
-            if trigger_file.exists():
-                logger.info("대시보드 즉시 스캔 요청 감지 — 대기를 중단하고 바로 감시를 시작합니다.")
+        run_inbox_only = False
+        while not stop_evt.is_set() and time.monotonic() < next_rss_deadline:
+            if _has_inbox_files():
+                logger.info("실시간 콜백 속보 감지(data/inbox) — RSS 대기 없이 즉시 분석을 시작합니다!")
+                run_inbox_only = True
                 break
-            rem = deadline - time.monotonic()
-            stop_evt.wait(timeout=min(2.0, max(0.1, rem)))
+            if trigger_file.exists():
+                logger.info("즉시 스캔 신호 감지 — 대기를 중단하고 바로 감시를 시작합니다.")
+                break
+            rem = next_rss_deadline - time.monotonic()
+            stop_evt.wait(timeout=min(0.5, max(0.05, rem)))
 
     write_status_snapshot(
         base_dir,
