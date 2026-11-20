@@ -91,7 +91,7 @@ if command -v systemctl >/dev/null 2>&1; then
   systemctl --user is-active --quiet news-alpha-telegram.service && systemctl --user restart news-alpha-telegram.service || true
   if systemctl --user is-active --quiet news-alpha-dashboard.service; then
     if [ "${DEFER_DASHBOARD}" = "1" ]; then
-      (sleep 1; systemctl --user restart news-alpha-dashboard.service) >/dev/null 2>&1 &
+      nohup bash -c 'sleep 1; systemctl --user restart news-alpha-dashboard.service' </dev/null >/dev/null 2>&1 9>&- &
     else
       systemctl --user restart news-alpha-dashboard.service || true
     fi

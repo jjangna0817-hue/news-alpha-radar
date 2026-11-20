@@ -47,6 +47,7 @@ done
 
 systemctl --user daemon-reload
 systemctl --user enable --now news-alpha-radar.service news-alpha-dashboard.service news-alpha-updater.timer
+systemctl --user restart news-alpha-radar.service news-alpha-dashboard.service
 
 # 선택 기능: TELEGRAM_API_ID & TELEGRAM_API_HASH가 설정되어 있으면 실시간 콜백용 .venv 준비
 TG_API_ID="$(grep -E '^TELEGRAM_API_ID=' "${REPO_DIR}/.env" | tail -n 1 | cut -d= -f2- | tr -d ' "\r' || true)"
@@ -61,6 +62,7 @@ if [ -n "${TG_API_ID}" ] && [ -n "${TG_API_HASH}" ]; then
   "${REPO_DIR}/.venv/bin/pip" install --quiet -r "${REPO_DIR}/requirements-realtime.txt"
   if [ -f "${REPO_DIR}/data/telegram_user.session" ]; then
     systemctl --user enable --now news-alpha-telegram.service
+    systemctl --user restart news-alpha-telegram.service
     TG_STATE="가동 중 (0초 콜백 활성)"
   else
     TG_STATE="1회 로그인 대기 중 -> 아래 명령 실행 필요"
