@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import tempfile
 import threading
@@ -78,6 +79,16 @@ RSS_MAX_PER_HOST = 2
 TRACE_MAX_DAYS = 7
 TRACE_MAX_BYTES = 5 * 1024 * 1024
 
+DEFAULT_DEDUP_MODE = "shadow"
+DEFAULT_TRIGGER_MODE = "shadow"
+DEFAULT_STAGE1_DAILY_RPD_LIMIT = 500
+HUB_STOCK_MIN_APPEARANCES = 3
+ESCALATION_SCORE_DELTA = 1.0
+DEFAULT_DAEMON_INTERVAL_MARKET_SEC = 60
+DEFAULT_DAEMON_INTERVAL_EXTENDED_SEC = 180
+DEFAULT_DAEMON_INTERVAL_OFFHOURS_SEC = 600
+DEFAULT_DAEMON_BURST_WINDOW_MIN = 15
+
 RSS_FEEDS: list[dict[str, Any]] = [
     {"name": "구글뉴스_한국_주요", "category": "속보", "url": "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko", "priority": 1, "group": "google", "timeout": RSS_GOOGLE_TIMEOUT},
     {"name": "구글뉴스_한국_사회", "category": "사회/사건", "url": "https://news.google.com/rss/headlines/section/topic/NATION?hl=ko&gl=KR&ceid=KR:ko", "priority": 1, "group": "google", "timeout": RSS_GOOGLE_TIMEOUT},
@@ -91,13 +102,37 @@ RSS_FEEDS: list[dict[str, Any]] = [
     {"name": "매일경제_사회", "category": "사회/사건", "url": "https://www.mk.co.kr/rss/50400012/", "priority": 2},
 ]
 
-# Actions 러너 IP에서 --probe-feeds로 검증한 뒤 채택할 후보 피드 목록
+# Actions 러너 IP에서 --probe-feeds로 검증한 뒤 채택할 후보 피드 목록 (우분투 상시 서버에서는 전자신문_속보·뉴시스_속보 기본 활성)
 PROBE_CANDIDATE_FEEDS: list[dict[str, Any]] = [
     {"name": "전자신문_AI·SW", "category": "IT/신기술", "url": "https://rss.etnews.com/04.xml", "priority": 2},
     {"name": "전자신문_속보", "category": "IT/신기술", "url": "https://rss.etnews.com/Section902.xml", "priority": 2},
     {"name": "뉴시스_속보", "category": "속보", "url": "https://www.newsis.com/RSS/sokbo.xml", "priority": 2},
     {"name": "조선비즈", "category": "경제/산업", "url": "https://biz.chosun.com/arc/outboundfeeds/rss/?outputType=xml", "priority": 2},
 ]
+
+ALL_FEEDS: list[dict[str, Any]] = RSS_FEEDS + PROBE_CANDIDATE_FEEDS
+DAEMON_DEFAULT_EXTRA_FEEDS: tuple[str, ...] = ("전자신문_속보", "뉴시스_속보")
+
+# PR-3 Stage 1 트리거 2계층 키워드 (단독/속보 및 단순 정치 용어 제외)
+HARD_TRIGGER_KEYWORDS: tuple[str, ...] = (
+    "해킹", "개인정보 유출", "정보유출", "랜섬웨어", "리콜", "전량 회수", "영업정지", "판매중지",
+    "생산중단", "가동중단", "가동 중단", "공장 화재", "화재 발생", "폭발 사고", "관세 부과",
+    "수출통제", "수출규제", "전파탐지", "불법촬영", "콜레라", "전염병", "감염병", "방역 비상",
+    "인수합병", "경영권 분쟁", "공개매수", "대규모 수주", "임상 성공", "임상 중단", "품목허가",
+    "과징금", "시정명령", "압수수색", "부도", "회생절차", "상장폐지", "대규모 정전", "통신장애",
+    "통신 마비", "공급망 마비", "해협 봉쇄", "항로 봉쇄",
+)
+
+SOFT_TRIGGER_KEYWORDS: tuple[str, ...] = (
+    "수주", "공급계약", "계약 체결", "국회 통과", "법안", "의무화", "전수조사", "규제 강화",
+    "특허", "승인", "대규모 투자", "증설", "합작", "제재", "파업", "파산", "감산",
+    "가격 인상", "품귀", "공급 부족", "결함", "조사 착수", "검찰 기소", "정부 대책",
+    "예산 증액", "반입 금지", "보안 강화", "부정행위",
+)
+
+POLITICAL_NOISE_RE = re.compile(
+    r"대통령|국회의원|민주당|국민의힘|조국혁신당|개혁신당|탄핵|여야|정당|공천|대선|총선|지방선거|국정감사|필리버스터|대법원장|특검|국무총리|정치권"
+)
 
 NOISE_PATTERNS = [
     re.compile(p, re.IGNORECASE)
@@ -592,6 +627,91 @@ def pt_date_str(now: datetime | None = None) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+def load_dotenv_file(path: Path | None = None) -> None:
+    """로컬/우분투 상시 서버 실행 시 .env 파일을 표준 라이브러리로 로드(기존 환경변수 우선)."""
+    target = path if path is not None else (Path(__file__).resolve().parent / ".env")
+    if not target.exists():
+        return
+    try:
+        for raw in target.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                val = val[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = val
+    except Exception as exc:
+        logger.warning(".env 로드 스킵: %s", exc)
+
+
+def load_runtime_config(data_dir: Path) -> dict[str, Any]:
+    """웹 대시보드에서 실시간 조정하는 data/runtime_config.json 로드."""
+    cfg_path = data_dir / "runtime_config.json"
+    if not cfg_path.exists():
+        return {}
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+        return dict(raw) if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_runtime_config(data_dir: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    """data/runtime_config.json 원자적 저장."""
+    clean = dict(cfg)
+    clean["updated_at"] = datetime.now(KST).isoformat()
+    atomic_write_text(
+        data_dir / "runtime_config.json",
+        json.dumps(clean, ensure_ascii=False, indent=2),
+    )
+    return clean
+
+
+def resolve_active_feeds(
+    runtime_cfg: dict[str, Any] | None = None,
+    *,
+    daemon_mode: bool = False,
+) -> list[dict[str, Any]] | None:
+    """활성 RSS 피드 목록 결정.
+
+    기본 Actions 모드(오버라이드 없음)에서는 None을 반환해 fetch_rss_news 기본값을 유지하고,
+    우분투 데몬 모드에서는 전자신문_속보·뉴시스_속보를 기본 추가하며,
+    runtime_config.json의 enabled_feeds나 EXTRA_RSS_FEEDS 설정을 반영한다.
+    """
+    cfg = runtime_cfg or {}
+    enabled_names = cfg.get("enabled_feeds")
+    if isinstance(enabled_names, list) and enabled_names:
+        wanted = {str(n).strip() for n in enabled_names if str(n).strip()}
+        selected = [f for f in ALL_FEEDS if f["name"] in wanted]
+        if selected:
+            return selected
+
+    extra_env = [x.strip() for x in (os.getenv("EXTRA_RSS_FEEDS") or "").split(",") if x.strip()]
+    if daemon_mode or extra_env:
+        base_names = {f["name"] for f in RSS_FEEDS}
+        if daemon_mode:
+            base_names.update(DAEMON_DEFAULT_EXTRA_FEEDS)
+        base_names.update(extra_env)
+        return [f for f in ALL_FEEDS if f["name"] in base_names]
+
+    return None
+
+
+def write_status_snapshot(data_dir: Path, payload: dict[str, Any]) -> None:
+    """웹 대시보드 모니터링용 data/status.json 하트비트 원자적 기록."""
+    try:
+        atomic_write_text(
+            data_dir / "status.json",
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        )
+    except Exception as exc:
+        logger.warning("status.json 기록 실패: %s", exc)
+
+
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -727,6 +847,16 @@ class StateStore:
             return False
         return (self._now_kst(now) - ts) < timedelta(hours=hours)
 
+    def alerts_in_rolling_window(self, minutes: int, now: datetime | None = None) -> int:
+        ref = self._now_kst(now)
+        cutoff = ref - timedelta(minutes=minutes)
+        count = 0
+        for rec in self.recent_alerts:
+            ts = parse_iso_kst(rec.get("ts"))
+            if ts is not None and ts >= cutoff:
+                count += 1
+        return count
+
     def mark_alerted(
         self,
         theme_key: str,
@@ -737,6 +867,8 @@ class StateStore:
         cand_codes: list[str] | None = None,
         final_codes: list[str] | None = None,
         catalyst_score: float | None = None,
+        title: str | None = None,
+        stocks: list[dict[str, str]] | None = None,
     ) -> None:
         ref = self._now_kst(now)
         k = norm_key(theme_key)
@@ -744,7 +876,7 @@ class StateStore:
             self.alerted_themes[k] = ref.isoformat()
         day = ref.strftime("%Y-%m-%d")
         self.daily_counts[day] = self.daily_counts.get(day, 0) + 1
-        self.recent_alerts.append({
+        rec: dict[str, Any] = {
             "ts": ref.isoformat(),
             "theme_key": theme_key,
             "tokens": list(tokens or []),
@@ -752,7 +884,12 @@ class StateStore:
             "cand_codes": list(cand_codes or []),
             "final_codes": list(final_codes or []),
             "catalyst_score": float(catalyst_score) if catalyst_score is not None else 0.0,
-        })
+        }
+        if title:
+            rec["title"] = str(title)
+        if stocks:
+            rec["stocks"] = list(stocks)
+        self.recent_alerts.append(rec)
 
     def sent_today(self, now: datetime | None = None) -> int:
         return self.daily_counts.get(self._now_kst(now).strftime("%Y-%m-%d"), 0)
@@ -803,6 +940,256 @@ class StateStore:
             indent=2,
         )
         atomic_write_text(self.path, payload)
+
+
+def compute_hub_stocks(
+    recent_alerts: list[dict[str, Any]],
+    now: datetime | None = None,
+    window_days: int = 7,
+) -> set[str]:
+    """최근 7일 알림 중 3건 이상 반복 등장한 허브 종목코드를 데이터 기반으로 추출."""
+    ref = StateStore._now_kst(now)
+    cutoff = ref - timedelta(days=window_days)
+    counts: Counter[str] = Counter()
+    for rec in recent_alerts:
+        ts = parse_iso_kst(rec.get("ts"))
+        if ts is not None and ts < cutoff:
+            continue
+        codes = rec.get("final_codes") or rec.get("cand_codes") or []
+        counts.update({str(c).strip() for c in codes if str(c).strip()})
+    return {code for code, cnt in counts.items() if cnt >= HUB_STOCK_MIN_APPEARANCES}
+
+
+def codes_overlap(codes_a: set[str], codes_b: set[str], hub_stocks: set[str]) -> bool:
+    """허브 종목 제외 후 |A∩B| >= 2 이고 |A∩B| / min(|A|,|B|) >= 0.5 여부 판정."""
+    a = {str(c).strip() for c in codes_a if str(c).strip()} - hub_stocks
+    b = {str(c).strip() for c in codes_b if str(c).strip()} - hub_stocks
+    if not a or not b:
+        return False
+    inter = len(a & b)
+    return inter >= 2 and (inter / min(len(a), len(b))) >= 0.5
+
+
+def evaluate_duplicate_candidate(
+    *,
+    theme_key: str,
+    tokens: list[str],
+    keywords: list[str],
+    codes: list[str],
+    catalyst_score: float,
+    recent_alerts: list[dict[str, Any]],
+    cooldown_hours: int,
+    now: datetime | None = None,
+    code_field: str = "cand_codes",
+) -> dict[str, Any]:
+    """PR-3 Stage 2 이전(및 발송 직전) (T, K, C) 다중 신호 중복 판정 + +1.0 에스컬레이션 예외."""
+    ref = StateStore._now_kst(now)
+    cutoff = ref - timedelta(hours=cooldown_hours)
+    hubs = compute_hub_stocks(recent_alerts, now=ref)
+
+    tnorm = norm_key(theme_key)
+    t_set = {str(x).lower() for x in tokens if x}
+    k_set = {str(x).lower() for x in keywords if x}
+    c_set = {str(x).strip() for x in codes if x}
+
+    best_match: dict[str, Any] | None = None
+    for rec in recent_alerts:
+        ts = parse_iso_kst(rec.get("ts"))
+        if ts is None or ts < cutoff:
+            continue
+        prev_theme = str(rec.get("theme_key") or "")
+        prev_tnorm = norm_key(prev_theme)
+        prev_t = {str(x).lower() for x in (rec.get("tokens") or []) if x}
+        prev_k = {str(x).lower() for x in (rec.get("keywords") or []) if x}
+        prev_codes_raw = rec.get(code_field) or rec.get("final_codes") or rec.get("cand_codes") or []
+        prev_c = {str(x).strip() for x in prev_codes_raw if x}
+
+        tok_inter = len(t_set & prev_t)
+        kw_inter = len(k_set & prev_k)
+        c_ov = codes_overlap(c_set, prev_c, hubs)
+
+        rule: str | None = None
+        if tnorm and prev_tnorm and tnorm == prev_tnorm:
+            rule = "theme_key_exact"
+        elif tok_inter >= 3 and (kw_inter >= 2 or c_ov):
+            rule = "tokens_and_kw_or_codes"
+        elif kw_inter >= 3 and c_ov:
+            rule = "keywords_and_codes"
+
+        if rule is None:
+            continue
+
+        prev_score = float(rec.get("catalyst_score", 0.0) or 0.0)
+        if best_match is None or prev_score > best_match["prev_score"]:
+            best_match = {
+                "rule": rule,
+                "matched_theme": prev_theme,
+                "prev_score": prev_score,
+                "token_overlap": tok_inter,
+                "kw_overlap": kw_inter,
+                "code_overlap": c_ov,
+            }
+
+    if best_match is None:
+        return {
+            "is_dup": False,
+            "escalated": False,
+            "reason": "unique",
+            "matched_theme": None,
+            "prev_score": None,
+            "token_overlap": 0,
+            "kw_overlap": 0,
+            "code_overlap": False,
+            "hub_stocks": sorted(hubs),
+        }
+
+    if catalyst_score >= best_match["prev_score"] + ESCALATION_SCORE_DELTA:
+        return {
+            "is_dup": False,
+            "escalated": True,
+            "reason": f"escalation_pass:{best_match['rule']}",
+            "matched_theme": best_match["matched_theme"],
+            "prev_score": best_match["prev_score"],
+            "token_overlap": best_match["token_overlap"],
+            "kw_overlap": best_match["kw_overlap"],
+            "code_overlap": best_match["code_overlap"],
+            "hub_stocks": sorted(hubs),
+        }
+
+    return {
+        "is_dup": True,
+        "escalated": False,
+        "reason": best_match["rule"],
+        "matched_theme": best_match["matched_theme"],
+        "prev_score": best_match["prev_score"],
+        "token_overlap": best_match["token_overlap"],
+        "kw_overlap": best_match["kw_overlap"],
+        "code_overlap": best_match["code_overlap"],
+        "hub_stocks": sorted(hubs),
+    }
+
+
+def evaluate_stage1_trigger(
+    pending_items: list[NewsItem],
+    ranked_clusters: list[EventCluster],
+    state: StateStore,
+    *,
+    now: datetime,
+    market_window: bool,
+    daily_rpd_limit: int = DEFAULT_STAGE1_DAILY_RPD_LIMIT,
+    screen_model: str = "gemini-3.5-flash-lite",
+) -> dict[str, Any]:
+    """PR-3 2계층(H/S) Stage 1 트리거 + PT 일일 RPD 70%/80%/90% 보호 가드."""
+    limit = max(10, int(daily_rpd_limit))
+    used = state.ai_requests_today(screen_model, now=now)
+    ratio = used / limit
+
+    if ratio >= 0.90:
+        rpd_tier = "h_only"
+        batch_th = 999999
+        elapsed_th = 999999.0
+    elif ratio >= 0.80:
+        rpd_tier = "slowdown"
+        batch_th = 12
+        elapsed_th = 15.0 if market_window else 30.0
+    elif ratio >= 0.70:
+        rpd_tier = "caution"
+        batch_th = 8
+        elapsed_th = 10.0 if market_window else 20.0
+    else:
+        rpd_tier = "normal"
+        batch_th = 6
+        elapsed_th = 6.0 if market_window else 15.0
+
+    last_dt = parse_iso_kst(state.last_stage1_at)
+    elapsed_min = max(0.0, (now - last_dt).total_seconds() / 60.0) if last_dt is not None else None
+
+    hard_hits: list[str] = []
+    soft_hits_all: list[str] = []
+    best_soft_in_cluster = 0
+    has_soft_plus_multi_outlet = False
+    max_non_pol_outlets = 0
+
+    for cl in ranked_clusters[:25]:
+        titles = [it.title for it in cl.items] if cl.items else [cl.headline]
+        joined = " ".join(titles)
+        cl_hard = [kw for kw in HARD_TRIGGER_KEYWORDS if kw in joined]
+        for kw in cl_hard:
+            if kw not in hard_hits:
+                hard_hits.append(kw)
+
+        is_political = any(POLITICAL_NOISE_RE.search(t) for t in titles)
+        outlets = {extract_outlet(it) for it in cl.items} if cl.items else set()
+        if not is_political:
+            max_non_pol_outlets = max(max_non_pol_outlets, len(outlets))
+            cl_soft = [kw for kw in SOFT_TRIGGER_KEYWORDS if kw in joined]
+            for kw in cl_soft:
+                if kw not in soft_hits_all:
+                    soft_hits_all.append(kw)
+            best_soft_in_cluster = max(best_soft_in_cluster, len(cl_soft))
+            if cl_soft and len(outlets) >= 2:
+                has_soft_plus_multi_outlet = True
+
+    should_run = False
+    reason = "waiting_batch_or_trigger"
+
+    if hard_hits:
+        should_run = True
+        reason = "hard_keyword"
+    elif rpd_tier == "h_only":
+        should_run = False
+        reason = "rpd_90_h_only_guard"
+    elif best_soft_in_cluster >= 2 and rpd_tier in ("normal", "caution"):
+        should_run = True
+        reason = "soft_keywords_2plus"
+    elif has_soft_plus_multi_outlet:
+        should_run = True
+        reason = "soft_plus_multi_outlet"
+    elif max_non_pol_outlets >= 2 and rpd_tier in ("normal", "caution"):
+        should_run = True
+        reason = "multi_outlet"
+    elif len(pending_items) >= batch_th:
+        should_run = True
+        reason = "pending_batch"
+    elif elapsed_min is None or elapsed_min >= elapsed_th:
+        should_run = True
+        reason = "elapsed_time"
+
+    return {
+        "should_run": should_run,
+        "reason": reason,
+        "rpd_tier": rpd_tier,
+        "rpd_used": used,
+        "rpd_limit": limit,
+        "rpd_ratio": round(ratio, 3),
+        "hard_hits": hard_hits[:5],
+        "soft_hits": soft_hits_all[:5],
+        "max_outlets": max_non_pol_outlets,
+        "pending_count": len(pending_items),
+        "elapsed_min": round(elapsed_min, 1) if elapsed_min is not None else None,
+        "batch_threshold": batch_th,
+        "elapsed_threshold_min": elapsed_th,
+    }
+
+
+def resolve_daemon_interval_sec(
+    now: datetime | None = None,
+    runtime_cfg: dict[str, Any] | None = None,
+) -> tuple[int, str]:
+    """우분투 상시 데몬의 KST 시간대별 적응형 감시 주기(초)와 구간명 반환."""
+    ref = StateStore._now_kst(now)
+    cfg = runtime_cfg or {}
+    market_sec = max(15, int(cfg.get("daemon_interval_market_sec") or _env_int("DAEMON_INTERVAL_MARKET_SEC", DEFAULT_DAEMON_INTERVAL_MARKET_SEC)))
+    ext_sec = max(30, int(cfg.get("daemon_interval_extended_sec") or _env_int("DAEMON_INTERVAL_EXTENDED_SEC", DEFAULT_DAEMON_INTERVAL_EXTENDED_SEC)))
+    off_sec = max(60, int(cfg.get("daemon_interval_offhours_sec") or _env_int("DAEMON_INTERVAL_OFFHOURS_SEC", DEFAULT_DAEMON_INTERVAL_OFFHOURS_SEC)))
+
+    if ref.weekday() < 5:
+        hm = (ref.hour, ref.minute)
+        if (8, 0) <= hm <= (15, 30):
+            return market_sec, "정규장/장전"
+        if (7, 0) <= hm < (8, 0) or (15, 30) < hm < (21, 0):
+            return ext_sec, "장전초/장후"
+    return off_sec, "심야/주말"
 
 
 def _fetch_single_feed(
@@ -1797,12 +2184,18 @@ def _build_stage2_message(
     delay_note: str | None,
     now: datetime,
     state: StateStore | None = None,
+    matched_override: list[dict[str, Any]] | None = None,
+    title_prefix: str = "",
 ) -> tuple[str, str, str, dict[str, Any]]:
-    matched = match_krx_stocks(
-        companies,
-        cand.get("second_order_keywords") or [],
-        cand.get("first_order_keywords") or [],
-        cand.get("negative_keywords") or [],
+    matched = (
+        list(matched_override)
+        if matched_override is not None
+        else match_krx_stocks(
+            companies,
+            cand.get("second_order_keywords") or [],
+            cand.get("first_order_keywords") or [],
+            cand.get("negative_keywords") or [],
+        )
     )
     quotes = fetch_naver_quotes([m["code"] for m in matched])
     enriched = []
@@ -1863,6 +2256,8 @@ def _build_stage2_message(
     deep_raw["stocks"] = clean_stocks[:6]
     deep_raw["catalyst_score"] = float(cand.get("catalyst_score", min_score))
     deep_raw.setdefault("title", cluster.headline)
+    if title_prefix and not str(deep_raw["title"]).startswith(title_prefix):
+        deep_raw["title"] = f"{title_prefix}{deep_raw['title']}"
     deep_raw.setdefault("event_summary", cand.get("event_summary", cluster.headline))
 
     raw_kws = list(cand.get("first_order_keywords") or []) + list(cand.get("second_order_keywords") or [])
@@ -1873,6 +2268,11 @@ def _build_stage2_message(
         "cand_codes": [m["code"] for m in matched],
         "final_codes": [s["code"] for s in deep_raw["stocks"]],
         "catalyst_score": float(deep_raw["catalyst_score"]),
+        "title": str(deep_raw["title"]),
+        "stocks": [
+            {"code": s["code"], "name": s["name"], "direction": str(s.get("direction") or "")}
+            for s in deep_raw["stocks"]
+        ],
     }
 
     msg = format_telegram_html(deep_raw, quotes, cluster.items, deep_model, delay_note=delay_note, now=now)
@@ -1939,18 +2339,64 @@ def run_live(
     interval_sec: int | None = None,
     data_dir: Path | None = None,
     now_fn: Callable[[], datetime] | None = None,
+    daemon_mode: bool = False,
 ) -> None:
     def _now() -> datetime:
         dt = now_fn() if now_fn is not None else datetime.now(KST)
         return dt.replace(tzinfo=KST) if dt.tzinfo is None else dt.astimezone(KST)
 
+    base_dir = data_dir if data_dir is not None else Path("data")
+    runtime_cfg = load_runtime_config(base_dir)
+
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     tg_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    min_score = _env_float("MIN_CATALYST_SCORE", 7.5)
-    max_per_run = max(1, _env_int("MAX_ALERTS_PER_RUN", 2))
-    max_daily = max(1, _env_int("MAX_DAILY_ALERTS", 10))
-    cooldown_h = max(1, _env_int("THEME_COOLDOWN_HOURS", 12))
+    min_score = float(
+        runtime_cfg["min_catalyst_score"]
+        if runtime_cfg.get("min_catalyst_score") is not None
+        else _env_float("MIN_CATALYST_SCORE", 7.5)
+    )
+    max_per_run = max(
+        1,
+        int(
+            runtime_cfg["max_alerts_per_window"]
+            if runtime_cfg.get("max_alerts_per_window") is not None
+            else _env_int("MAX_ALERTS_PER_RUN", 2)
+        ),
+    )
+    max_daily = max(
+        1,
+        int(
+            runtime_cfg["max_daily_alerts"]
+            if runtime_cfg.get("max_daily_alerts") is not None
+            else _env_int("MAX_DAILY_ALERTS", 10)
+        ),
+    )
+    cooldown_h = max(
+        1,
+        int(
+            runtime_cfg["theme_cooldown_hours"]
+            if runtime_cfg.get("theme_cooldown_hours") is not None
+            else _env_int("THEME_COOLDOWN_HOURS", 12)
+        ),
+    )
+    dedup_default = "enforce" if daemon_mode else DEFAULT_DEDUP_MODE
+    trigger_default = "enforce" if daemon_mode else DEFAULT_TRIGGER_MODE
+    dedup_mode = str(runtime_cfg.get("dedup_mode") or _env_str("DEDUP_MODE", dedup_default)).strip().lower()
+    if dedup_mode not in ("shadow", "enforce"):
+        dedup_mode = dedup_default
+    trigger_mode = str(runtime_cfg.get("trigger_mode") or _env_str("TRIGGER_MODE", trigger_default)).strip().lower()
+    if trigger_mode not in ("shadow", "enforce"):
+        trigger_mode = trigger_default
+    stage1_rpd_limit = max(
+        10,
+        int(
+            runtime_cfg["stage1_daily_rpd_limit"]
+            if runtime_cfg.get("stage1_daily_rpd_limit") is not None
+            else _env_int("STAGE1_DAILY_RPD_LIMIT", DEFAULT_STAGE1_DAILY_RPD_LIMIT)
+        ),
+    )
+    active_feeds = resolve_active_feeds(runtime_cfg, daemon_mode=daemon_mode)
 
     screen_models = [m.strip() for m in _env_str("GEMINI_SCREEN_MODELS", DEFAULT_SCREEN_MODELS).split(",") if m.strip()]
     deep_models = [m.strip() for m in _env_str("GEMINI_DEEP_MODELS", DEFAULT_DEEP_MODELS).split(",") if m.strip()]
@@ -1981,11 +2427,10 @@ def run_live(
         )
     else:
         logger.info(
-            "단일 감시 사이클 시작 (장중구간=%s, 시작=%s)",
-            market_window, started_at.strftime("%Y-%m-%d %H:%M KST"),
+            "단일 감시 사이클 시작 (장중구간=%s, dedup=%s, trigger=%s, 시작=%s)",
+            market_window, dedup_mode, trigger_mode, started_at.strftime("%Y-%m-%d %H:%M KST"),
         )
 
-    base_dir = data_dir if data_dir is not None else Path("data")
     state = StateStore(base_dir / "state.json")
     trace = TraceLogger(base_dir / "trace.jsonl")
     trace.emit({
@@ -1998,6 +2443,9 @@ def run_live(
         "interval_sec": loop_interval,
         "market_window": market_window,
         "dry_run": dry_run,
+        "daemon_mode": daemon_mode,
+        "dedup_mode": dedup_mode,
+        "trigger_mode": trigger_mode,
     })
 
     companies: dict[str, dict[str, str]] | None = None
@@ -2009,6 +2457,11 @@ def run_live(
     failed_cycles = 0
     last_cycle_err: Exception | None = None
     cycle_rows: list[dict[str, Any]] = []
+
+    def _burst_limit_reached(now_dt: datetime) -> bool:
+        if daemon_mode:
+            return state.alerts_in_rolling_window(DEFAULT_DAEMON_BURST_WINDOW_MIN, now=now_dt) >= max_per_run
+        return sent_this_run >= max_per_run
 
     def _ensure_companies(tag: str) -> dict[str, dict[str, str]]:
         nonlocal companies
@@ -2039,8 +2492,8 @@ def run_live(
                 row_summary["note"] = "일일 한도 도달"
                 cycle_rows.append(row_summary)
                 break
-            if sent_this_run >= max_per_run:
-                logger.info("%s 이번 실행 최대 알림(%d건) 도달 — 워커 루프를 종료합니다.", tag, max_per_run)
+            if _burst_limit_reached(cycle_now):
+                logger.info("%s 단기 알림 한도(%d건) 도달 — 이번 사이클을 종료합니다.", tag, max_per_run)
                 row_summary["note"] = "실행당 한도 도달"
                 cycle_rows.append(row_summary)
                 break
@@ -2094,7 +2547,7 @@ def run_live(
                             logger.info("%s Deferred 중복/쿨다운 스킵: %s", tag, tkey)
                             continue
 
-                        if sent_this_run >= max_per_run or state.sent_today(now=now_d) >= max_daily:
+                        if _burst_limit_reached(now_d) or state.sent_today(now=now_d) >= max_daily:
                             remaining_deferred.append(entry)
                             continue
 
@@ -2267,7 +2720,7 @@ def run_live(
                         state.save(now=_now())
 
                 # Deferred 처리만으로 한도에 도달했으면 RSS/Stage 1 스킵
-                if state.sent_today(now=_now()) >= max_daily or sent_this_run >= max_per_run:
+                if state.sent_today(now=_now()) >= max_daily or _burst_limit_reached(_now()):
                     successful_cycles += 1
                     row_summary["note"] = "Deferred 처리로 한도 도달"
                     cycle_rows.append(row_summary)
@@ -2276,7 +2729,10 @@ def run_live(
 
                 # 2) RSS 수집 → seen("수집함") + pending 큐 적재 + TTL 만료 처리
                 fetch_now = _now()
-                fresh = fetch_rss_news(state, now=fetch_now)
+                if active_feeds is not None:
+                    fresh = fetch_rss_news(state, now=fetch_now, feeds=active_feeds)
+                else:
+                    fresh = fetch_rss_news(state, now=fetch_now)
                 row_summary["fresh_count"] = len(fresh)
                 for item in fresh:
                     state.mark_seen(item.url, item.title, now=fetch_now)
@@ -2328,229 +2784,356 @@ def run_live(
                     ranked_clusters = cluster_news_ranked(pending_items, now=fetch_now)
                     clusters = ranked_clusters[:25]
                     row_summary["cluster_count"] = len(clusters)
-                    logger.info(
-                        "%s 클러스터링 완료: %d개 이벤트 (전체 %d개 중 상위 %d개 평가, 잔여 %d개 pending 유지)",
-                        tag, len(clusters), len(ranked_clusters), len(clusters), max(0, len(ranked_clusters) - len(clusters)),
-                    )
 
-                    s1_t0 = time.monotonic()
-                    screen_raw, screen_model = call_gemini(
-                        api_key,
-                        screen_models,
-                        SCREENING_PROMPT,
-                        json.dumps({"clusters": [c.to_prompt_dict() for c in clusters], "min_score_hint": min_score}, ensure_ascii=False),
-                        thinking_level=screen_thinking_level,
-                        thinking_budget=0,
-                        timeout=screen_timeout,
-                        state=state,
-                        stage="stage1",
+                    primary_screen_model = screen_models[0] if screen_models else "gemini-3.5-flash-lite"
+                    trig = evaluate_stage1_trigger(
+                        pending_items,
+                        ranked_clusters,
+                        state,
                         now=fetch_now,
+                        market_window=is_market_watch_window(fetch_now),
+                        daily_rpd_limit=stage1_rpd_limit,
+                        screen_model=primary_screen_model,
                     )
-                    s1_sec = time.monotonic() - s1_t0
-                    ai_calls += 1
-                    row_summary["stage1_model"] = screen_model
-                    row_summary["stage1_sec"] = round(s1_sec, 2)
-                    logger.info("%s Stage 1 스크리닝 완료 (%s, %.1fs)", tag, screen_model, s1_sec)
+                    execute_stage1 = bool(trig["should_run"] or trigger_mode != "enforce")
+                    trace.emit({
+                        "ts": fetch_now.isoformat(),
+                        "type": "trigger_decision",
+                        "cycle": cycle,
+                        "mode": trigger_mode,
+                        "executed": execute_stage1,
+                        **trig,
+                    })
 
-                    # Stage 1에 실제 포함된 상위 25 클러스터의 기사만 evaluated 처리 (26위 이하는 pending 유지!)
-                    eval_now = _now()
-                    state.last_stage1_at = eval_now.isoformat()
-                    for cl in clusters:
-                        for item in cl.items:
-                            state.mark_evaluated(item.url, item.title, now=eval_now)
-                    if not dry_run:
-                        state.save(now=eval_now)
-
-                    by_id = {c.cluster_id: c for c in clusters}
-                    selected_map: dict[str, dict[str, Any]] = {}
-                    for ev in screen_raw.get("selected_events", []):
-                        cid = ev.get("cluster_id")
-                        if cid in by_id:
-                            selected_map[cid] = ev
-
-                    candidates = [
-                        e for e in selected_map.values()
-                        if float(e.get("catalyst_score", 0) or 0) >= min_score
-                    ]
-                    candidates.sort(key=lambda e: -float(e.get("catalyst_score", 0)))
-
-                    alerted_cids: set[str] = set()
-                    deferred_reasons: dict[str, str] = {}
-
-                    if not candidates:
-                        row_summary["note"] = "촉매 기준 미달"
-                        logger.info("%s 촉매 점수 %.1f 이상 핵심 이슈 없음 — 다음 주기에 재탐색합니다.", tag, min_score)
+                    if not execute_stage1:
+                        if not dry_run:
+                            state.save(now=fetch_now)
+                        skipped_cycles += 1
+                        successful_cycles += 1
+                        row_summary["skipped_ai"] = True
+                        row_summary["note"] = f"트리거 대기({trig['reason']})"
+                        logger.info(
+                            "%s Stage 1 트리거 대기 (%s, tier=%s, pending=%d건, RPD=%d/%d) — AI 호출 스킵",
+                            tag, trig["reason"], trig["rpd_tier"], len(pending_items), trig["rpd_used"], trig["rpd_limit"],
+                        )
                     else:
-                        comps = _ensure_companies(tag)
-                        ttl_min = _deferred_ttl_minutes(is_market_watch_window(_now()))
+                        logger.info(
+                            "%s 클러스터링 완료: %d개 이벤트 (전체 %d개 중 상위 %d개 평가, 잔여 %d개 pending 유지, trigger=%s/%s)",
+                            tag, len(clusters), len(ranked_clusters), len(clusters), max(0, len(ranked_clusters) - len(clusters)),
+                            trigger_mode, trig["reason"],
+                        )
 
-                        for cand in candidates:
-                            cand_now = _now()
-                            cid = str(cand["cluster_id"])
-                            cluster = by_id[cid]
-                            tkey = str(cand.get("theme_key") or cid)
-                            tnorm = norm_key(tkey)
-                            score_val = float(cand.get("catalyst_score", min_score))
-                            first_seen_iso = _earliest_first_seen(cluster, cand_now)
+                        s1_t0 = time.monotonic()
+                        screen_raw, screen_model = call_gemini(
+                            api_key,
+                            screen_models,
+                            SCREENING_PROMPT,
+                            json.dumps({"clusters": [c.to_prompt_dict() for c in clusters], "min_score_hint": min_score}, ensure_ascii=False),
+                            thinking_level=screen_thinking_level,
+                            thinking_budget=0,
+                            timeout=screen_timeout,
+                            state=state,
+                            stage="stage1",
+                            now=fetch_now,
+                        )
+                        s1_sec = time.monotonic() - s1_t0
+                        ai_calls += 1
+                        row_summary["stage1_model"] = screen_model
+                        row_summary["stage1_sec"] = round(s1_sec, 2)
+                        logger.info("%s Stage 1 스크리닝 완료 (%s, %.1fs)", tag, screen_model, s1_sec)
 
-                            if tnorm in batch_themes or state.in_cooldown(tkey, cooldown_h, now=cand_now):
-                                deferred_reasons[cid] = "cooldown_skip"
-                                logger.info("%s 중복/쿨다운 테마 스킵: %s", tag, tkey)
-                                continue
+                        # Stage 1에 실제 포함된 상위 25 클러스터의 기사만 evaluated 처리 (26위 이하는 pending 유지!)
+                        eval_now = _now()
+                        state.last_stage1_at = eval_now.isoformat()
+                        for cl in clusters:
+                            for item in cl.items:
+                                state.mark_evaluated(item.url, item.title, now=eval_now)
+                        if not dry_run:
+                            state.save(now=eval_now)
 
-                            # 실행당/일일 알림 한도 초과 시 영구 유실 대신 deferred 큐 보관
-                            if sent_this_run >= max_per_run or state.sent_today(now=cand_now) >= max_daily:
-                                reason = "over_daily_limit" if state.sent_today(now=cand_now) >= max_daily else "over_run_limit"
-                                deferred_reasons[cid] = reason
-                                enqueue_deferred(
-                                    state,
-                                    {
-                                        "kind": "stage2_pending",
-                                        "cluster": cluster.to_dict(),
-                                        "stage1": cand,
-                                        "theme_key": tkey,
-                                        "catalyst_score": score_val,
-                                        "first_seen": first_seen_iso,
-                                        "created_at": cand_now.isoformat(),
-                                        "expires_at": (cand_now + timedelta(minutes=ttl_min)).isoformat(),
-                                        "retries": 0,
-                                        "reason": reason,
-                                    },
-                                    trace,
-                                    cycle,
-                                    cand_now,
+                        by_id = {c.cluster_id: c for c in clusters}
+                        selected_map: dict[str, dict[str, Any]] = {}
+                        for ev in screen_raw.get("selected_events", []):
+                            cid = ev.get("cluster_id")
+                            if cid in by_id:
+                                selected_map[cid] = ev
+
+                        candidates = [
+                            e for e in selected_map.values()
+                            if float(e.get("catalyst_score", 0) or 0) >= min_score
+                        ]
+                        candidates.sort(key=lambda e: -float(e.get("catalyst_score", 0)))
+
+                        alerted_cids: set[str] = set()
+                        deferred_reasons: dict[str, str] = {}
+
+                        if not candidates:
+                            row_summary["note"] = "촉매 기준 미달"
+                            logger.info("%s 촉매 점수 %.1f 이상 핵심 이슈 없음 — 다음 주기에 재탐색합니다.", tag, min_score)
+                        else:
+                            comps = _ensure_companies(tag)
+                            ttl_min = _deferred_ttl_minutes(is_market_watch_window(_now()))
+
+                            for cand in candidates:
+                                cand_now = _now()
+                                cid = str(cand["cluster_id"])
+                                cluster = by_id[cid]
+                                tkey = str(cand.get("theme_key") or cid)
+                                tnorm = norm_key(tkey)
+                                score_val = float(cand.get("catalyst_score", min_score))
+                                first_seen_iso = _earliest_first_seen(cluster, cand_now)
+
+                                # PR-3 Stage 2 이전 (T, K, C) 다중 신호 중복 판정
+                                cand_tokens = top_cluster_tokens(cluster, limit=8)
+                                raw_kws = list(cand.get("first_order_keywords") or []) + list(cand.get("second_order_keywords") or [])
+                                cand_keywords = list(dict.fromkeys(tok for kw in raw_kws for tok in extract_normalized_tokens(str(kw))))
+                                matched = match_krx_stocks(
+                                    comps,
+                                    cand.get("second_order_keywords") or [],
+                                    cand.get("first_order_keywords") or [],
+                                    cand.get("negative_keywords") or [],
                                 )
-                                if not dry_run:
-                                    state.save(now=cand_now)
-                                logger.info("%s 알림 한도 도달 — 후순위 후보 deferred 보관: %s", tag, tkey)
-                                continue
+                                cand_codes = [m["code"] for m in matched]
 
-                            # 후보별 개별 try/except: 한 후보 실패 시 나머지 후보 중단 및 유실 방지
-                            try:
-                                msg, title_str, deep_model, alert_meta = _build_stage2_message(
-                                    api_key=api_key,
-                                    deep_models=deep_models,
-                                    deep_thinking_level=deep_thinking_level,
-                                    deep_thinking_budget=deep_thinking_budget,
-                                    deep_timeout=deep_timeout,
-                                    min_score=min_score,
-                                    companies=comps,
-                                    cluster=cluster,
-                                    cand=cand,
-                                    delay_note=None,
+                                dedup_pre = evaluate_duplicate_candidate(
+                                    theme_key=tkey,
+                                    tokens=cand_tokens,
+                                    keywords=cand_keywords,
+                                    codes=cand_codes,
+                                    catalyst_score=score_val,
+                                    recent_alerts=state.recent_alerts,
+                                    cooldown_hours=cooldown_h,
                                     now=cand_now,
-                                    state=state,
+                                    code_field="cand_codes",
                                 )
-                                ai_calls += 1
-                                logger.info("%s Stage 2 심층 분석 완료 (%s): %s", tag, deep_model, title_str)
-                            except GeminiAuthError:
-                                raise
-                            except Exception as exc:
-                                deferred_reasons[cid] = "stage2_error"
-                                logger.warning("%s 후보 Stage 2 실패 — deferred(stage2_pending) 보관 (%s): %s", tag, tkey, exc)
-                                enqueue_deferred(
-                                    state,
-                                    {
-                                        "kind": "stage2_pending",
-                                        "cluster": cluster.to_dict(),
-                                        "stage1": cand,
-                                        "theme_key": tkey,
-                                        "catalyst_score": score_val,
-                                        "first_seen": first_seen_iso,
-                                        "created_at": cand_now.isoformat(),
-                                        "expires_at": (cand_now + timedelta(minutes=ttl_min)).isoformat(),
-                                        "retries": 0,
-                                        "reason": f"stage2_error:{str(exc)[:80]}",
-                                    },
-                                    trace,
-                                    cycle,
-                                    cand_now,
-                                )
-                                if not dry_run:
-                                    state.save(now=cand_now)
-                                continue
-
-                            try:
-                                if dry_run:
-                                    print(msg)
+                                legacy_cooldown = tnorm in batch_themes or state.in_cooldown(tkey, cooldown_h, now=cand_now)
+                                if dedup_mode == "enforce":
+                                    if tnorm in batch_themes:
+                                        blocked_pre = True
+                                        block_reason = "cooldown_skip"
+                                    elif dedup_pre["is_dup"]:
+                                        blocked_pre = True
+                                        block_reason = f"dedup_pre_stage2:{dedup_pre['reason']}"
+                                    elif dedup_pre["escalated"]:
+                                        blocked_pre = False
+                                        block_reason = ""
+                                    elif state.in_cooldown(tkey, cooldown_h, now=cand_now):
+                                        blocked_pre = True
+                                        block_reason = "cooldown_skip"
+                                    else:
+                                        blocked_pre = False
+                                        block_reason = ""
                                 else:
-                                    send_telegram(tg_token, tg_chat, msg, start_chunk=0)
-                                    state.mark_alerted(tkey, now=cand_now, **alert_meta)
-                                    state.save(now=cand_now)
-                                    logger.info("%s 텔레그램 알림 발송 완료: %s", tag, title_str)
-                                # 발송 성공 후에만 batch_themes 등록 (실패 시 재시도 허용)
-                                batch_themes.add(tnorm)
-                                alerted_cids.add(cid)
-                                sent_this_run += 1
-                                row_summary["alerts_sent"] += 1
-                            except TelegramPartialSendError as tg_exc:
-                                deferred_reasons[cid] = "send_error"
-                                logger.warning(
-                                    "%s 텔레그램 발송 실패(sent_chunks=%d) — deferred(send_pending) 보관 (%s): %s",
-                                    tag, tg_exc.sent_chunks, tkey, tg_exc,
-                                )
-                                enqueue_deferred(
-                                    state,
-                                    {
-                                        "kind": "send_pending",
-                                        "cluster": cluster.to_dict(),
-                                        "stage1": cand,
-                                        "theme_key": tkey,
-                                        "catalyst_score": score_val,
-                                        "first_seen": first_seen_iso,
-                                        "created_at": cand_now.isoformat(),
-                                        "stage2_completed_at": cand_now.isoformat(),
-                                        "expires_at": (cand_now + timedelta(minutes=ttl_min)).isoformat(),
-                                        "retries": 0,
-                                        "reason": f"send_error:{str(tg_exc)[:80]}",
-                                        "message_html": msg,
-                                        "deep_title": title_str,
-                                        "alert_meta": alert_meta,
-                                        "sent_chunks": tg_exc.sent_chunks,
-                                    },
-                                    trace,
-                                    cycle,
-                                    cand_now,
-                                )
-                                if not dry_run:
-                                    state.save(now=cand_now)
-                                continue
+                                    blocked_pre = legacy_cooldown
+                                    block_reason = "cooldown_skip" if legacy_cooldown else ""
 
-                    # 기사 단위 상태 전이·판정 trace 기록
-                    trace_now = _now()
-                    for rank, cl in enumerate(ranked_clusters, start=1):
-                        cid = cl.cluster_id
-                        in_s1 = rank <= 25
-                        ev = selected_map.get(cid)
-                        s1_score = float(ev.get("catalyst_score", 0) or 0) if ev else None
-                        s1_selected = bool(ev and (s1_score or 0.0) >= min_score)
-                        d_reason = deferred_reasons.get(cid) or (None if in_s1 else "cluster_rank_overflow")
-                        sent_flag = cid in alerted_cids
-                        for item in cl.items:
-                            fs_dt = parse_iso_kst(item.first_seen) or trace_now
-                            pub_dt = parse_pub_date(item.published_at)
-                            pub_lag = int((fs_dt - pub_dt).total_seconds()) if pub_dt is not None else None
-                            trace.emit({
-                                "ts": trace_now.isoformat(),
-                                "type": "article_decision",
-                                "cycle": cycle,
-                                "first_seen": fs_dt.isoformat(),
-                                "source": item.source,
-                                "pub_date_raw": item.published_at,
-                                "pub_date": pub_dt.isoformat() if pub_dt else None,
-                                "pub_lag_sec": pub_lag,
-                                "url_hash": url_hash(item.url),
-                                "title": item.title[:160],
-                                "cluster_id": cid,
-                                "cluster_rank": rank,
-                                "included_in_stage1": in_s1,
-                                "stage1_score": s1_score,
-                                "stage1_selected": s1_selected,
-                                "deferred_reason": d_reason,
-                                "alert_sent": sent_flag,
-                            })
+                                trace.emit({
+                                    "ts": cand_now.isoformat(),
+                                    "type": "dedup_decision",
+                                    "cycle": cycle,
+                                    "phase": "pre_stage2",
+                                    "mode": dedup_mode,
+                                    "cluster_id": cid,
+                                    "theme_key": tkey,
+                                    "catalyst_score": score_val,
+                                    "would_block": bool(dedup_pre["is_dup"]),
+                                    "blocked": blocked_pre,
+                                    **dedup_pre,
+                                })
 
-                    successful_cycles += 1
+                                if blocked_pre:
+                                    deferred_reasons[cid] = block_reason or "cooldown_skip"
+                                    logger.info("%s 중복/쿨다운 테마 스킵(%s): %s", tag, deferred_reasons[cid], tkey)
+                                    continue
+
+                                title_prefix = "[후속] " if (dedup_mode == "enforce" and dedup_pre["escalated"]) else ""
+
+                                # 실행당/단기/일일 알림 한도 초과 시 영구 유실 대신 deferred 큐 보관
+                                if _burst_limit_reached(cand_now) or state.sent_today(now=cand_now) >= max_daily:
+                                    reason = "over_daily_limit" if state.sent_today(now=cand_now) >= max_daily else "over_run_limit"
+                                    deferred_reasons[cid] = reason
+                                    enqueue_deferred(
+                                        state,
+                                        {
+                                            "kind": "stage2_pending",
+                                            "cluster": cluster.to_dict(),
+                                            "stage1": cand,
+                                            "theme_key": tkey,
+                                            "catalyst_score": score_val,
+                                            "first_seen": first_seen_iso,
+                                            "created_at": cand_now.isoformat(),
+                                            "expires_at": (cand_now + timedelta(minutes=ttl_min)).isoformat(),
+                                            "retries": 0,
+                                            "reason": reason,
+                                        },
+                                        trace,
+                                        cycle,
+                                        cand_now,
+                                    )
+                                    if not dry_run:
+                                        state.save(now=cand_now)
+                                    logger.info("%s 알림 한도 도달 — 후순위 후보 deferred 보관: %s", tag, tkey)
+                                    continue
+
+                                # 후보별 개별 try/except: 한 후보 실패 시 나머지 후보 중단 및 유실 방지
+                                try:
+                                    msg, title_str, deep_model, alert_meta = _build_stage2_message(
+                                        api_key=api_key,
+                                        deep_models=deep_models,
+                                        deep_thinking_level=deep_thinking_level,
+                                        deep_thinking_budget=deep_thinking_budget,
+                                        deep_timeout=deep_timeout,
+                                        min_score=min_score,
+                                        companies=comps,
+                                        cluster=cluster,
+                                        cand=cand,
+                                        delay_note=None,
+                                        now=cand_now,
+                                        state=state,
+                                        matched_override=matched,
+                                        title_prefix=title_prefix,
+                                    )
+                                    ai_calls += 1
+                                    logger.info("%s Stage 2 심층 분석 완료 (%s): %s", tag, deep_model, title_str)
+                                except GeminiAuthError:
+                                    raise
+                                except Exception as exc:
+                                    deferred_reasons[cid] = "stage2_error"
+                                    logger.warning("%s 후보 Stage 2 실패 — deferred(stage2_pending) 보관 (%s): %s", tag, tkey, exc)
+                                    enqueue_deferred(
+                                        state,
+                                        {
+                                            "kind": "stage2_pending",
+                                            "cluster": cluster.to_dict(),
+                                            "stage1": cand,
+                                            "theme_key": tkey,
+                                            "catalyst_score": score_val,
+                                            "first_seen": first_seen_iso,
+                                            "created_at": cand_now.isoformat(),
+                                            "expires_at": (cand_now + timedelta(minutes=ttl_min)).isoformat(),
+                                            "retries": 0,
+                                            "reason": f"stage2_error:{str(exc)[:80]}",
+                                        },
+                                        trace,
+                                        cycle,
+                                        cand_now,
+                                    )
+                                    if not dry_run:
+                                        state.save(now=cand_now)
+                                    continue
+
+                                # 발송 직전 2차 중복 안전망 체크 (final_codes 기준)
+                                dedup_post = evaluate_duplicate_candidate(
+                                    theme_key=tkey,
+                                    tokens=alert_meta.get("tokens") or cand_tokens,
+                                    keywords=alert_meta.get("keywords") or cand_keywords,
+                                    codes=alert_meta.get("final_codes") or [],
+                                    catalyst_score=score_val,
+                                    recent_alerts=state.recent_alerts,
+                                    cooldown_hours=cooldown_h,
+                                    now=cand_now,
+                                    code_field="final_codes",
+                                )
+                                blocked_post = bool(dedup_mode == "enforce" and dedup_post["is_dup"])
+                                trace.emit({
+                                    "ts": cand_now.isoformat(),
+                                    "type": "dedup_decision",
+                                    "cycle": cycle,
+                                    "phase": "pre_send",
+                                    "mode": dedup_mode,
+                                    "cluster_id": cid,
+                                    "theme_key": tkey,
+                                    "catalyst_score": score_val,
+                                    "would_block": bool(dedup_post["is_dup"]),
+                                    "blocked": blocked_post,
+                                    **dedup_post,
+                                })
+                                if blocked_post:
+                                    deferred_reasons[cid] = f"dedup_pre_send:{dedup_post['reason']}"
+                                    logger.info("%s 발송 직전 2차 중복 차단(%s): %s", tag, dedup_post["reason"], tkey)
+                                    continue
+
+                                try:
+                                    if dry_run:
+                                        print(msg)
+                                    else:
+                                        send_telegram(tg_token, tg_chat, msg, start_chunk=0)
+                                        state.mark_alerted(tkey, now=cand_now, **alert_meta)
+                                        state.save(now=cand_now)
+                                        logger.info("%s 텔레그램 알림 발송 완료: %s", tag, title_str)
+                                    # 발송 성공 후에만 batch_themes 등록 (실패 시 재시도 허용)
+                                    batch_themes.add(tnorm)
+                                    alerted_cids.add(cid)
+                                    sent_this_run += 1
+                                    row_summary["alerts_sent"] += 1
+                                except TelegramPartialSendError as tg_exc:
+                                    deferred_reasons[cid] = "send_error"
+                                    logger.warning(
+                                        "%s 텔레그램 발송 실패(sent_chunks=%d) — deferred(send_pending) 보관 (%s): %s",
+                                        tag, tg_exc.sent_chunks, tkey, tg_exc,
+                                    )
+                                    enqueue_deferred(
+                                        state,
+                                        {
+                                            "kind": "send_pending",
+                                            "cluster": cluster.to_dict(),
+                                            "stage1": cand,
+                                            "theme_key": tkey,
+                                            "catalyst_score": score_val,
+                                            "first_seen": first_seen_iso,
+                                            "created_at": cand_now.isoformat(),
+                                            "stage2_completed_at": cand_now.isoformat(),
+                                            "expires_at": (cand_now + timedelta(minutes=ttl_min)).isoformat(),
+                                            "retries": 0,
+                                            "reason": f"send_error:{str(tg_exc)[:80]}",
+                                            "message_html": msg,
+                                            "deep_title": title_str,
+                                            "alert_meta": alert_meta,
+                                            "sent_chunks": tg_exc.sent_chunks,
+                                        },
+                                        trace,
+                                        cycle,
+                                        cand_now,
+                                    )
+                                    if not dry_run:
+                                        state.save(now=cand_now)
+                                    continue
+
+                        # 기사 단위 상태 전이·판정 trace 기록
+                        trace_now = _now()
+                        for rank, cl in enumerate(ranked_clusters, start=1):
+                            cid = cl.cluster_id
+                            in_s1 = rank <= 25
+                            ev = selected_map.get(cid)
+                            s1_score = float(ev.get("catalyst_score", 0) or 0) if ev else None
+                            s1_selected = bool(ev and (s1_score or 0.0) >= min_score)
+                            d_reason = deferred_reasons.get(cid) or (None if in_s1 else "cluster_rank_overflow")
+                            sent_flag = cid in alerted_cids
+                            for item in cl.items:
+                                fs_dt = parse_iso_kst(item.first_seen) or trace_now
+                                pub_dt = parse_pub_date(item.published_at)
+                                pub_lag = int((fs_dt - pub_dt).total_seconds()) if pub_dt is not None else None
+                                trace.emit({
+                                    "ts": trace_now.isoformat(),
+                                    "type": "article_decision",
+                                    "cycle": cycle,
+                                    "first_seen": fs_dt.isoformat(),
+                                    "source": item.source,
+                                    "pub_date_raw": item.published_at,
+                                    "pub_date": pub_dt.isoformat() if pub_dt else None,
+                                    "pub_lag_sec": pub_lag,
+                                    "url_hash": url_hash(item.url),
+                                    "title": item.title[:160],
+                                    "cluster_id": cid,
+                                    "cluster_rank": rank,
+                                    "included_in_stage1": in_s1,
+                                    "stage1_score": s1_score,
+                                    "stage1_selected": s1_selected,
+                                    "deferred_reason": d_reason,
+                                    "alert_sent": sent_flag,
+                                })
+
+                        successful_cycles += 1
             except GeminiAuthError:
                 raise
             except Exception as exc:
@@ -2573,7 +3156,7 @@ def run_live(
 
             if cycle < total_cycles:
                 check_now = _now()
-                if state.sent_today(now=check_now) >= max_daily or sent_this_run >= max_per_run:
+                if state.sent_today(now=check_now) >= max_daily or _burst_limit_reached(check_now):
                     logger.info("%s 알림 한도 도달 — 남은 워커 사이클을 조기 종료합니다.", tag)
                     break
                 elapsed = time.monotonic() - cycle_start
@@ -2613,21 +3196,164 @@ def run_live(
         raise RuntimeError(f"모든 감시 사이클 실패: {last_cycle_err}")
 
 
+def run_daemon(
+    *,
+    dry_run: bool = False,
+    data_dir: Path | None = None,
+    now_fn: Callable[[], datetime] | None = None,
+    max_iterations: int | None = None,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """우분투 24/7 상시 서버 전용 무한 감시 데몬 (시간대별 적응형 주기·실시간 설정 리로드·즉시 스캔 지원)."""
+    def _now() -> datetime:
+        dt = now_fn() if now_fn is not None else datetime.now(KST)
+        return dt.replace(tzinfo=KST) if dt.tzinfo is None else dt.astimezone(KST)
+
+    base_dir = data_dir if data_dir is not None else Path("data")
+    base_dir.mkdir(parents=True, exist_ok=True)
+    trigger_file = base_dir / "trigger_now"
+
+    stop_evt = stop_event if stop_event is not None else threading.Event()
+    if stop_event is None and threading.current_thread() is threading.main_thread():
+        def _handle_sig(signum: int, _frame: Any) -> None:
+            logger.info("종료 시그널(%d) 수신 — 현재 사이클 마무리 후 안전 종료합니다.", signum)
+            stop_evt.set()
+        signal.signal(signal.SIGTERM, _handle_sig)
+        signal.signal(signal.SIGINT, _handle_sig)
+
+    started_at = _now()
+    logger.info("News Alpha Radar 상시 데몬 시작 (PID=%d, data_dir=%s)", os.getpid(), base_dir)
+
+    iterations = 0
+    last_error: str | None = None
+
+    while not stop_evt.is_set():
+        iter_now = _now()
+        runtime_cfg = load_runtime_config(base_dir)
+        poll_sec, window_label = resolve_daemon_interval_sec(now=iter_now, runtime_cfg=runtime_cfg)
+        active_feeds = resolve_active_feeds(runtime_cfg, daemon_mode=True) or RSS_FEEDS
+        paused = bool(runtime_cfg.get("paused", False))
+        manual_wake = trigger_file.exists()
+        if manual_wake:
+            try:
+                trigger_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        if paused and not manual_wake:
+            write_status_snapshot(
+                base_dir,
+                {
+                    "pid": os.getpid(),
+                    "mode": "daemon",
+                    "state": "paused",
+                    "started_at": started_at.isoformat(),
+                    "heartbeat_at": iter_now.isoformat(),
+                    "last_cycle_at": None,
+                    "next_cycle_at": (iter_now + timedelta(seconds=10)).isoformat(),
+                    "poll_interval_sec": poll_sec,
+                    "window_label": window_label,
+                    "active_feeds_count": len(active_feeds),
+                    "last_error": last_error,
+                },
+            )
+            iterations += 1
+            if max_iterations is not None and iterations >= max_iterations:
+                break
+            for _ in range(5):
+                if stop_evt.is_set() or trigger_file.exists():
+                    break
+                time.sleep(2)
+            continue
+
+        cycle_t0 = time.monotonic()
+        try:
+            run_live(
+                dry_run=dry_run,
+                cycles=1,
+                interval_sec=0,
+                data_dir=base_dir,
+                now_fn=now_fn,
+                daemon_mode=True,
+            )
+            last_error = None
+        except GeminiAuthError as auth_exc:
+            last_error = str(auth_exc)
+            logger.error("데몬 치명적 API 키 오류: %s — 5분 후 재확인합니다.", auth_exc)
+            poll_sec = max(poll_sec, 300)
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning("데몬 사이클 일시 오류 (다음 주기에 자동 복구): %s", exc)
+
+        done_now = _now()
+        elapsed = time.monotonic() - cycle_t0
+        wait_sec = max(1.0, poll_sec - elapsed)
+        next_at = done_now + timedelta(seconds=wait_sec)
+        write_status_snapshot(
+            base_dir,
+            {
+                "pid": os.getpid(),
+                "mode": "daemon",
+                "state": "error" if last_error else "running",
+                "started_at": started_at.isoformat(),
+                "heartbeat_at": done_now.isoformat(),
+                "last_cycle_at": done_now.isoformat(),
+                "last_cycle_sec": round(elapsed, 2),
+                "next_cycle_at": next_at.isoformat(),
+                "poll_interval_sec": poll_sec,
+                "window_label": window_label,
+                "active_feeds_count": len(active_feeds),
+                "last_error": last_error,
+            },
+        )
+
+        iterations += 1
+        if max_iterations is not None and iterations >= max_iterations:
+            break
+
+        deadline = time.monotonic() + wait_sec
+        while not stop_evt.is_set() and time.monotonic() < deadline:
+            if trigger_file.exists():
+                logger.info("대시보드 즉시 스캔 요청 감지 — 대기를 중단하고 바로 감시를 시작합니다.")
+                break
+            rem = deadline - time.monotonic()
+            stop_evt.wait(timeout=min(2.0, max(0.1, rem)))
+
+    write_status_snapshot(
+        base_dir,
+        {
+            "pid": os.getpid(),
+            "mode": "daemon",
+            "state": "stopped",
+            "started_at": started_at.isoformat(),
+            "heartbeat_at": _now().isoformat(),
+            "last_error": last_error,
+        },
+    )
+    logger.info("News Alpha Radar 상시 데몬 정상 종료.")
+
+
 def main() -> int:
+    load_dotenv_file()
     parser = argparse.ArgumentParser(description="News Alpha Radar (24/7 Free)")
-    parser.add_argument("--mode", choices=["live", "demo", "probe"], default="live")
+    parser.add_argument("--mode", choices=["live", "demo", "probe", "daemon"], default="live")
+    parser.add_argument("--daemon", action="store_true", help="우분투 등 상시 가동 서버용 24/7 무한 루프 모드 실행")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--probe-feeds", action="store_true", help="모든 활성+후보 RSS 피드의 상태코드·항목 수·최신 pubDate 점검")
     parser.add_argument("--cycles", type=int, default=None, help="연속 감시 횟수 강제 지정 (미지정 시 장중 6회 / 그 외 1회)")
     parser.add_argument("--interval", type=int, default=None, help="연속 감시 간격(초) 강제 지정 (기본 120초)")
+    parser.add_argument("--data-dir", type=str, default=None, help="상태·트레이스 저장 디렉터리 (기본 data)")
     args = parser.parse_args()
+    data_dir = Path(args.data_dir) if args.data_dir else None
     try:
         if args.probe_feeds or args.mode == "probe":
             probe_feeds()
+        elif args.daemon or args.mode == "daemon":
+            run_daemon(dry_run=args.dry_run, data_dir=data_dir)
         elif args.mode == "demo":
             run_demo(args.dry_run, os.getenv("TELEGRAM_BOT_TOKEN", "").strip(), os.getenv("TELEGRAM_CHAT_ID", "").strip())
         else:
-            run_live(args.dry_run, cycles=args.cycles, interval_sec=args.interval)
+            run_live(args.dry_run, cycles=args.cycles, interval_sec=args.interval, data_dir=data_dir)
         return 0
     except Exception as exc:
         logger.exception("실행 오류: %s", exc)

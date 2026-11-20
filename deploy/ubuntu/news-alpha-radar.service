@@ -1,0 +1,17 @@
+[Unit]
+Description=News Alpha Radar (24/7 Domestic Stock News Daemon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__WORKDIR__
+EnvironmentFile=-__WORKDIR__/.env
+ExecStart=__PYTHON__ -u __WORKDIR__/radar.py --daemon
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

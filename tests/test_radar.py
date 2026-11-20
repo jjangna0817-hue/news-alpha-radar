@@ -871,5 +871,295 @@ class TestWorkflowConfig(unittest.TestCase):
         self.assertIn("--probe-feeds", yml)
 
 
+class TestPR3DedupTriggerDaemonAndDashboard(unittest.TestCase):
+    def test_pr3_dedup_hub_exclusion_and_escalation_followup(self) -> None:
+        now = datetime(2026, 11, 20, 11, 0, tzinfo=KST)
+        # Hub stock '005930' appears in 3 distinct alerts within 7 days -> excluded from overlap!
+        recent = [
+            {"ts": (now - timedelta(days=3)).isoformat(), "theme_key": "이슈1", "tokens": ["alpha"], "keywords": ["kw1"], "cand_codes": ["005930"], "final_codes": ["005930"], "catalyst_score": 8.0},
+            {"ts": (now - timedelta(days=2)).isoformat(), "theme_key": "이슈2", "tokens": ["beta"], "keywords": ["kw2"], "cand_codes": ["005930"], "final_codes": ["005930"], "catalyst_score": 8.0},
+            {
+                "ts": (now - timedelta(hours=2)).isoformat(),
+                "theme_key": "컬리_개인정보유출",
+                "tokens": ["컬리", "개인정보", "유출", "피해", "보상"],
+                "keywords": ["사이버보안", "정보보안", "개인정보"],
+                "cand_codes": ["005930", "263860", "053800"],
+                "final_codes": ["005930", "263860", "053800"],
+                "catalyst_score": 8.0,
+            },
+        ]
+        hubs = radar.compute_hub_stocks(recent, now=now)
+        self.assertIn("005930", hubs)
+        self.assertNotIn("263860", hubs)
+
+        # Unrelated event sharing only hub stock '005930' must NOT be marked duplicate
+        unrelated = radar.evaluate_duplicate_candidate(
+            theme_key="전혀다른_메모리_수주",
+            tokens=["메모리", "신공장", "증설"],
+            keywords=["반도체", "장비", "수주"],
+            codes=["005930", "999999"],
+            catalyst_score=8.0,
+            recent_alerts=recent,
+            cooldown_hours=12,
+            now=now,
+        )
+        self.assertFalse(unrelated["is_dup"])
+
+        # Same incident with DIFFERENT theme_key -> caught by (T, K, C) rules!
+        same_diff_key = radar.evaluate_duplicate_candidate(
+            theme_key="컬리_해킹_2보",
+            tokens=["컬리", "개인정보", "유출", "추가", "조사"],
+            keywords=["사이버보안", "정보보안"],
+            codes=["263860", "053800"],
+            catalyst_score=8.4,  # < 8.0 + 1.0 -> blocked
+            recent_alerts=recent,
+            cooldown_hours=12,
+            now=now,
+        )
+        self.assertTrue(same_diff_key["is_dup"])
+        self.assertFalse(same_diff_key["escalated"])
+
+        # Same incident with +1.0 escalation (9.1 >= 8.0 + 1.0) -> allowed with escalated=True!
+        escalated = radar.evaluate_duplicate_candidate(
+            theme_key="컬리_해킹_전수조사",
+            tokens=["컬리", "개인정보", "유출", "정부", "전수조사"],
+            keywords=["사이버보안", "정보보안"],
+            codes=["263860", "053800"],
+            catalyst_score=9.1,
+            recent_alerts=recent,
+            cooldown_hours=12,
+            now=now,
+        )
+        self.assertFalse(escalated["is_dup"])
+        self.assertTrue(escalated["escalated"])
+
+    def test_pr3_e2e_enforce_blocks_before_stage2_and_escalates_with_followup_prefix(self) -> None:
+        t0 = datetime(2026, 11, 20, 10, 0, tzinfo=KST)
+        item_dup = radar.NewsItem("컬리 개인정보 유출 해킹 추가 피해 확인", "https://ex.com/dup", "연합뉴스_사회", "사회/사건", first_seen=t0.isoformat())
+        item_esc = radar.NewsItem("컬리 개인정보 유출 해킹 정부 전수조사 착수", "https://ex.com/esc", "연합뉴스_사회", "사회/사건", first_seen=t0.isoformat())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            st = radar.StateStore(tmp_dir / "state.json")
+            st.mark_alerted(
+                "컬리_최초보도",
+                now=t0 - timedelta(hours=1),
+                tokens=["컬리", "개인정보", "유출", "해킹", "피해"],
+                keywords=["사이버보안", "정보보안"],
+                cand_codes=["263860", "053800"],
+                final_codes=["263860", "053800"],
+                catalyst_score=8.0,
+            )
+            st.save(now=t0)
+
+            stage2_calls = [0]
+            sent_msgs: list[str] = []
+
+            def fake_gemini(api_key, models, sp, up, **kw):
+                if sp == radar.SCREENING_PROMPT:
+                    cls = json.loads(up)["clusters"]
+                    return {
+                        "selected_events": [{
+                            "cluster_id": cls[0]["cluster_id"],
+                            "catalyst_score": 8.2,  # dup, not escalated
+                            "theme_key": "컬리_다른테마키",
+                            "first_order_keywords": ["정보보안"],
+                            "second_order_keywords": ["사이버보안"],
+                        }]
+                    }, "gemini-3.5-flash-lite"
+                stage2_calls[0] += 1
+                return {"title": "심층분석", "event_summary": "요약", "stocks": [{"code": "263860", "name": "지니언스"}]}, "gemini-3.6-flash"
+
+            env = {"GEMINI_API_KEY": "k", "TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c", "DEDUP_MODE": "enforce", "TRIGGER_MODE": "shadow"}
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.object(radar, "fetch_rss_news", return_value=[item_dup]),
+                mock.patch.object(radar, "call_gemini", side_effect=fake_gemini),
+                mock.patch.object(radar, "load_krx_master", return_value={c["code"]: dict(c) for c in radar.SEED_COMPANIES}),
+                mock.patch.object(radar, "fetch_naver_quotes", return_value={}),
+                mock.patch.object(radar, "send_telegram", side_effect=lambda t, c, m, start_chunk=0: sent_msgs.append(m) or 1),
+            ):
+                radar.run_live(dry_run=False, cycles=1, data_dir=tmp_dir, now_fn=lambda: t0)
+
+            # Blocked BEFORE Stage 2 -> 0 Stage 2 calls, 0 alerts!
+            self.assertEqual(stage2_calls[0], 0)
+            self.assertEqual(len(sent_msgs), 0)
+
+            # Now score 9.2 (>= 8.0 + 1.0) -> escalated pass-through with [후속] prefix!
+            def fake_gemini_esc(api_key, models, sp, up, **kw):
+                if sp == radar.SCREENING_PROMPT:
+                    cls = json.loads(up)["clusters"]
+                    return {
+                        "selected_events": [{
+                            "cluster_id": cls[0]["cluster_id"],
+                            "catalyst_score": 9.2,
+                            "theme_key": "컬리_최초보도",
+                            "first_order_keywords": ["정보보안"],
+                            "second_order_keywords": ["사이버보안"],
+                        }]
+                    }, "gemini-3.5-flash-lite"
+                stage2_calls[0] += 1
+                return {"title": "컬리 해킹 정부 전수조사 확대", "event_summary": "요약", "stocks": [{"code": "263860", "name": "지니언스"}]}, "gemini-3.6-flash"
+
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.object(radar, "fetch_rss_news", return_value=[item_esc]),
+                mock.patch.object(radar, "call_gemini", side_effect=fake_gemini_esc),
+                mock.patch.object(radar, "load_krx_master", return_value={c["code"]: dict(c) for c in radar.SEED_COMPANIES}),
+                mock.patch.object(radar, "fetch_naver_quotes", return_value={}),
+                mock.patch.object(radar, "send_telegram", side_effect=lambda t, c, m, start_chunk=0: sent_msgs.append(m) or 1),
+            ):
+                radar.run_live(dry_run=False, cycles=1, data_dir=tmp_dir, now_fn=lambda: t0 + timedelta(minutes=5))
+
+            self.assertEqual(stage2_calls[0], 1)
+            self.assertEqual(len(sent_msgs), 1)
+            self.assertIn("[후속] 컬리 해킹 정부 전수조사 확대", sent_msgs[0])
+
+    def test_pr3_stage1_trigger_hs_political_guard_and_rpd_tiers(self) -> None:
+        now = datetime(2026, 11, 20, 10, 0, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            st = radar.StateStore(Path(tmp) / "state.json")
+            st.last_stage1_at = (now - timedelta(minutes=2)).isoformat()
+
+            # 1) Plain single article -> waiting (should_run=False)
+            plain = [radar.NewsItem("지역 축제 주말 개최 안내", "https://ex.com/1", "매일경제_사회", "사회/사건", first_seen=now.isoformat())]
+            res_wait = radar.evaluate_stage1_trigger(plain, radar.cluster_news_ranked(plain, now=now), st, now=now, market_window=True)
+            self.assertFalse(res_wait["should_run"])
+            self.assertEqual(res_wait["reason"], "waiting_batch_or_trigger")
+
+            # 2) Political multi-outlet story MUST NOT trigger multi_outlet!
+            pol = [
+                radar.NewsItem("민주당 여야 탄핵안 국회 본회의 공방", "https://ex.com/p1", "연합뉴스_최신", "속보", first_seen=now.isoformat()),
+                radar.NewsItem("민주당 여야 탄핵안 국회 본회의 공방 격화", "https://ex.com/p2", "매일경제_사회", "사회/사건", first_seen=now.isoformat()),
+            ]
+            res_pol = radar.evaluate_stage1_trigger(pol, radar.cluster_news_ranked(pol, now=now), st, now=now, market_window=True)
+            self.assertFalse(res_pol["should_run"])
+
+            # 3) Non-political multi-outlet story triggers multi_outlet!
+            multi = [
+                radar.NewsItem("차세대 전고체 배터리 상용화 일정 앞당겨", "https://ex.com/m1", "연합뉴스_산업", "경제/산업", first_seen=now.isoformat()),
+                radar.NewsItem("차세대 전고체 배터리 상용화 일정 가속", "https://ex.com/m2", "매일경제_경제", "경제/산업", first_seen=now.isoformat()),
+            ]
+            res_multi = radar.evaluate_stage1_trigger(multi, radar.cluster_news_ranked(multi, now=now), st, now=now, market_window=True)
+            self.assertTrue(res_multi["should_run"])
+            self.assertEqual(res_multi["reason"], "multi_outlet")
+
+            # 4) RPD at 92% (460 / 500) -> h_only blocks multi_outlet & batch, but allows Hard keyword!
+            pt_day = radar.pt_date_str(now)
+            st.daily_ai_calls[pt_day] = {"gemini-3.5-flash-lite": {"requests": 460, "stage1": 460, "stage2": 0}}
+            res_blocked = radar.evaluate_stage1_trigger(multi, radar.cluster_news_ranked(multi, now=now), st, now=now, market_window=True, daily_rpd_limit=500)
+            self.assertFalse(res_blocked["should_run"])
+            self.assertEqual(res_blocked["rpd_tier"], "h_only")
+            self.assertEqual(res_blocked["reason"], "rpd_90_h_only_guard")
+
+            hard_item = [radar.NewsItem("대형 통신사 랜섬웨어 해킹 사고 발생", "https://ex.com/h1", "연합뉴스_최신", "속보", first_seen=now.isoformat())]
+            res_hard = radar.evaluate_stage1_trigger(hard_item, radar.cluster_news_ranked(hard_item, now=now), st, now=now, market_window=True, daily_rpd_limit=500)
+            self.assertTrue(res_hard["should_run"])
+            self.assertEqual(res_hard["reason"], "hard_keyword")
+
+    def test_daemon_intervals_default_feeds_and_paused_heartbeat(self) -> None:
+        # Adaptive intervals
+        self.assertEqual(radar.resolve_daemon_interval_sec(datetime(2026, 11, 20, 9, 30, tzinfo=KST)), (60, "정규장/장전"))
+        self.assertEqual(radar.resolve_daemon_interval_sec(datetime(2026, 11, 20, 16, 30, tzinfo=KST)), (180, "장전초/장후"))
+        self.assertEqual(radar.resolve_daemon_interval_sec(datetime(2026, 11, 20, 23, 0, tzinfo=KST)), (600, "심야/주말"))
+        self.assertEqual(radar.resolve_daemon_interval_sec(datetime(2026, 11, 21, 10, 0, tzinfo=KST)), (600, "심야/주말"))
+
+        # Daemon default feeds include 전자신문_속보 & 뉴시스_속보 (12 feeds total)
+        daemon_feeds = radar.resolve_active_feeds(None, daemon_mode=True)
+        assert daemon_feeds is not None
+        names = {f["name"] for f in daemon_feeds}
+        self.assertIn("전자신문_속보", names)
+        self.assertIn("뉴시스_속보", names)
+        self.assertEqual(len(daemon_feeds), 12)
+
+        # Paused runtime_config prevents run_live call and records status.json
+        t0 = datetime(2026, 11, 20, 10, 0, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            radar.save_runtime_config(tmp_dir, {"paused": True})
+            with mock.patch.object(radar, "run_live", side_effect=AssertionError("paused daemon must not call run_live")):
+                radar.run_daemon(dry_run=True, data_dir=tmp_dir, now_fn=lambda: t0, max_iterations=1)
+            status = json.loads((tmp_dir / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status["state"], "stopped")  # exited cleanly after max_iterations=1
+
+    def test_dashboard_http_api_auth_config_and_probe(self) -> None:
+        import base64
+        import threading as _th
+        import dashboard
+
+        now = datetime(2026, 11, 20, 10, 0, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            st = radar.StateStore(tmp_dir / "state.json")
+            st.mark_alerted("테스트_알림", now=now, final_codes=["446840"], catalyst_score=8.7, title="테스트 알림 제목")
+            st.save(now=now)
+            radar.write_status_snapshot(
+                tmp_dir,
+                {
+                    "pid": 12345,
+                    "mode": "daemon",
+                    "state": "running",
+                    "heartbeat_at": datetime.now(KST).isoformat(),
+                    "poll_interval_sec": 60,
+                    "window_label": "정규장/장전",
+                },
+            )
+
+            srv = dashboard.create_dashboard_server("127.0.0.1", 0, data_dir=tmp_dir, password="secret")
+            port = srv.server_address[1]
+            t = _th.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            auth_hdr = "Basic " + base64.b64encode(b"admin:secret").decode("ascii")
+            base = f"http://127.0.0.1:{port}"
+            try:
+                # 1) Unauthenticated request -> 401
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(f"{base}/api/overview", timeout=5)
+                self.assertEqual(ctx.exception.code, 401)
+
+                # 2) Authenticated HTML page -> 200
+                req_html = urllib.request.Request(f"{base}/", headers={"Authorization": auth_hdr})
+                with urllib.request.urlopen(req_html, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    self.assertIn("News Alpha Radar", resp.read().decode("utf-8"))
+
+                # 3) Authenticated overview -> returns daemon alive + recent alert
+                req_ov = urllib.request.Request(f"{base}/api/overview", headers={"Authorization": auth_hdr})
+                with urllib.request.urlopen(req_ov, timeout=5) as resp:
+                    ov = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(ov["daemon"]["alive"])
+                self.assertEqual(len(ov["recent_alerts"]), 1)
+                self.assertEqual(ov["recent_alerts"][0]["title"], "테스트 알림 제목")
+
+                # 4) POST /api/config updates runtime_config.json
+                body = json.dumps({"min_catalyst_score": 8.0, "dedup_mode": "shadow", "enabled_feeds": ["연합뉴스_최신", "뉴시스_속보"]}).encode("utf-8")
+                req_cfg = urllib.request.Request(f"{base}/api/config", data=body, headers={"Authorization": auth_hdr, "Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req_cfg, timeout=5) as resp:
+                    cfg_res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(cfg_res["ok"])
+                saved_cfg = radar.load_runtime_config(tmp_dir)
+                self.assertEqual(saved_cfg["min_catalyst_score"], 8.0)
+                self.assertEqual(saved_cfg["enabled_feeds"], ["연합뉴스_최신", "뉴시스_속보"])
+
+                # 5) POST /api/actions/scan-now wakes running daemon via trigger_now file
+                req_scan = urllib.request.Request(f"{base}/api/actions/scan-now", data=b"{}", headers={"Authorization": auth_hdr, "Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req_scan, timeout=5) as resp:
+                    scan_res = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(scan_res["mode"], "woke_daemon")
+                self.assertTrue((tmp_dir / "trigger_now").exists())
+
+                # 6) POST /api/actions/probe-feeds returns mocked rows
+                fake_rows = [{"name": "연합뉴스_최신", "status": 200, "items": 25, "elapsed": 0.4, "lag_min": 5.0, "error": None, "sample_title": "속보"}]
+                with mock.patch.object(radar, "probe_feeds", return_value=fake_rows):
+                    req_probe = urllib.request.Request(f"{base}/api/actions/probe-feeds", data=b"{}", headers={"Authorization": auth_hdr, "Content-Type": "application/json"}, method="POST")
+                    with urllib.request.urlopen(req_probe, timeout=5) as resp:
+                        probe_res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(probe_res["ok"])
+                self.assertEqual(len(probe_res["rows"]), 1)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

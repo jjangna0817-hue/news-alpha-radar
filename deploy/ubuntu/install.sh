@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+PYTHON_BIN="$(command -v python3 || true)"
+
+if [ -z "${PYTHON_BIN}" ]; then
+  echo "[오류] python3가 설치되어 있지 않습니다. 먼저 설치하세요: sudo apt update && sudo apt install -y python3"
+  exit 1
+fi
+
+"${PYTHON_BIN}" -c 'import sys; assert sys.version_info >= (3, 11), f"Python 3.11+ 필요 (현재 {sys.version})"'
+echo "[확인] Python: $(${PYTHON_BIN} --version)"
+
+mkdir -p "${REPO_DIR}/data"
+
+if [ ! -f "${REPO_DIR}/.env" ]; then
+  cp "${REPO_DIR}/.env.example" "${REPO_DIR}/.env"
+  chmod 600 "${REPO_DIR}/.env"
+  echo ""
+  echo "[안내] .env 파일을 새로 만들었습니다: ${REPO_DIR}/.env"
+  echo "       먼저 아래 명령으로 API 키와 텔레그램 정보를 입력한 뒤 이 스크립트를 다시 실행하세요:"
+  echo "       nano ${REPO_DIR}/.env"
+  exit 0
+fi
+
+if grep -q "여기에_" "${REPO_DIR}/.env"; then
+  echo "[오류] ${REPO_DIR}/.env 안에 아직 예시 문구(여기에_...)가 남아 있습니다."
+  echo "       nano ${REPO_DIR}/.env 로 실제 키를 입력한 뒤 다시 실행하세요."
+  exit 1
+fi
+
+chmod 600 "${REPO_DIR}/.env"
+
+UNIT_DIR="${HOME}/.config/systemd/user"
+mkdir -p "${UNIT_DIR}"
+
+for svc in news-alpha-radar.service news-alpha-dashboard.service; do
+  sed \
+    -e "s|__WORKDIR__|${REPO_DIR}|g" \
+    -e "s|__PYTHON__|${PYTHON_BIN}|g" \
+    "${SCRIPT_DIR}/${svc}" > "${UNIT_DIR}/${svc}"
+  echo "[설치] ${UNIT_DIR}/${svc}"
+done
+
+systemctl --user daemon-reload
+systemctl --user enable --now news-alpha-radar.service news-alpha-dashboard.service
+
+if command -v loginctl >/dev/null 2>&1; then
+  loginctl enable-linger "${USER}" 2>/dev/null || \
+    echo "[참고] 재부팅 후 자동 시작을 위해 필요 시 실행: sudo loginctl enable-linger ${USER}"
+fi
+
+PORT="$(grep -E '^DASHBOARD_PORT=' "${REPO_DIR}/.env" | tail -n 1 | cut -d= -f2- | tr -d ' "\r' || true)"
+PORT="${PORT:-8787}"
+LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo '127.0.0.1')"
+
+echo ""
+echo "============================================================"
+echo " News Alpha Radar 상시 서버 + 웹 대시보드 가동 완료!"
+echo "============================================================"
+echo " • 로컬 대시보드 : http://127.0.0.1:${PORT}"
+echo " • 집 Wi-Fi 접속 : http://${LAN_IP}:${PORT}"
+echo " • 상태 확인     : systemctl --user status news-alpha-radar news-alpha-dashboard"
+echo " • 실시간 로그   : journalctl --user -u news-alpha-radar -f"
+echo ""
+echo "[필수 체크 2가지]"
+echo " 1) 노트북 덮개 닫아도 유지: docs/UBUNTU_SERVER_GUIDE.md 참고"
+echo " 2) 중복 알림 방지: 정상 작동 확인 후 GitHub Actions 워크플로 Disable"
+echo "============================================================"
