@@ -335,9 +335,19 @@ class TestTelegramChunkResumeAndDeferred(unittest.TestCase):
             self.assertIn("⏱ 지연 발송 (최초 포착 09:10, 10분 경과)", sent_msgs[1])
             self.assertIn("15,200원", sent_msgs[1])
 
-            # Deferred queue now empty
+            # Deferred queue now empty & recent_alerts populated for PR-3 dedup
             reloaded = radar.StateStore(tmp_dir / "state.json")
             self.assertEqual(reloaded.deferred, [])
+            self.assertEqual(len(reloaded.recent_alerts), 2)
+            by_theme = {a["theme_key"]: a for a in reloaded.recent_alerts}
+            self.assertIn("AI안경_전파탐지기", by_theme)
+            self.assertIn("통신망_해킹", by_theme)
+            self.assertEqual(by_theme["AI안경_전파탐지기"]["final_codes"], ["446840"])
+            self.assertIn("446840", by_theme["AI안경_전파탐지기"]["cand_codes"])
+            self.assertTrue(len(by_theme["AI안경_전파탐지기"]["tokens"]) >= 1)
+            self.assertTrue(len(by_theme["AI안경_전파탐지기"]["keywords"]) >= 1)
+            self.assertEqual(by_theme["통신망_해킹"]["final_codes"], ["263860"])
+            self.assertGreaterEqual(by_theme["통신망_해킹"]["catalyst_score"], 8.5)
 
             # Trace file contains run_start (with jitter), deferred events, article decisions, cycle summaries
             trace_records = [json.loads(l) for l in (tmp_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -585,6 +595,266 @@ class TestTelegramChunkResumeAndDeferred(unittest.TestCase):
             self.assertTrue(any(r["action"] == "dropped_capacity" and r["cluster_id"] == "evt_0" for r in recs))
 
 
+class _FakeXmlResponse:
+    def __init__(self, xml_bytes: bytes, status: int = 200, headers: dict[str, str] | None = None) -> None:
+        self._bytes = xml_bytes
+        self.status = status
+        self.headers = headers or {}
+
+    def read(self) -> bytes:
+        return self._bytes
+
+    def __enter__(self) -> "_FakeXmlResponse":
+        return self
+
+    def __exit__(self, *args) -> None:
+        return None
+
+
+class TestPR2QuotaPendingRssAndTokens(unittest.TestCase):
+    def test_pacific_midnight_resets_ai_counter_not_alert_counter(self) -> None:
+        # Winter PST = UTC-8, KST = UTC+9 -> 17:00 KST is PT midnight!
+        before_pt_midnight = datetime(2026, 11, 20, 16, 59, tzinfo=KST)
+        after_pt_midnight = datetime(2026, 11, 20, 17, 1, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            st = radar.StateStore(Path(tmp) / "state.json")
+            st.record_ai_request("gemini-3.5-flash-lite", stage="stage1", now=before_pt_midnight)
+            st.record_ai_request("gemini-3.6-flash", stage="stage2", now=before_pt_midnight)
+            st.mark_model_exhausted("gemini-3.6-flash", now=before_pt_midnight)
+            st.mark_alerted("테스트_테마", now=before_pt_midnight, tokens=["컬리"], final_codes=["263860"], catalyst_score=8.5)
+            st.save(now=before_pt_midnight)
+
+            self.assertEqual(st.ai_requests_today(now=before_pt_midnight), 2)
+            self.assertTrue(st.is_model_exhausted("gemini-3.6-flash", now=before_pt_midnight))
+            self.assertEqual(st.sent_today(now=before_pt_midnight), 1)
+
+            # After PT midnight (17:01 KST): AI counter & exhausted reset, KST alert count preserved!
+            self.assertEqual(st.ai_requests_today(now=after_pt_midnight), 0)
+            self.assertFalse(st.is_model_exhausted("gemini-3.6-flash", now=after_pt_midnight))
+            self.assertEqual(st.sent_today(now=after_pt_midnight), 1)
+
+    def test_model_daily_quota_429_circuit_breaker_and_rpm_distinction(self) -> None:
+        t1 = datetime(2026, 11, 20, 14, 0, tzinfo=KST)
+        t_next_pt = datetime(2026, 11, 20, 17, 5, tzinfo=KST)
+        called_models: list[str] = []
+        fail_36_once = [True]
+
+        def fake_urlopen(req, timeout=0):
+            url = req.full_url
+            called_models.append(url)
+            if "gemini-3.6-flash" in url and fail_36_once[0]:
+                fail_36_once[0] = False
+                body = b'{"error":{"code":429,"message":"Quota exceeded for metric GenerateRequestsPerDayPerProjectPerModel"}}'
+                raise urllib.error.HTTPError(url, 429, "Too Many Requests", {}, io.BytesIO(body))
+            return _FakeResponse({"candidates": [{"content": {"parts": [{"text": '{"ok": true}'}]}}]})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            st = radar.StateStore(Path(tmp) / "state.json")
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), mock.patch.object(radar.time, "sleep"):
+                # Call 1: 3.6-flash hits daily quota 429 -> immediately falls back to 3.5-flash-lite & marks exhausted
+                res1, m1 = radar.call_gemini(
+                    "k", ["gemini-3.6-flash", "gemini-3.5-flash-lite"], "sys", "u", state=st, stage="stage2", now=t1
+                )
+                self.assertEqual(m1, "gemini-3.5-flash-lite")
+                self.assertEqual(res1, {"ok": True})
+                self.assertTrue(st.is_model_exhausted("gemini-3.6-flash", now=t1))
+                self.assertEqual(st.ai_requests_today("gemini-3.6-flash", now=t1), 1)
+                self.assertEqual(st.ai_requests_today("gemini-3.5-flash-lite", now=t1), 1)
+
+                # Call 2 (same PT day): 3.6-flash MUST NOT be called at all!
+                called_models.clear()
+                res2, m2 = radar.call_gemini(
+                    "k", ["gemini-3.6-flash", "gemini-3.5-flash-lite"], "sys", "u", state=st, stage="stage2", now=t1 + timedelta(minutes=10)
+                )
+                self.assertEqual(m2, "gemini-3.5-flash-lite")
+                self.assertFalse(any("gemini-3.6-flash" in u for u in called_models))
+
+                # Call 3 (after PT midnight): 3.6-flash is back in rotation!
+                called_models.clear()
+                res3, m3 = radar.call_gemini(
+                    "k", ["gemini-3.6-flash", "gemini-3.5-flash-lite"], "sys", "u", state=st, stage="stage2", now=t_next_pt
+                )
+                self.assertEqual(m3, "gemini-3.6-flash")
+                self.assertTrue(any("gemini-3.6-flash" in u for u in called_models))
+
+        # Verify RPM vs RPD detection
+        self.assertTrue(radar.is_daily_quota_error("GenerateRequestsPerDay exceeded"))
+        self.assertFalse(radar.is_daily_quota_error("RequestsPerMinute limit reached"))
+
+    def test_seen_evaluated_separation_and_pending_ttl_for_40_clusters(self) -> None:
+        t0 = datetime(2026, 11, 20, 10, 0, tzinfo=KST)
+        clock = [t0]
+        articles = [
+            radar.NewsItem(
+                f"독립종목{i} 핵심기술{i} 설비투자{i}",
+                f"https://ex.com/a{i}",
+                "매일경제_경제",
+                "경제/산업",
+                published_at="Fri, 20 Nov 2026 09:55:00 +0900",
+                first_seen=t0.isoformat(),
+            )
+            for i in range(40)
+        ]
+
+        s1_batch_sizes: list[int] = []
+
+        def fake_fetch(state, max_per_feed=25, now=None):
+            return [a for a in articles if not state.is_seen(a.url, a.title)]
+
+        def fake_gemini(api_key, models, sp, up, **kw):
+            s1_batch_sizes.append(len(json.loads(up)["clusters"]))
+            return {"selected_events": []}, "gemini-3.5-flash-lite"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            with (
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "k"}, clear=False),
+                mock.patch.object(radar, "fetch_rss_news", side_effect=fake_fetch),
+                mock.patch.object(radar, "call_gemini", side_effect=fake_gemini),
+                mock.patch.object(radar.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + timedelta(minutes=2))),
+            ):
+                # Cycle 1: 40 fresh -> 25 evaluated, 15 kept in pending!
+                # Cycle 2: 0 new RSS -> remaining 15 in pending evaluated!
+                radar.run_live(dry_run=False, cycles=2, interval_sec=120, data_dir=tmp_dir, now_fn=lambda: clock[0])
+
+            self.assertEqual(s1_batch_sizes, [25, 15])
+            reloaded = radar.StateStore(tmp_dir / "state.json")
+            self.assertEqual(len(reloaded.pending), 0)
+            self.assertEqual(len(reloaded.evaluated), 40)
+
+        # Now test pending TTL expiry (95m > 90m market TTL -> dropped without AI call)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            st = radar.StateStore(tmp_dir / "state.json")
+            old_item = radar.NewsItem("지연된 기사", "https://ex.com/stale", "연합뉴스_최신", "속보", first_seen=t0.isoformat())
+            st.mark_seen(old_item.url, old_item.title, now=t0)
+            st.add_pending(old_item, now=t0)
+            st.save(now=t0)
+
+            with (
+                mock.patch.dict(os.environ, {"GEMINI_API_KEY": "k"}, clear=False),
+                mock.patch.object(radar, "fetch_rss_news", return_value=[]),
+                mock.patch.object(radar, "call_gemini", side_effect=AssertionError("AI must not be called for expired pending")),
+            ):
+                radar.run_live(dry_run=False, cycles=1, data_dir=tmp_dir, now_fn=lambda: t0 + timedelta(minutes=95))
+
+            reloaded2 = radar.StateStore(tmp_dir / "state.json")
+            self.assertEqual(len(reloaded2.pending), 0)
+            recs = [json.loads(l) for l in (tmp_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertTrue(any(r.get("deferred_reason") == "pending_ttl_expired" for r in recs))
+
+    def test_parallel_rss_google_cb_conditional_304_and_host_concurrency(self) -> None:
+        import threading as _th
+        now = datetime(2026, 11, 20, 10, 0, tzinfo=KST)
+        xml_body = (
+            b'<?xml version="1.0" encoding="UTF-8"?><rss><channel>'
+            b'<item><title>AI \xeb\xb0\x98\xeb\x8f\x84\xec\xb2\xb4 \xec\x88\x98\xec\xa3\xbc \xed\x99\x95\xeb\x8c\x80</title>'
+            b'<link>https://yna.example/1</link><pubDate>Fri, 20 Nov 2026 09:58:00 +0900</pubDate></item>'
+            b'</channel></rss>'
+        )
+        feeds = [
+            {"name": "구글뉴스_한국_주요", "category": "속보", "url": "https://news.google.com/rss?a=1", "priority": 1, "group": "google", "timeout": 5},
+            {"name": "구글뉴스_한국_사회", "category": "사회/사건", "url": "https://news.google.com/rss?a=2", "priority": 1, "group": "google", "timeout": 5},
+            {"name": "연합1", "category": "속보", "url": "https://www.yna.co.kr/rss/1.xml", "priority": 1},
+            {"name": "연합2", "category": "사회/사건", "url": "https://www.yna.co.kr/rss/2.xml", "priority": 1},
+            {"name": "연합3", "category": "경제/산업", "url": "https://www.yna.co.kr/rss/3.xml", "priority": 2},
+            {"name": "연합4", "category": "경제/산업", "url": "https://www.yna.co.kr/rss/4.xml", "priority": 2},
+        ]
+
+        lock = _th.Lock()
+        active_yna = [0]
+        max_active_yna = [0]
+        seen_urls: list[str] = []
+        seen_if_none_match: list[str | None] = []
+
+        def fake_urlopen(req, timeout=0):
+            url = req.full_url
+            with lock:
+                seen_urls.append(url)
+            if "news.google.com" in url:
+                raise urllib.error.HTTPError(url, 503, "Service Unavailable", {}, io.BytesIO(b"503"))
+            inm = req.get_header("If-none-match")
+            with lock:
+                seen_if_none_match.append(inm)
+                active_yna[0] += 1
+                max_active_yna[0] = max(max_active_yna[0], active_yna[0])
+            try:
+                radar.time.sleep(0.03)
+                if inm == '"etag-v1"':
+                    raise urllib.error.HTTPError(url, 304, "Not Modified", {}, io.BytesIO(b""))
+                return _FakeXmlResponse(xml_body, status=200, headers={"ETag": '"etag-v1"', "Last-Modified": "Fri, 20 Nov 2026 09:58:00 GMT"})
+            finally:
+                with lock:
+                    active_yna[0] -= 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            st = radar.StateStore(Path(tmp) / "state.json")
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                items1 = radar.fetch_rss_news(st, now=now, feeds=feeds)
+                # Google #2 MUST be skipped by circuit breaker!
+                self.assertIn("https://news.google.com/rss?a=1", seen_urls)
+                self.assertNotIn("https://news.google.com/rss?a=2", seen_urls)
+                # Host concurrency strictly <= 2
+                self.assertLessEqual(max_active_yna[0], 2)
+                self.assertEqual(len(items1), 1)  # deduplicated across 4 identical feeds
+                self.assertEqual(st.feed_stats["연합1"]["etag"], '"etag-v1"')
+
+                # Second fetch sends If-None-Match -> receives 304 (not counted as failure!)
+                seen_urls.clear()
+                seen_if_none_match.clear()
+                items2 = radar.fetch_rss_news(st, now=now + timedelta(minutes=2), feeds=feeds[2:])
+                self.assertEqual(items2, [])
+                self.assertTrue(all(h == '"etag-v1"' for h in seen_if_none_match))
+                self.assertEqual(st.feed_stats["연합1"]["not_modified_304"], 1)
+                self.assertEqual(st.feed_stats["연합1"]["fail"], 0)
+
+    def test_probe_feeds_outputs_status_items_and_pubdate(self) -> None:
+        now = datetime(2026, 11, 20, 10, 0, tzinfo=KST)
+        xml_body = (
+            b'<?xml version="1.0" encoding="UTF-8"?><rss><channel>'
+            b'<item><title>Test Headline</title><link>https://ex.com/1</link>'
+            b'<pubDate>Fri, 20 Nov 2026 09:50:00 +0900</pubDate></item>'
+            b'</channel></rss>'
+        )
+        feeds = [
+            {"name": "정상피드", "category": "속보", "url": "https://ok.example/rss", "priority": 1},
+            {"name": "실패피드", "category": "속보", "url": "https://err.example/rss", "priority": 2},
+        ]
+
+        def fake_urlopen(req, timeout=0):
+            if "err.example" in req.full_url:
+                raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, io.BytesIO(b""))
+            return _FakeXmlResponse(xml_body)
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            rows = radar.probe_feeds(feeds=feeds, now=now)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["status"], 200)
+        self.assertEqual(rows[0]["items"], 1)
+        self.assertEqual(rows[0]["lag_min"], 10.0)
+        self.assertEqual(rows[1]["status"], 403)
+        self.assertIsNotNone(rows[1]["error"])
+
+    def test_token_normalization_and_outlet_extraction(self) -> None:
+        self.assertEqual(radar.normalize_token("컬리가"), "컬리")
+        self.assertEqual(radar.normalize_token("컬리의"), "컬리")
+        self.assertEqual(radar.normalize_token("데이터센터에서"), "데이터센터")
+        self.assertEqual(radar.normalize_token("3370만명"), "")
+        self.assertEqual(radar.normalize_token("2026년"), "")
+        self.assertEqual(radar.normalize_token("발표"), "")
+        toks = radar.extract_normalized_tokens("[단독] 컬리가 3370만명 개인정보를 유출 - MBC 뉴스")
+        self.assertIn("컬리", toks)
+        self.assertIn("개인정보", toks)
+        self.assertIn("유출", toks)
+        self.assertNotIn("mbc", toks)
+        self.assertNotIn("3370만명", toks)
+
+        g_item = radar.NewsItem("컬리 유출 사태 - MBC 뉴스", "https://news.google.com/1", "구글뉴스_한국_주요", "속보")
+        y_item = radar.NewsItem("컬리 유출", "https://yna.co.kr/1", "연합뉴스_사회", "사회/사건")
+        self.assertEqual(radar.extract_outlet(g_item), "MBC 뉴스")
+        self.assertEqual(radar.extract_outlet(y_item), "연합뉴스")
+
+
 class TestWorkflowConfig(unittest.TestCase):
     def test_radar_yml_prime_cron_and_trace_upload(self) -> None:
         yml = (REPO_DIR / ".github" / "workflows" / "radar.yml").read_text(encoding="utf-8")
@@ -597,6 +867,8 @@ class TestWorkflowConfig(unittest.TestCase):
         self.assertIn("GITHUB_EVENT_SCHEDULE: ${{ github.event.schedule }}", yml)
         self.assertIn("actions/upload-artifact@v4", yml)
         self.assertIn("data/trace.jsonl", yml)
+        self.assertIn("- probe", yml)
+        self.assertIn("--probe-feeds", yml)
 
 
 if __name__ == "__main__":

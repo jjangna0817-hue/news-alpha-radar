@@ -2,7 +2,7 @@
 """News Alpha Radar — 단일 파일 24/7 국내주식 일상뉴스 2차 파급효과 레이더 (추가 비용 0원).
 
 외부 패키지 설치 불필요 (Python 3.11+ 표준 라이브러리 전용).
-- 뉴스 수집: 무료 한국 RSS 11개 피드 (사회·사건사고·IT·경제·국제) + 시황 노이즈 제거 + 클러스터링
+- 뉴스 수집: 무료 한국 RSS 10개 피드 (구글뉴스 2개 + 국내 직통 8개, 병렬 수집·조건부 GET) + 시황 노이즈 제거 + 클러스터링
 - 종목 검증: KRX KIND 전체 상장사(코스피·코스닥 약 2,600개) 실시간 로드 & 2차 키워드 매칭
 - 시세 체크: 네이버 금융 공개 JSON 배치 조회 (미반영 초입 vs 과열 급등 자동 판정)
 - AI 추론: Google AI Studio 무료 티어 2단계 (Flash-Lite 스크리닝 → Flash 심층 매매 가이드)
@@ -20,18 +20,22 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections import Counter
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +44,11 @@ logging.basicConfig(
 logger = logging.getLogger("news_alpha_radar")
 
 KST = timezone(timedelta(hours=9))
+try:
+    PT = ZoneInfo("America/Los_Angeles")
+except Exception:
+    PT = timezone(timedelta(hours=-8))
+
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -60,21 +69,34 @@ MAX_DEFERRED_RETRIES = 2
 DEFERRED_TTL_MARKET_MIN = 60
 DEFERRED_TTL_OFFHOURS_MIN = 180
 SEND_PENDING_MAX_AGE_MIN = 15
+PENDING_TTL_MARKET_MIN = 90
+PENDING_TTL_OFFHOURS_MIN = 180
+MAX_PUB_AGE_HOURS = 12
+RSS_DIRECT_TIMEOUT = 8
+RSS_GOOGLE_TIMEOUT = 5
+RSS_MAX_PER_HOST = 2
 TRACE_MAX_DAYS = 7
 TRACE_MAX_BYTES = 5 * 1024 * 1024
 
 RSS_FEEDS: list[dict[str, Any]] = [
-    {"name": "구글뉴스_한국_주요", "category": "속보", "url": "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko", "priority": 1},
-    {"name": "구글뉴스_한국_사회", "category": "사회/사건", "url": "https://news.google.com/rss/headlines/section/topic/NATION?hl=ko&gl=KR&ceid=KR:ko", "priority": 1},
-    {"name": "구글뉴스_한국_과학기술", "category": "IT/신기술", "url": "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=ko&gl=KR&ceid=KR:ko", "priority": 1},
-    {"name": "구글뉴스_한국_경제", "category": "경제/산업", "url": "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=ko&gl=KR&ceid=KR:ko", "priority": 2},
-    {"name": "구글뉴스_한국_세계", "category": "국제/지정학", "url": "https://news.google.com/rss/headlines/section/topic/WORLD?hl=ko&gl=KR&ceid=KR:ko", "priority": 2},
+    {"name": "구글뉴스_한국_주요", "category": "속보", "url": "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko", "priority": 1, "group": "google", "timeout": RSS_GOOGLE_TIMEOUT},
+    {"name": "구글뉴스_한국_사회", "category": "사회/사건", "url": "https://news.google.com/rss/headlines/section/topic/NATION?hl=ko&gl=KR&ceid=KR:ko", "priority": 1, "group": "google", "timeout": RSS_GOOGLE_TIMEOUT},
     {"name": "연합뉴스_최신", "category": "속보", "url": "https://www.yna.co.kr/rss/news.xml", "priority": 1},
     {"name": "연합뉴스_사회", "category": "사회/사건", "url": "https://www.yna.co.kr/rss/society.xml", "priority": 1},
-    {"name": "연합뉴스_산업", "category": "산업", "url": "https://www.yna.co.kr/rss/industry.xml", "priority": 2},
+    {"name": "연합뉴스_산업", "category": "경제/산업", "url": "https://www.yna.co.kr/rss/industry.xml", "priority": 2},
+    {"name": "연합뉴스_경제", "category": "경제/산업", "url": "https://www.yna.co.kr/rss/economy.xml", "priority": 2},
     {"name": "지디넷코리아_IT", "category": "IT/신기술", "url": "https://feeds.feedburner.com/zdkorea", "priority": 2},
     {"name": "매일경제_경제", "category": "경제/산업", "url": "https://www.mk.co.kr/rss/30100041/", "priority": 2},
+    {"name": "매일경제_기업경영", "category": "경제/산업", "url": "https://www.mk.co.kr/rss/50100032/", "priority": 2},
     {"name": "매일경제_사회", "category": "사회/사건", "url": "https://www.mk.co.kr/rss/50400012/", "priority": 2},
+]
+
+# Actions 러너 IP에서 --probe-feeds로 검증한 뒤 채택할 후보 피드 목록
+PROBE_CANDIDATE_FEEDS: list[dict[str, Any]] = [
+    {"name": "전자신문_AI·SW", "category": "IT/신기술", "url": "https://rss.etnews.com/04.xml", "priority": 2},
+    {"name": "전자신문_속보", "category": "IT/신기술", "url": "https://rss.etnews.com/Section902.xml", "priority": 2},
+    {"name": "뉴시스_속보", "category": "속보", "url": "https://www.newsis.com/RSS/sokbo.xml", "priority": 2},
+    {"name": "조선비즈", "category": "경제/산업", "url": "https://biz.chosun.com/arc/outboundfeeds/rss/?outputType=xml", "priority": 2},
 ]
 
 NOISE_PATTERNS = [
@@ -85,18 +107,31 @@ NOISE_PATTERNS = [
         r"^\[?코스피\s*마감",
         r"^\[?코스닥\s*마감",
         r"^\[?뉴욕증시\s*마감",
-        r"^\[?오늘의\s*운세",
+        r"^\[?오늘의\s*(운세|날씨)",
         r"^\[?(부고|부음)\]?",
         r"^\[?인사\]?",
         r"^\[?동정\]?",
         r"^\[?포토\]?",
         r"^\[?사진\]?",
+        r"^\[?(칼럼|사설|기고|인터뷰|게시판|알림)\]?",
         r"목표가\s*(상향|하향|유지)",
         r"투자의견\s*(매수|중립|유지)",
         r"외국인\s*순매수\s*상위",
         r"기관\s*순매수\s*상위",
     ]
 ]
+
+TOKEN_STOPWORDS: frozenset[str] = frozenset({
+    "속보", "단독", "종합", "오늘", "내일", "올해", "내년", "관련", "대해", "통해", "위해", "뉴스",
+    "정부", "발표", "기업", "국내", "업계", "관계자", "전망", "우려", "증가", "감소", "확대", "추진",
+    "예정", "계획", "지난", "이번", "오는", "최대", "최초", "사실상", "논란", "가능성", "영향", "대상",
+    "진행", "기자", "보도", "확인", "최근", "가운데", "본격", "기존", "신규", "기준", "수준", "현재",
+    "이후", "이전", "경우", "때문", "따른", "위주", "중심", "관련주", "시장", "한국",
+})
+
+KOREAN_POSTPOSITIONS: tuple[str, ...] = (
+    "에서", "으로", "까지", "부터", "은", "는", "이", "가", "을", "를", "의", "에", "로", "와", "과", "도", "만",
+)
 
 KEYWORD_EXPANSIONS: dict[str, list[str]] = {
     "전파탐지기": ["무선도청", "불법촬영", "전파", "보안", "탐지", "rf", "감시"],
@@ -495,22 +530,118 @@ def extract_json(raw_text: str) -> dict[str, Any]:
     raise ValueError(f"JSON 파싱 실패: {text[:180]}")
 
 
+def item_dedup_key(url: str, title: str) -> str:
+    th = title_hash(title)
+    return f"t:{th}" if norm_key(title) else f"u:{url_hash(url)}"
+
+
+def extract_outlet(item: NewsItem) -> str:
+    """기사 원 언론사명 추출 (구글뉴스는 제목 끝 '- 언론사명', 직통 피드는 소스 접두사)."""
+    if item.source.startswith("구글뉴스"):
+        m = re.search(r"\s+-\s+([^-]{1,40})$", (item.title or "").strip())
+        if m:
+            return m.group(1).strip()
+        return "구글뉴스"
+    return item.source.split("_", 1)[0]
+
+
+def normalize_token(word: str) -> str:
+    """한국어 조사 제거·숫자 토큰 제외·불용어 필터링."""
+    w = (word or "").strip().lower()
+    if len(w) < 2 or w[0].isdigit():
+        return ""
+    if len(w) >= 3:
+        for suf in KOREAN_POSTPOSITIONS:
+            if w.endswith(suf) and len(w) - len(suf) >= 2:
+                w = w[: -len(suf)]
+                break
+    if len(w) < 2 or w[0].isdigit() or w in TOKEN_STOPWORDS:
+        return ""
+    return w
+
+
+def extract_normalized_tokens(text: str) -> list[str]:
+    """제목/텍스트에서 괄호·언론사 접미사를 제거하고 정규화된 토큰 목록 반환."""
+    cleaned = re.sub(r"\s+-\s+[^-]+$", " ", text or "")
+    cleaned = re.sub(r"\[[^\]]*\]|\([^\)]*\)", " ", cleaned)
+    out: list[str] = []
+    for raw in re.findall(r"[가-힣a-zA-Z0-9]{2,}", cleaned):
+        tok = normalize_token(raw)
+        if tok:
+            out.append(tok)
+    return out
+
+
+def top_cluster_tokens(cluster: EventCluster, limit: int = 8) -> list[str]:
+    """클러스터 내 기사 제목들의 출현 빈도순 상위 정규화 토큰 추출."""
+    counts: Counter[str] = Counter()
+    texts = [item.title for item in cluster.items] if cluster.items else [cluster.headline]
+    for txt in texts:
+        counts.update(set(extract_normalized_tokens(txt)))
+    return [tok for tok, _ in counts.most_common(limit)]
+
+
+def pt_date_str(now: datetime | None = None) -> str:
+    """Gemini API RPD 리셋 기준(태평양 시간 자정) 날짜 문자열 YYYY-MM-DD."""
+    if now is None:
+        dt = datetime.now(PT)
+    elif now.tzinfo is None:
+        dt = now.replace(tzinfo=KST).astimezone(PT)
+    else:
+        dt = now.astimezone(PT)
+    return dt.strftime("%Y-%m-%d")
+
+
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.seen_urls: dict[str, str] = {}
         self.seen_titles: dict[str, str] = {}
-        self.alerted_themes: dict[str, str] = {}
-        self.daily_counts: dict[str, int] = {}
+        self.pending: dict[str, dict[str, Any]] = {}
+        self.evaluated: dict[str, str] = {}
         self.deferred: list[dict[str, Any]] = []
+        self.alerted_themes: dict[str, str] = {}
+        self.recent_alerts: list[dict[str, Any]] = []
+        self.daily_counts: dict[str, int] = {}
+        self.daily_ai_calls: dict[str, dict[str, dict[str, int]]] = {}
+        self.exhausted_models: dict[str, str] = {}
+        self.last_stage1_at: str | None = None
+        self.feed_stats: dict[str, dict[str, Any]] = {}
         if path.exists():
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
                 self.seen_urls = dict(raw.get("seen_urls", {}))
                 self.seen_titles = dict(raw.get("seen_titles", {}))
-                self.alerted_themes = dict(raw.get("alerted_themes", {}))
-                self.daily_counts = {str(k): int(v) for k, v in raw.get("daily_counts", {}).items()}
+                self.pending = {
+                    str(k): dict(v)
+                    for k, v in (raw.get("pending") or {}).items()
+                    if isinstance(v, dict)
+                }
+                self.evaluated = {str(k): str(v) for k, v in (raw.get("evaluated") or {}).items()}
                 self.deferred = [dict(d) for d in (raw.get("deferred") or []) if isinstance(d, dict)]
+                self.alerted_themes = dict(raw.get("alerted_themes", {}))
+                self.recent_alerts = [dict(a) for a in (raw.get("recent_alerts") or []) if isinstance(a, dict)]
+                self.daily_counts = {str(k): int(v) for k, v in raw.get("daily_counts", {}).items()}
+                raw_ai = raw.get("daily_ai_calls") or {}
+                if isinstance(raw_ai, dict):
+                    for day_k, models_v in raw_ai.items():
+                        if isinstance(models_v, dict):
+                            self.daily_ai_calls[str(day_k)] = {
+                                str(m): {
+                                    "requests": int(c.get("requests", 0)),
+                                    "stage1": int(c.get("stage1", 0)),
+                                    "stage2": int(c.get("stage2", 0)),
+                                }
+                                for m, c in models_v.items()
+                                if isinstance(c, dict)
+                            }
+                self.exhausted_models = {str(k): str(v) for k, v in (raw.get("exhausted_models") or {}).items()}
+                self.last_stage1_at = str(raw["last_stage1_at"]) if raw.get("last_stage1_at") else None
+                self.feed_stats = {
+                    str(k): dict(v)
+                    for k, v in (raw.get("feed_stats") or {}).items()
+                    if isinstance(v, dict)
+                }
             except Exception:
                 pass
 
@@ -529,6 +660,64 @@ class StateStore:
             self.seen_urls[url] = now_iso
         self.seen_titles[title_hash(title)] = now_iso
 
+    def is_evaluated(self, url: str, title: str) -> bool:
+        return item_dedup_key(url, title) in self.evaluated
+
+    def mark_evaluated(self, url: str, title: str, now: datetime | None = None) -> None:
+        key = item_dedup_key(url, title)
+        self.evaluated[key] = self._now_kst(now).isoformat()
+        self.pending.pop(key, None)
+
+    def add_pending(self, item: NewsItem, now: datetime | None = None) -> str:
+        ref = self._now_kst(now)
+        key = item_dedup_key(item.url, item.title)
+        if key not in self.pending:
+            data = item.to_dict()
+            if not data.get("first_seen"):
+                data["first_seen"] = ref.isoformat()
+            pub_dt = parse_pub_date(item.published_at)
+            data["pub_date"] = pub_dt.isoformat() if pub_dt else None
+            self.pending[key] = data
+        return key
+
+    def get_pending_items(self) -> list[NewsItem]:
+        return [NewsItem.from_dict(v) for v in self.pending.values()]
+
+    def prune_pending_ttl(self, ttl_minutes: int, now: datetime | None = None) -> list[NewsItem]:
+        ref = self._now_kst(now)
+        cutoff = ref - timedelta(minutes=ttl_minutes)
+        expired: list[NewsItem] = []
+        kept: dict[str, dict[str, Any]] = {}
+        for key, val in self.pending.items():
+            fs = parse_iso_kst(val.get("first_seen"))
+            if fs is not None and fs < cutoff:
+                expired.append(NewsItem.from_dict(val))
+            else:
+                kept[key] = val
+        self.pending = kept
+        return expired
+
+    def record_ai_request(self, model: str, stage: str = "other", now: datetime | None = None) -> None:
+        pt_day = pt_date_str(self._now_kst(now))
+        day_map = self.daily_ai_calls.setdefault(pt_day, {})
+        entry = day_map.setdefault(model, {"requests": 0, "stage1": 0, "stage2": 0})
+        entry["requests"] = int(entry.get("requests", 0)) + 1
+        if stage in ("stage1", "stage2"):
+            entry[stage] = int(entry.get(stage, 0)) + 1
+
+    def ai_requests_today(self, model: str | None = None, now: datetime | None = None) -> int:
+        pt_day = pt_date_str(self._now_kst(now))
+        day_map = self.daily_ai_calls.get(pt_day) or {}
+        if model is not None:
+            return int((day_map.get(model) or {}).get("requests", 0))
+        return sum(int(v.get("requests", 0)) for v in day_map.values())
+
+    def mark_model_exhausted(self, model: str, now: datetime | None = None) -> None:
+        self.exhausted_models[model] = pt_date_str(self._now_kst(now))
+
+    def is_model_exhausted(self, model: str, now: datetime | None = None) -> bool:
+        return self.exhausted_models.get(model) == pt_date_str(self._now_kst(now))
+
     def in_cooldown(self, theme_key: str, hours: int, now: datetime | None = None) -> bool:
         k = norm_key(theme_key)
         if not k or k not in self.alerted_themes:
@@ -538,13 +727,32 @@ class StateStore:
             return False
         return (self._now_kst(now) - ts) < timedelta(hours=hours)
 
-    def mark_alerted(self, theme_key: str, now: datetime | None = None) -> None:
+    def mark_alerted(
+        self,
+        theme_key: str,
+        now: datetime | None = None,
+        *,
+        tokens: list[str] | None = None,
+        keywords: list[str] | None = None,
+        cand_codes: list[str] | None = None,
+        final_codes: list[str] | None = None,
+        catalyst_score: float | None = None,
+    ) -> None:
         ref = self._now_kst(now)
         k = norm_key(theme_key)
         if k:
             self.alerted_themes[k] = ref.isoformat()
         day = ref.strftime("%Y-%m-%d")
         self.daily_counts[day] = self.daily_counts.get(day, 0) + 1
+        self.recent_alerts.append({
+            "ts": ref.isoformat(),
+            "theme_key": theme_key,
+            "tokens": list(tokens or []),
+            "keywords": list(keywords or []),
+            "cand_codes": list(cand_codes or []),
+            "final_codes": list(final_codes or []),
+            "catalyst_score": float(catalyst_score) if catalyst_score is not None else 0.0,
+        })
 
     def sent_today(self, now: datetime | None = None) -> int:
         return self.daily_counts.get(self._now_kst(now).strftime("%Y-%m-%d"), 0)
@@ -563,17 +771,33 @@ class StateStore:
 
         self.seen_urls = _prune(self.seen_urls)
         self.seen_titles = _prune(self.seen_titles)
+        self.evaluated = _prune(self.evaluated)
         self.alerted_themes = _prune(self.alerted_themes)
+        self.recent_alerts = [
+            a for a in self.recent_alerts
+            if (ts := parse_iso_kst(a.get("ts"))) is not None and ts >= cutoff
+        ]
         day_cut = (ref - timedelta(days=14)).strftime("%Y-%m-%d")
         self.daily_counts = {k: v for k, v in self.daily_counts.items() if k >= day_cut}
+        pt_today = pt_date_str(ref)
+        pt_cut = (ref.astimezone(PT) - timedelta(days=14)).strftime("%Y-%m-%d")
+        self.daily_ai_calls = {k: v for k, v in self.daily_ai_calls.items() if k >= pt_cut}
+        self.exhausted_models = {m: d for m, d in self.exhausted_models.items() if d == pt_today}
 
         payload = json.dumps(
             {
                 "seen_urls": self.seen_urls,
                 "seen_titles": self.seen_titles,
-                "alerted_themes": self.alerted_themes,
-                "daily_counts": self.daily_counts,
+                "pending": self.pending,
+                "evaluated": self.evaluated,
                 "deferred": self.deferred,
+                "alerted_themes": self.alerted_themes,
+                "recent_alerts": self.recent_alerts,
+                "daily_counts": self.daily_counts,
+                "daily_ai_calls": self.daily_ai_calls,
+                "exhausted_models": self.exhausted_models,
+                "last_stage1_at": self.last_stage1_at,
+                "feed_stats": self.feed_stats,
             },
             ensure_ascii=False,
             indent=2,
@@ -581,45 +805,211 @@ class StateStore:
         atomic_write_text(self.path, payload)
 
 
-def fetch_rss_news(state: StateStore, max_per_feed: int = 25, now: datetime | None = None) -> list[NewsItem]:
-    seen_ts = (
+def _fetch_single_feed(
+    feed: dict[str, Any],
+    *,
+    prev_stat: dict[str, Any] | None,
+    host_sem: threading.Semaphore,
+    max_per_feed: int,
+    seen_ts: str,
+    use_conditional: bool = True,
+) -> dict[str, Any]:
+    name = str(feed["name"])
+    url = str(feed["url"])
+    is_google = feed.get("group") == "google" or "news.google.com" in url
+    timeout = int(feed.get("timeout") or (RSS_GOOGLE_TIMEOUT if is_google else RSS_DIRECT_TIMEOUT))
+
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/xml, text/xml"}
+    if use_conditional and prev_stat:
+        if prev_stat.get("etag"):
+            headers["If-None-Match"] = str(prev_stat["etag"])
+        if prev_stat.get("last_modified"):
+            headers["If-Modified-Since"] = str(prev_stat["last_modified"])
+
+    t0 = time.monotonic()
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with host_sem:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw_bytes = resp.read()
+                status = int(getattr(resp, "status", 200) or 200)
+                resp_headers = getattr(resp, "headers", None) or {}
+                etag = resp_headers.get("ETag") or resp_headers.get("etag")
+                last_mod = resp_headers.get("Last-Modified") or resp_headers.get("last-modified")
+        root = ET.fromstring(raw_bytes)
+        items: list[NewsItem] = []
+        for elem in root.findall(".//item")[:max_per_feed]:
+            title = strip_html(elem.findtext("title") or "")
+            link = (elem.findtext("link") or "").strip()
+            if title and link:
+                items.append(
+                    NewsItem(
+                        title=title,
+                        url=link,
+                        source=name,
+                        category=str(feed["category"]),
+                        published_at=(elem.findtext("pubDate") or "").strip(),
+                        summary=strip_html(elem.findtext("description") or "")[:360],
+                        priority=int(feed["priority"]),
+                        first_seen=seen_ts,
+                    )
+                )
+        return {
+            "name": name,
+            "status": status,
+            "items": items,
+            "etag": etag,
+            "last_modified": last_mod,
+            "error": None,
+            "elapsed": round(time.monotonic() - t0, 2),
+            "trip_google_cb": False,
+        }
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return {
+                "name": name,
+                "status": 304,
+                "items": [],
+                "etag": (prev_stat or {}).get("etag"),
+                "last_modified": (prev_stat or {}).get("last_modified"),
+                "error": None,
+                "elapsed": round(time.monotonic() - t0, 2),
+                "trip_google_cb": False,
+            }
+        return {
+            "name": name,
+            "status": exc.code,
+            "items": [],
+            "etag": (prev_stat or {}).get("etag"),
+            "last_modified": (prev_stat or {}).get("last_modified"),
+            "error": f"HTTP {exc.code}: {exc.reason}",
+            "elapsed": round(time.monotonic() - t0, 2),
+            "trip_google_cb": is_google and exc.code in (429, 503),
+        }
+    except Exception as exc:
+        return {
+            "name": name,
+            "status": 0,
+            "items": [],
+            "etag": (prev_stat or {}).get("etag"),
+            "last_modified": (prev_stat or {}).get("last_modified"),
+            "error": str(exc),
+            "elapsed": round(time.monotonic() - t0, 2),
+            "trip_google_cb": is_google,
+        }
+
+
+def fetch_rss_news(
+    state: StateStore,
+    max_per_feed: int = 25,
+    now: datetime | None = None,
+    feeds: list[dict[str, Any]] | None = None,
+) -> list[NewsItem]:
+    ref = (
         now.replace(tzinfo=KST) if (now and now.tzinfo is None)
         else (now.astimezone(KST) if now else datetime.now(KST))
-    ).isoformat()
-    collected: list[NewsItem] = []
-    for feed in RSS_FEEDS:
-        req = urllib.request.Request(
-            feed["url"],
-            headers={"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/xml, text/xml"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                root = ET.fromstring(resp.read())
-            for elem in root.findall(".//item")[:max_per_feed]:
-                title = strip_html(elem.findtext("title") or "")
-                link = (elem.findtext("link") or "").strip()
-                if title and link:
-                    collected.append(
-                        NewsItem(
-                            title=title,
-                            url=link,
-                            source=feed["name"],
-                            category=feed["category"],
-                            published_at=(elem.findtext("pubDate") or "").strip(),
-                            summary=strip_html(elem.findtext("description") or "")[:360],
-                            priority=int(feed["priority"]),
-                            first_seen=seen_ts,
-                        )
-                    )
-        except Exception as exc:
-            logger.warning("RSS 수집 스킵 (%s): %s", feed["name"], exc)
+    )
+    seen_ts = ref.isoformat()
+    target_feeds = list(feeds) if feeds is not None else RSS_FEEDS
 
+    google_feeds = [f for f in target_feeds if f.get("group") == "google" or "news.google.com" in str(f.get("url", ""))]
+    direct_feeds = [f for f in target_feeds if f not in google_feeds]
+
+    host_sems: dict[str, threading.Semaphore] = {}
+    for f in target_feeds:
+        host = urllib.parse.urlparse(str(f["url"])).netloc or str(f["name"])
+        if host not in host_sems:
+            host_sems[host] = threading.Semaphore(RSS_MAX_PER_HOST)
+
+    stats_snapshot = {name: dict(st) for name, st in state.feed_stats.items()}
+
+    def _run_google_sequential() -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for idx, gf in enumerate(google_feeds):
+            host = urllib.parse.urlparse(str(gf["url"])).netloc or str(gf["name"])
+            res = _fetch_single_feed(
+                gf,
+                prev_stat=stats_snapshot.get(str(gf["name"])),
+                host_sem=host_sems[host],
+                max_per_feed=max_per_feed,
+                seen_ts=seen_ts,
+                use_conditional=True,
+            )
+            out.append(res)
+            if res.get("trip_google_cb") and idx + 1 < len(google_feeds):
+                logger.warning(
+                    "구글뉴스 서킷 브레이커 발동 (%s: %s) — 남은 구글 피드 %d개 스킵",
+                    gf["name"], res.get("error"), len(google_feeds) - idx - 1,
+                )
+                break
+        return out
+
+    results: list[dict[str, Any]] = []
+    max_workers = max(1, min(8, len(direct_feeds) + (1 if google_feeds else 0)))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        direct_futs = [
+            pool.submit(
+                _fetch_single_feed,
+                df,
+                prev_stat=stats_snapshot.get(str(df["name"])),
+                host_sem=host_sems[urllib.parse.urlparse(str(df["url"])).netloc or str(df["name"])],
+                max_per_feed=max_per_feed,
+                seen_ts=seen_ts,
+                use_conditional=True,
+            )
+            for df in direct_feeds
+        ]
+        google_fut = pool.submit(_run_google_sequential) if google_feeds else None
+
+        for fut in direct_futs:
+            results.append(fut.result())
+        if google_fut is not None:
+            results.extend(google_fut.result())
+
+    collected: list[NewsItem] = []
+    for res in results:
+        name = str(res["name"])
+        st = state.feed_stats.setdefault(name, {"ok": 0, "fail": 0, "not_modified_304": 0})
+        st["last_status"] = int(res.get("status", 0))
+        st["last_fetched_at"] = seen_ts
+        if res.get("etag"):
+            st["etag"] = res["etag"]
+        if res.get("last_modified"):
+            st["last_modified"] = res["last_modified"]
+
+        if res.get("status") == 304:
+            st["not_modified_304"] = int(st.get("not_modified_304", 0)) + 1
+            st["last_error"] = None
+            continue
+        if res.get("error"):
+            st["fail"] = int(st.get("fail", 0)) + 1
+            st["last_error"] = str(res["error"])[:160]
+            logger.warning("RSS 수집 스킵 (%s): %s", name, res["error"])
+            continue
+
+        st["ok"] = int(st.get("ok", 0)) + 1
+        st["last_error"] = None
+        feed_items: list[NewsItem] = res.get("items") or []
+        lags = []
+        for it in feed_items:
+            pdt = parse_pub_date(it.published_at)
+            if pdt is not None:
+                lags.append(max(0, int((ref - pdt).total_seconds())))
+        if lags:
+            st["last_min_pub_lag_sec"] = min(lags)
+        collected.extend(feed_items)
+
+    pub_cutoff = ref - timedelta(hours=MAX_PUB_AGE_HOURS)
     fresh: list[NewsItem] = []
     batch_titles: set[str] = set()
     for item in collected:
         if any(p.search(item.title) for p in NOISE_PATTERNS):
             continue
-        if state.is_seen(item.url, item.title):
+        # 느슨한 안전 상한(12시간): 파싱 성공 시에만 오래된 기사 제외 (파싱 실패 시 보존)
+        pub_dt = parse_pub_date(item.published_at)
+        if pub_dt is not None and pub_dt < pub_cutoff:
+            continue
+        if state.is_seen(item.url, item.title) or state.is_evaluated(item.url, item.title):
             continue
         nk = norm_key(item.title)
         if not nk or nk in batch_titles:
@@ -629,16 +1019,63 @@ def fetch_rss_news(state: StateStore, max_per_feed: int = 25, now: datetime | No
     return fresh
 
 
-def cluster_news_ranked(items: list[NewsItem]) -> list[EventCluster]:
-    stops = {"속보", "단독", "종합", "오늘", "내일", "올해", "내년", "관련", "대해", "통해", "위해", "뉴스"}
+def probe_feeds(feeds: list[dict[str, Any]] | None = None, now: datetime | None = None) -> list[dict[str, Any]]:
+    """현재 실행 환경(러너 IP 포함)에서 RSS 피드별 상태코드·항목 수·최신 pubDate 점검."""
+    ref = (
+        now.replace(tzinfo=KST) if (now and now.tzinfo is None)
+        else (now.astimezone(KST) if now else datetime.now(KST))
+    )
+    target_feeds = list(feeds) if feeds is not None else (RSS_FEEDS + PROBE_CANDIDATE_FEEDS)
+    seen_ts = ref.isoformat()
+    host_sems: dict[str, threading.Semaphore] = {}
+    for f in target_feeds:
+        host = urllib.parse.urlparse(str(f["url"])).netloc or str(f["name"])
+        host_sems.setdefault(host, threading.Semaphore(RSS_MAX_PER_HOST))
 
-    def _tokens(t: str) -> set[str]:
-        c = re.sub(r"\[[^\]]*\]|\([^\)]*\)|-\s*[^-]+$", " ", t)
-        return {w for w in re.findall(r"[가-힣a-zA-Z0-9]{2,}", c.lower()) if w not in stops}
+    rows: list[dict[str, Any]] = []
+    for f in target_feeds:
+        host = urllib.parse.urlparse(str(f["url"])).netloc or str(f["name"])
+        res = _fetch_single_feed(
+            f,
+            prev_stat=None,
+            host_sem=host_sems[host],
+            max_per_feed=25,
+            seen_ts=seen_ts,
+            use_conditional=False,
+        )
+        items: list[NewsItem] = res.get("items") or []
+        latest_raw = items[0].published_at if items else ""
+        latest_dt = parse_pub_date(latest_raw)
+        lag_min = round((ref - latest_dt).total_seconds() / 60.0, 1) if latest_dt else None
+        row = {
+            "name": res["name"],
+            "url": f["url"],
+            "status": res["status"],
+            "items": len(items),
+            "elapsed": res["elapsed"],
+            "latest_pub_date": latest_dt.isoformat() if latest_dt else latest_raw,
+            "lag_min": lag_min,
+            "error": res["error"],
+            "sample_title": items[0].title[:50] if items else "",
+        }
+        rows.append(row)
+        lag_txt = f"{row['lag_min']}m" if row["lag_min"] is not None else "N/A"
+        print(
+            f"{'OK ' if not row['error'] else 'ERR'} {row['name']:18s} | HTTP {row['status']:3d} | "
+            f"items={row['items']:2d} | {row['elapsed']:4.2f}s | lag={lag_txt:>6s} | "
+            f"pub={str(row['latest_pub_date'])[:25]} | {row['error'] or row['sample_title']}"
+        )
+    return rows
 
+
+def cluster_news_ranked(items: list[NewsItem], now: datetime | None = None) -> list[EventCluster]:
+    ref = (
+        now.replace(tzinfo=KST) if (now and now.tzinfo is None)
+        else (now.astimezone(KST) if now else datetime.now(KST))
+    )
     clusters: list[tuple[set[str], EventCluster]] = []
     for item in sorted(items, key=lambda x: x.priority):
-        toks = _tokens(item.title)
+        toks = set(extract_normalized_tokens(item.title))
         best_i, best_sim = -1, 0.0
         for idx, (ctoks, _) in enumerate(clusters):
             union = toks | ctoks
@@ -652,13 +1089,27 @@ def cluster_news_ranked(items: list[NewsItem]) -> list[EventCluster]:
             cid = "evt_" + hashlib.sha1(item.title.encode("utf-8")).hexdigest()[:10]
             clusters.append((set(toks), EventCluster(cid, item.title, item.category, [item])))
 
+    def _cluster_sort_key(c: EventCluster) -> tuple[float, float]:
+        newest: datetime | None = None
+        for it in c.items:
+            ts = parse_iso_kst(it.first_seen) or parse_pub_date(it.published_at)
+            if ts is not None and (newest is None or ts > newest):
+                newest = ts
+        age_min = max(0.0, (ref - newest).total_seconds() / 60.0) if newest is not None else 60.0
+        recency_bonus = max(0.0, 2.0 - (age_min / 30.0))
+        min_prio = min((i.priority for i in c.items), default=2)
+        priority_bonus = 0.6 if min_prio == 1 else 0.0
+        score = len(c.items) * 1.5 + recency_bonus + priority_bonus
+        newest_epoch = newest.timestamp() if newest is not None else 0.0
+        return (-round(score, 4), -newest_epoch)
+
     ranked = [c for _, c in clusters]
-    ranked.sort(key=lambda c: (-len(c.items), min(i.priority for i in c.items)))
+    ranked.sort(key=_cluster_sort_key)
     return ranked
 
 
-def cluster_news(items: list[NewsItem], max_clusters: int = 25) -> list[EventCluster]:
-    return cluster_news_ranked(items)[:max_clusters]
+def cluster_news(items: list[NewsItem], max_clusters: int = 25, now: datetime | None = None) -> list[EventCluster]:
+    return cluster_news_ranked(items, now=now)[:max_clusters]
 
 
 class _TableParser(HTMLParser):
@@ -943,6 +1394,16 @@ def build_gemini_generation_config(
     return cfg
 
 
+def is_daily_quota_error(err_text: str) -> bool:
+    """HTTP 429 응답 본문이 분당 제한(RPM)이 아닌 일일 할당량(RPD) 소진인지 판별."""
+    low = (err_text or "").lower()
+    if any(k in low for k in ("perminute", "per minute", "requests_per_minute", "tokens_per_minute", "rpm")):
+        return False
+    if any(k in low for k in ("perday", "per day", "per_day", "daily", "rpd")):
+        return True
+    return "quota" in low and "second" not in low
+
+
 def call_gemini(
     api_key: str,
     models: list[str],
@@ -952,6 +1413,9 @@ def call_gemini(
     thinking_level: str | None = None,
     thinking_budget: int | None = None,
     timeout: int = DEFAULT_DEEP_TIMEOUT,
+    state: StateStore | None = None,
+    stage: str = "other",
+    now: datetime | None = None,
 ) -> tuple[dict[str, Any], str]:
     if not api_key:
         raise GeminiAuthError("GEMINI_API_KEY가 비어 있습니다. GitHub Secrets에 등록하세요.")
@@ -959,7 +1423,12 @@ def call_gemini(
         raise RuntimeError("호출할 Gemini 모델 목록이 비어 있습니다.")
 
     last_err: Exception | None = None
+    attempted_any = False
     for model in models:
+        if state is not None and state.is_model_exhausted(model, now=now):
+            logger.info("Gemini %s 일일 할당량 소진 서킷 브레이커 활성 — 폴백 모델로 스킵합니다.", model)
+            continue
+        attempted_any = True
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         gen_cfg = build_gemini_generation_config(
             model,
@@ -968,6 +1437,8 @@ def call_gemini(
         )
         for attempt in range(2):
             t0 = time.monotonic()
+            if state is not None:
+                state.record_ai_request(model, stage=stage, now=now)
             body = json.dumps({
                 "systemInstruction": {"parts": [{"text": system_prompt}]},
                 "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
@@ -1006,6 +1477,11 @@ def call_gemini(
                     logger.info("Gemini %s thinkingConfig 미지원 감지 — 기본 설정으로 재시도합니다.", model)
                     gen_cfg = {k: v for k, v in gen_cfg.items() if k != "thinkingConfig"}
                     continue
+                if exc.code == 429 and is_daily_quota_error(err_txt):
+                    if state is not None:
+                        state.mark_model_exhausted(model, now=now)
+                    logger.warning("Gemini %s 일일 할당량 소진 감지 — 태평양 자정까지 폴백 체인에서 제외합니다.", model)
+                    break
                 if exc.code in (429, 503) and attempt == 0:
                     time.sleep(3)
                     continue
@@ -1014,6 +1490,8 @@ def call_gemini(
                 logger.warning("Gemini %s 오류 (%.1fs): %s", model, time.monotonic() - t0, exc)
                 last_err = exc
                 break
+    if not attempted_any:
+        raise RuntimeError("모든 Gemini 모델이 오늘(태평양 시간) 일일 할당량 소진 상태입니다.")
     raise RuntimeError(f"모든 Gemini 모델 호출 실패: {last_err}")
 
 
@@ -1318,7 +1796,8 @@ def _build_stage2_message(
     cand: dict[str, Any],
     delay_note: str | None,
     now: datetime,
-) -> tuple[str, str, str]:
+    state: StateStore | None = None,
+) -> tuple[str, str, str, dict[str, Any]]:
     matched = match_krx_stocks(
         companies,
         cand.get("second_order_keywords") or [],
@@ -1354,6 +1833,9 @@ def _build_stage2_message(
         thinking_level=deep_thinking_level,
         thinking_budget=deep_thinking_budget,
         timeout=deep_timeout,
+        state=state,
+        stage="stage2",
+        now=now,
     )
 
     # 할루시네이션 가드: 실제 KRX 매칭 후보에 있는 종목코드만 통과
@@ -1383,8 +1865,18 @@ def _build_stage2_message(
     deep_raw.setdefault("title", cluster.headline)
     deep_raw.setdefault("event_summary", cand.get("event_summary", cluster.headline))
 
+    raw_kws = list(cand.get("first_order_keywords") or []) + list(cand.get("second_order_keywords") or [])
+    norm_kws = list(dict.fromkeys(tok for kw in raw_kws for tok in extract_normalized_tokens(str(kw))))
+    alert_meta = {
+        "tokens": top_cluster_tokens(cluster, limit=8),
+        "keywords": norm_kws,
+        "cand_codes": [m["code"] for m in matched],
+        "final_codes": [s["code"] for s in deep_raw["stocks"]],
+        "catalyst_score": float(deep_raw["catalyst_score"]),
+    }
+
     msg = format_telegram_html(deep_raw, quotes, cluster.items, deep_model, delay_note=delay_note, now=now)
-    return msg, str(deep_raw["title"]), deep_model
+    return msg, str(deep_raw["title"]), deep_model, alert_meta
 
 
 def write_step_summary(
@@ -1400,6 +1892,9 @@ def write_step_summary(
     sent_this_run: int,
     deferred_remaining: int,
     cycle_rows: list[dict[str, Any]],
+    pending_remaining: int = 0,
+    ai_requests_pt_today: int | None = None,
+    exhausted_models: list[str] | None = None,
 ) -> None:
     summary_env = (os.getenv("GITHUB_STEP_SUMMARY") or "").strip()
     if not summary_env:
@@ -1410,13 +1905,16 @@ def write_step_summary(
             if jitter_sec is not None and scheduled_at is not None
             else "수동 실행 / 해당 없음"
         )
+        pt_quota_txt = f"{ai_requests_pt_today}회" if ai_requests_pt_today is not None else "-"
+        exh_txt = ", ".join(exhausted_models) if exhausted_models else "없음"
         lines = [
             "## News Alpha Radar 실행 요약",
             "",
             f"- **시작 시각**: {started_at.strftime('%Y-%m-%d %H:%M:%S KST')}",
             f"- **Cron 지연**: {jitter_txt}",
             f"- **사이클**: {successful_cycles}/{total_cycles} 성공 (AI 스킵 {skipped_cycles}회, AI 호출 {ai_calls}회)",
-            f"- **발송 알림 / Deferred 잔여**: {sent_this_run}건 / {deferred_remaining}건",
+            f"- **발송 알림 / Pending / Deferred 잔여**: {sent_this_run}건 / {pending_remaining}건 / {deferred_remaining}건",
+            f"- **금일 PT 누적 AI 요청 / 소진 모델**: {pt_quota_txt} / {exh_txt}",
             "",
             "| 사이클 | 신규기사 | 클러스터 | Stage1 | Deferred 재시도 | 발송 | 비고 |",
             "|---:|---:|---:|---|---:|---:|---|",
@@ -1636,15 +2134,16 @@ def run_live(
                                 if sent_chunks == 0:
                                     msg_to_send = _inject_delay_note_into_html(msg_to_send, delay_note)
                                 title_str = str(entry.get("deep_title") or cluster.headline)
+                                alert_meta = dict(entry.get("alert_meta") or {})
                                 if dry_run:
                                     print(msg_to_send)
                                 else:
                                     send_telegram(tg_token, tg_chat, msg_to_send, start_chunk=sent_chunks)
-                                    state.mark_alerted(tkey, now=now_d)
+                                    state.mark_alerted(tkey, now=now_d, **alert_meta)
                                     logger.info("%s Deferred 재발송 완료(Stage 2 생략, chunk>=%d): %s", tag, sent_chunks, title_str)
                             else:
                                 comps = _ensure_companies(tag)
-                                msg_to_send, title_str, deep_model = _build_stage2_message(
+                                msg_to_send, title_str, deep_model, alert_meta = _build_stage2_message(
                                     api_key=api_key,
                                     deep_models=deep_models,
                                     deep_thinking_level=deep_thinking_level,
@@ -1656,6 +2155,7 @@ def run_live(
                                     cand=cand,
                                     delay_note=delay_note,
                                     now=now_d,
+                                    state=state,
                                 )
                                 ai_calls += 1
                                 logger.info("%s Deferred Stage 2 재분석 완료 (%s): %s", tag, deep_model, title_str)
@@ -1665,7 +2165,7 @@ def run_live(
                                         print(msg_to_send)
                                     else:
                                         send_telegram(tg_token, tg_chat, msg_to_send, start_chunk=0)
-                                        state.mark_alerted(tkey, now=now_d)
+                                        state.mark_alerted(tkey, now=now_d, **alert_meta)
                                         logger.info("%s Deferred 텔레그램 발송 완료: %s", tag, title_str)
                                 except TelegramPartialSendError as tg_exc:
                                     new_retries = retries + 1
@@ -1673,6 +2173,7 @@ def run_live(
                                         entry["kind"] = "send_pending"
                                         entry["message_html"] = msg_to_send
                                         entry["deep_title"] = title_str
+                                        entry["alert_meta"] = alert_meta
                                         entry["sent_chunks"] = tg_exc.sent_chunks
                                         entry["stage2_completed_at"] = now_d.isoformat()
                                         entry["retries"] = new_retries
@@ -1773,22 +2274,64 @@ def run_live(
                     logger.info("%s Deferred 발송으로 알림 한도 도달 — 이번 사이클 RSS 수집을 생략합니다.", tag)
                     break
 
-                # 2) RSS 수집 및 클러스터링
-                fresh = fetch_rss_news(state, now=_now())
+                # 2) RSS 수집 → seen("수집함") + pending 큐 적재 + TTL 만료 처리
+                fetch_now = _now()
+                fresh = fetch_rss_news(state, now=fetch_now)
                 row_summary["fresh_count"] = len(fresh)
-                logger.info("%s 신규 수집 기사(노이즈 제거 후): %d건", tag, len(fresh))
+                for item in fresh:
+                    state.mark_seen(item.url, item.title, now=fetch_now)
+                    state.add_pending(item, now=fetch_now)
 
-                if not fresh:
+                pending_ttl = (
+                    PENDING_TTL_MARKET_MIN if is_market_watch_window(fetch_now) else PENDING_TTL_OFFHOURS_MIN
+                )
+                expired_pending = state.prune_pending_ttl(pending_ttl, now=fetch_now)
+                for exp_item in expired_pending:
+                    fs_dt = parse_iso_kst(exp_item.first_seen) or fetch_now
+                    pub_dt = parse_pub_date(exp_item.published_at)
+                    pub_lag = int((fs_dt - pub_dt).total_seconds()) if pub_dt is not None else None
+                    trace.emit({
+                        "ts": fetch_now.isoformat(),
+                        "type": "article_decision",
+                        "cycle": cycle,
+                        "first_seen": fs_dt.isoformat(),
+                        "source": exp_item.source,
+                        "pub_date_raw": exp_item.published_at,
+                        "pub_date": pub_dt.isoformat() if pub_dt else None,
+                        "pub_lag_sec": pub_lag,
+                        "url_hash": url_hash(exp_item.url),
+                        "title": exp_item.title[:160],
+                        "cluster_id": None,
+                        "cluster_rank": None,
+                        "included_in_stage1": False,
+                        "stage1_score": None,
+                        "stage1_selected": False,
+                        "deferred_reason": "pending_ttl_expired",
+                        "alert_sent": False,
+                    })
+
+                pending_items = state.get_pending_items()
+                logger.info(
+                    "%s 신규 수집 기사: %d건 (pending 대기 %d건, TTL 만료 %d건)",
+                    tag, len(fresh), len(pending_items), len(expired_pending),
+                )
+
+                if not pending_items:
+                    if not dry_run:
+                        state.save(now=fetch_now)
                     skipped_cycles += 1
                     successful_cycles += 1
                     row_summary["skipped_ai"] = True
                     row_summary["note"] = "새 기사 없음"
-                    logger.info("%s 새 기사 없음 — AI 호출 스킵 (Gemini 무료 한도 보호)", tag)
+                    logger.info("%s 대기 기사 없음 — AI 호출 스킵 (Gemini 무료 한도 보호)", tag)
                 else:
-                    ranked_clusters = cluster_news_ranked(fresh)
+                    ranked_clusters = cluster_news_ranked(pending_items, now=fetch_now)
                     clusters = ranked_clusters[:25]
                     row_summary["cluster_count"] = len(clusters)
-                    logger.info("%s 클러스터링 완료: %d개 이벤트 (전체 %d개 중 상위 %d개)", tag, len(clusters), len(ranked_clusters), len(clusters))
+                    logger.info(
+                        "%s 클러스터링 완료: %d개 이벤트 (전체 %d개 중 상위 %d개 평가, 잔여 %d개 pending 유지)",
+                        tag, len(clusters), len(ranked_clusters), len(clusters), max(0, len(ranked_clusters) - len(clusters)),
+                    )
 
                     s1_t0 = time.monotonic()
                     screen_raw, screen_model = call_gemini(
@@ -1799,6 +2342,9 @@ def run_live(
                         thinking_level=screen_thinking_level,
                         thinking_budget=0,
                         timeout=screen_timeout,
+                        state=state,
+                        stage="stage1",
+                        now=fetch_now,
                     )
                     s1_sec = time.monotonic() - s1_t0
                     ai_calls += 1
@@ -1806,11 +2352,14 @@ def run_live(
                     row_summary["stage1_sec"] = round(s1_sec, 2)
                     logger.info("%s Stage 1 스크리닝 완료 (%s, %.1fs)", tag, screen_model, s1_sec)
 
-                    mark_now = _now()
-                    for item in fresh:
-                        state.mark_seen(item.url, item.title, now=mark_now)
+                    # Stage 1에 실제 포함된 상위 25 클러스터의 기사만 evaluated 처리 (26위 이하는 pending 유지!)
+                    eval_now = _now()
+                    state.last_stage1_at = eval_now.isoformat()
+                    for cl in clusters:
+                        for item in cl.items:
+                            state.mark_evaluated(item.url, item.title, now=eval_now)
                     if not dry_run:
-                        state.save(now=mark_now)
+                        state.save(now=eval_now)
 
                     by_id = {c.cluster_id: c for c in clusters}
                     selected_map: dict[str, dict[str, Any]] = {}
@@ -1878,7 +2427,7 @@ def run_live(
 
                             # 후보별 개별 try/except: 한 후보 실패 시 나머지 후보 중단 및 유실 방지
                             try:
-                                msg, title_str, deep_model = _build_stage2_message(
+                                msg, title_str, deep_model, alert_meta = _build_stage2_message(
                                     api_key=api_key,
                                     deep_models=deep_models,
                                     deep_thinking_level=deep_thinking_level,
@@ -1890,6 +2439,7 @@ def run_live(
                                     cand=cand,
                                     delay_note=None,
                                     now=cand_now,
+                                    state=state,
                                 )
                                 ai_calls += 1
                                 logger.info("%s Stage 2 심층 분석 완료 (%s): %s", tag, deep_model, title_str)
@@ -1925,7 +2475,7 @@ def run_live(
                                     print(msg)
                                 else:
                                     send_telegram(tg_token, tg_chat, msg, start_chunk=0)
-                                    state.mark_alerted(tkey, now=cand_now)
+                                    state.mark_alerted(tkey, now=cand_now, **alert_meta)
                                     state.save(now=cand_now)
                                     logger.info("%s 텔레그램 알림 발송 완료: %s", tag, title_str)
                                 # 발송 성공 후에만 batch_themes 등록 (실패 시 재시도 허용)
@@ -1955,6 +2505,7 @@ def run_live(
                                         "reason": f"send_error:{str(tg_exc)[:80]}",
                                         "message_html": msg,
                                         "deep_title": title_str,
+                                        "alert_meta": alert_meta,
                                         "sent_chunks": tg_exc.sent_chunks,
                                     },
                                     trace,
@@ -2016,6 +2567,7 @@ def run_live(
                 "type": "cycle_summary",
                 "total_cycles": total_cycles,
                 **row_summary,
+                "pending_remaining": len(state.pending),
                 "deferred_remaining": len(state.deferred),
             })
 
@@ -2034,6 +2586,8 @@ def run_live(
         if not dry_run:
             state.save(now=end_now)
         trace.rotate(now=end_now)
+        pt_today = pt_date_str(end_now)
+        active_exhausted = sorted(m for m, d in state.exhausted_models.items() if d == pt_today)
         write_step_summary(
             started_at=started_at,
             schedule_expr=schedule_expr,
@@ -2046,11 +2600,14 @@ def run_live(
             sent_this_run=sent_this_run,
             deferred_remaining=len(state.deferred),
             cycle_rows=cycle_rows,
+            pending_remaining=len(state.pending),
+            ai_requests_pt_today=state.ai_requests_today(now=end_now),
+            exhausted_models=active_exhausted,
         )
 
     logger.info(
-        "감시 종료 — 성공 %d/%d 사이클 (AI 스킵 %d회, AI 호출 %d회, 알림 %d건, deferred 잔여 %d건)",
-        successful_cycles, total_cycles, skipped_cycles, ai_calls, sent_this_run, len(state.deferred),
+        "감시 종료 — 성공 %d/%d 사이클 (AI 스킵 %d회, AI 호출 %d회, 알림 %d건, pending %d건, deferred %d건)",
+        successful_cycles, total_cycles, skipped_cycles, ai_calls, sent_this_run, len(state.pending), len(state.deferred),
     )
     if successful_cycles == 0 and failed_cycles > 0:
         raise RuntimeError(f"모든 감시 사이클 실패: {last_cycle_err}")
@@ -2058,13 +2615,16 @@ def run_live(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="News Alpha Radar (24/7 Free)")
-    parser.add_argument("--mode", choices=["live", "demo"], default="live")
+    parser.add_argument("--mode", choices=["live", "demo", "probe"], default="live")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--probe-feeds", action="store_true", help="모든 활성+후보 RSS 피드의 상태코드·항목 수·최신 pubDate 점검")
     parser.add_argument("--cycles", type=int, default=None, help="연속 감시 횟수 강제 지정 (미지정 시 장중 6회 / 그 외 1회)")
     parser.add_argument("--interval", type=int, default=None, help="연속 감시 간격(초) 강제 지정 (기본 120초)")
     args = parser.parse_args()
     try:
-        if args.mode == "demo":
+        if args.probe_feeds or args.mode == "probe":
+            probe_feeds()
+        elif args.mode == "demo":
             run_demo(args.dry_run, os.getenv("TELEGRAM_BOT_TOKEN", "").strip(), os.getenv("TELEGRAM_CHAT_ID", "").strip())
         else:
             run_live(args.dry_run, cycles=args.cycles, interval_sec=args.interval)

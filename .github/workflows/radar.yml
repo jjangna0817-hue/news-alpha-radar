@@ -16,13 +16,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "실행 모드 (demo: 텔레그램 즉시 테스트 / live: 실제 실시간 뉴스 분석)"
+        description: "실행 모드 (demo: 텔레그램 테스트 / live: 실시간 분석 / probe: RSS 피드 상태 점검)"
         required: true
         default: "demo"
         type: choice
         options:
           - demo
           - live
+          - probe
       dry_run:
         description: "체크 시 텔레그램 발송 없이 로그에만 출력"
         required: false
@@ -81,6 +82,10 @@ jobs:
         run: |
           mkdir -p data
           MODE="${{ inputs.mode || 'live' }}"
+          if [ "$MODE" = "probe" ]; then
+            python3 radar.py --probe-feeds
+            exit 0
+          fi
           if [ "${{ github.event_name }}" = "schedule" ] && [ -z "$GEMINI_API_KEY" ]; then
             echo "GEMINI_API_KEY Secret 등록 대기 중..."
             exit 0
