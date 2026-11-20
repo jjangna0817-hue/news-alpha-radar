@@ -58,7 +58,7 @@ AFTER="$(git rev-parse --short HEAD)"
 
 # 안전 게이트: 오프라인 단위 테스트 통과 확인 (실패 시 즉시 자동 롤백)
 if [ -n "${PYTHON_BIN}" ]; then
-  if ! "${PYTHON_BIN}" -m unittest discover -s tests >/dev/null 2>&1; then
+  if ! env -i PATH="${PATH}" HOME="${HOME}" "${PYTHON_BIN}" -m unittest discover -s tests >/dev/null 2>&1; then
     echo "[오류] 단위 테스트 실패 — 이전 버전(${BEFORE})으로 자동 롤백합니다!"
     git reset --hard "${BEFORE_FULL}"
     echo "STATUS=ROLLBACK"

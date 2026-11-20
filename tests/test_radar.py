@@ -22,6 +22,27 @@ import radar  # noqa: E402
 
 KST = radar.KST
 
+_APP_ENV_PREFIXES = (
+    "GEMINI_", "TELEGRAM_", "DASHBOARD_", "DAEMON_", "MIN_CATALYST_",
+    "MAX_ALERTS_", "MAX_DAILY_", "THEME_COOLDOWN_", "DEDUP_MODE",
+    "TRIGGER_MODE", "STAGE1_DAILY_", "INSTANT_FLASH_", "EXTRA_RSS_",
+    "MARKET_LOOP_", "GITHUB_EVENT_SCHEDULE", "GITHUB_STEP_SUMMARY",
+)
+_SAVED_ENV: dict[str, str] = {}
+
+
+def setUpModule() -> None:
+    _SAVED_ENV.clear()
+    for key in list(os.environ.keys()):
+        if any(key == p or key.startswith(p) for p in _APP_ENV_PREFIXES):
+            _SAVED_ENV[key] = os.environ.pop(key)
+
+
+def tearDownModule() -> None:
+    for key, val in _SAVED_ENV.items():
+        os.environ[key] = val
+    _SAVED_ENV.clear()
+
 
 class _FakeResponse:
     def __init__(self, payload: dict, status: int = 200) -> None:

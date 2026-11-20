@@ -228,14 +228,18 @@ def run_self_update(repo_dir: Path = REPO_DIR) -> dict[str, Any]:
     else:
         msg = (proc.stderr or proc.stdout or f"exit={proc.returncode}").strip()[:200]
 
-    return {
-        "ok": proc.returncode == 0 and status not in ("ROLLBACK", "ERROR"),
+    ok = proc.returncode == 0 and status not in ("ROLLBACK", "ERROR")
+    out: dict[str, Any] = {
+        "ok": ok,
         "status": status,
         "updated": status == "UPDATED",
         "before": kv.get("BEFORE") or kv.get("COMMIT"),
         "after": kv.get("AFTER") or kv.get("COMMIT"),
         "message": msg,
     }
+    if not ok:
+        out["error"] = msg
+    return out
 
 
 def build_overview_payload(data_dir: Path, now: datetime | None = None) -> dict[str, Any]:
@@ -1162,7 +1166,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         ...opts,
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+      if (!res.ok) throw new Error(data.error || data.message || ("HTTP " + res.status));
       return data;
     }
 
