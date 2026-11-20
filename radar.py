@@ -19,13 +19,16 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -48,9 +51,17 @@ DEFAULT_SCREEN_THINKING_LEVEL = "MINIMAL"
 DEFAULT_DEEP_THINKING_LEVEL = "LOW"
 DEFAULT_THINKING_BUDGET = 1024
 DEFAULT_SCREEN_TIMEOUT = 25
-DEFAULT_DEEP_TIMEOUT = 30
+DEFAULT_DEEP_TIMEOUT = 25
 DEFAULT_MARKET_LOOP_COUNT = 6
 DEFAULT_MARKET_LOOP_INTERVAL_SEC = 120
+
+MAX_DEFERRED_ITEMS = 5
+MAX_DEFERRED_RETRIES = 2
+DEFERRED_TTL_MARKET_MIN = 60
+DEFERRED_TTL_OFFHOURS_MIN = 180
+SEND_PENDING_MAX_AGE_MIN = 15
+TRACE_MAX_DAYS = 7
+TRACE_MAX_BYTES = 5 * 1024 * 1024
 
 RSS_FEEDS: list[dict[str, Any]] = [
     {"name": "구글뉴스_한국_주요", "category": "속보", "url": "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko", "priority": 1},
@@ -205,6 +216,32 @@ class NewsItem:
     published_at: str = ""
     summary: str = ""
     priority: int = 2
+    first_seen: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "title": self.title,
+            "url": self.url,
+            "source": self.source,
+            "category": self.category,
+            "published_at": self.published_at,
+            "summary": self.summary,
+            "priority": self.priority,
+            "first_seen": self.first_seen,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "NewsItem":
+        return cls(
+            title=str(data.get("title", "")),
+            url=str(data.get("url", "")),
+            source=str(data.get("source", "")),
+            category=str(data.get("category", "")),
+            published_at=str(data.get("published_at", "")),
+            summary=str(data.get("summary", "")),
+            priority=int(data.get("priority", 2)),
+            first_seen=str(data.get("first_seen", "")),
+        )
 
 
 @dataclass(slots=True)
@@ -224,6 +261,23 @@ class EventCluster:
             "summary": self.items[0].summary[:280] if self.items else "",
             "published_at": self.items[0].published_at if self.items else "",
         }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "cluster_id": self.cluster_id,
+            "headline": self.headline,
+            "category": self.category,
+            "items": [i.to_dict() for i in self.items[:5]],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EventCluster":
+        return cls(
+            cluster_id=str(data.get("cluster_id", "")),
+            headline=str(data.get("headline", "")),
+            category=str(data.get("category", "")),
+            items=[NewsItem.from_dict(x) for x in (data.get("items") or []) if isinstance(x, dict)],
+        )
 
 
 @dataclass(slots=True)
@@ -249,6 +303,177 @@ def norm_key(text: str) -> str:
 
 def title_hash(title: str) -> str:
     return hashlib.sha1(norm_key(title).encode("utf-8")).hexdigest()[:16]
+
+
+def url_hash(url: str) -> str:
+    return hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:16]
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """임시 파일에 기록·fsync 후 os.replace로 원자적 교체."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fp:
+            tmp_path = Path(fp.name)
+            fp.write(content)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def parse_iso_kst(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        return dt.replace(tzinfo=KST) if dt.tzinfo is None else dt.astimezone(KST)
+    except ValueError:
+        return None
+
+
+def parse_pub_date(raw: str | None) -> datetime | None:
+    """RSS pubDate(RFC 822 / ISO 8601)를 KST datetime으로 파싱. 실패 시 None."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        dt = parsedate_to_datetime(text)
+        if dt is not None:
+            return dt.replace(tzinfo=KST) if dt.tzinfo is None else dt.astimezone(KST)
+    except Exception:
+        pass
+    return parse_iso_kst(text)
+
+
+def _parse_cron_field(expr: str, min_val: int, max_val: int, *, is_dow: bool = False) -> set[int]:
+    out: set[int] = set()
+    for part in expr.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        step = 1
+        if "/" in part:
+            base, step_s = part.split("/", 1)
+            step = max(1, int(step_s))
+        else:
+            base = part
+        if base == "*":
+            start, end = min_val, max_val
+        elif "-" in base:
+            a, b = base.split("-", 1)
+            start, end = int(a), int(b)
+        else:
+            start = end = int(base)
+        for v in range(start, end + 1, step):
+            if is_dow and v == 7:
+                out.add(0)
+            elif min_val <= v <= max_val:
+                out.add(v)
+    return out
+
+
+def compute_cron_jitter(schedule_expr: str | None, started_at: datetime) -> tuple[datetime | None, int | None]:
+    """GitHub Actions UTC cron 문자열 기준으로 가장 최근 예정 시각(KST)과 지연(초) 계산."""
+    expr = (schedule_expr or "").strip()
+    if not expr:
+        return None, None
+    fields = expr.split()
+    if len(fields) != 5:
+        return None, None
+    try:
+        mins = _parse_cron_field(fields[0], 0, 59)
+        hours = _parse_cron_field(fields[1], 0, 23)
+        doms = _parse_cron_field(fields[2], 1, 31)
+        months = _parse_cron_field(fields[3], 1, 12)
+        dows = _parse_cron_field(fields[4], 0, 7, is_dow=True)
+    except ValueError:
+        return None, None
+    if not (mins and hours and doms and months and dows):
+        return None, None
+
+    started_utc = (
+        started_at.replace(tzinfo=KST).astimezone(timezone.utc)
+        if started_at.tzinfo is None
+        else started_at.astimezone(timezone.utc)
+    )
+    cand = started_utc.replace(second=0, microsecond=0)
+    # 최대 7일(10,080분) 역추적
+    for _ in range(7 * 24 * 60 + 1):
+        cron_dow = (cand.weekday() + 1) % 7
+        if (
+            cand.month in months
+            and cand.day in doms
+            and cron_dow in dows
+            and cand.hour in hours
+            and cand.minute in mins
+        ):
+            jitter = max(0, int((started_utc - cand).total_seconds()))
+            return cand.astimezone(KST), jitter
+        cand -= timedelta(minutes=1)
+    return None, None
+
+
+class TraceLogger:
+    """기사 상태 전이·판정·실행 지연을 data/trace.jsonl에 기록하고 7일/5MB 기준 로테이션."""
+
+    def __init__(self, path: Path, max_days: int = TRACE_MAX_DAYS, max_bytes: int = TRACE_MAX_BYTES) -> None:
+        self.path = path
+        self.max_days = max_days
+        self.max_bytes = max_bytes
+
+    def emit(self, record: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with self.path.open("a", encoding="utf-8") as fp:
+            fp.write(line)
+
+    def rotate(self, now: datetime | None = None) -> None:
+        if not self.path.exists():
+            return
+        ref = now.astimezone(KST) if (now and now.tzinfo) else (now.replace(tzinfo=KST) if now else datetime.now(KST))
+        cutoff = ref - timedelta(days=self.max_days)
+        kept: list[str] = []
+        for raw_line in self.path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                ts = parse_iso_kst(obj.get("ts"))
+                if ts is None or ts >= cutoff:
+                    kept.append(line)
+            except Exception:
+                continue
+
+        # 5MB 초과 시 최신 레코드 우선 보존
+        if self.max_bytes > 0:
+            total = 0
+            trimmed: list[str] = []
+            for line in reversed(kept):
+                sz = len(line.encode("utf-8")) + 1
+                if total + sz > self.max_bytes and trimmed:
+                    break
+                trimmed.append(line)
+                total += sz
+            kept = list(reversed(trimmed))
+
+        content = ("\n".join(kept) + "\n") if kept else ""
+        atomic_write_text(self.path, content)
 
 
 def extract_json(raw_text: str) -> dict[str, Any]:
@@ -277,6 +502,7 @@ class StateStore:
         self.seen_titles: dict[str, str] = {}
         self.alerted_themes: dict[str, str] = {}
         self.daily_counts: dict[str, int] = {}
+        self.deferred: list[dict[str, Any]] = []
         if path.exists():
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
@@ -284,80 +510,82 @@ class StateStore:
                 self.seen_titles = dict(raw.get("seen_titles", {}))
                 self.alerted_themes = dict(raw.get("alerted_themes", {}))
                 self.daily_counts = {str(k): int(v) for k, v in raw.get("daily_counts", {}).items()}
+                self.deferred = [dict(d) for d in (raw.get("deferred") or []) if isinstance(d, dict)]
             except Exception:
                 pass
+
+    @staticmethod
+    def _now_kst(now: datetime | None = None) -> datetime:
+        if now is None:
+            return datetime.now(KST)
+        return now.replace(tzinfo=KST) if now.tzinfo is None else now.astimezone(KST)
 
     def is_seen(self, url: str, title: str) -> bool:
         return url in self.seen_urls or title_hash(title) in self.seen_titles
 
-    def mark_seen(self, url: str, title: str) -> None:
-        now_iso = datetime.now(KST).isoformat()
+    def mark_seen(self, url: str, title: str, now: datetime | None = None) -> None:
+        now_iso = self._now_kst(now).isoformat()
         if url:
             self.seen_urls[url] = now_iso
         self.seen_titles[title_hash(title)] = now_iso
 
-    def in_cooldown(self, theme_key: str, hours: int) -> bool:
+    def in_cooldown(self, theme_key: str, hours: int, now: datetime | None = None) -> bool:
         k = norm_key(theme_key)
         if not k or k not in self.alerted_themes:
             return False
-        try:
-            ts = datetime.fromisoformat(self.alerted_themes[k])
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=KST)
-            return (datetime.now(KST) - ts) < timedelta(hours=hours)
-        except ValueError:
+        ts = parse_iso_kst(self.alerted_themes[k])
+        if ts is None:
             return False
+        return (self._now_kst(now) - ts) < timedelta(hours=hours)
 
-    def mark_alerted(self, theme_key: str) -> None:
-        now = datetime.now(KST)
+    def mark_alerted(self, theme_key: str, now: datetime | None = None) -> None:
+        ref = self._now_kst(now)
         k = norm_key(theme_key)
         if k:
-            self.alerted_themes[k] = now.isoformat()
-        day = now.strftime("%Y-%m-%d")
+            self.alerted_themes[k] = ref.isoformat()
+        day = ref.strftime("%Y-%m-%d")
         self.daily_counts[day] = self.daily_counts.get(day, 0) + 1
 
-    def sent_today(self) -> int:
-        return self.daily_counts.get(datetime.now(KST).strftime("%Y-%m-%d"), 0)
+    def sent_today(self, now: datetime | None = None) -> int:
+        return self.daily_counts.get(self._now_kst(now).strftime("%Y-%m-%d"), 0)
 
-    def save(self) -> None:
-        cutoff = datetime.now(KST) - timedelta(days=7)
+    def save(self, now: datetime | None = None) -> None:
+        ref = self._now_kst(now)
+        cutoff = ref - timedelta(days=7)
 
         def _prune(d: dict[str, str]) -> dict[str, str]:
             out: dict[str, str] = {}
             for k, v in d.items():
-                try:
-                    ts = datetime.fromisoformat(v)
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=KST)
-                    if ts >= cutoff:
-                        out[k] = v
-                except ValueError:
-                    pass
+                ts = parse_iso_kst(v)
+                if ts is not None and ts >= cutoff:
+                    out[k] = v
             return out
 
         self.seen_urls = _prune(self.seen_urls)
         self.seen_titles = _prune(self.seen_titles)
         self.alerted_themes = _prune(self.alerted_themes)
-        day_cut = (datetime.now(KST) - timedelta(days=14)).strftime("%Y-%m-%d")
+        day_cut = (ref - timedelta(days=14)).strftime("%Y-%m-%d")
         self.daily_counts = {k: v for k, v in self.daily_counts.items() if k >= day_cut}
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(
-                {
-                    "seen_urls": self.seen_urls,
-                    "seen_titles": self.seen_titles,
-                    "alerted_themes": self.alerted_themes,
-                    "daily_counts": self.daily_counts,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        payload = json.dumps(
+            {
+                "seen_urls": self.seen_urls,
+                "seen_titles": self.seen_titles,
+                "alerted_themes": self.alerted_themes,
+                "daily_counts": self.daily_counts,
+                "deferred": self.deferred,
+            },
+            ensure_ascii=False,
+            indent=2,
         )
+        atomic_write_text(self.path, payload)
 
 
-def fetch_rss_news(state: StateStore, max_per_feed: int = 25) -> list[NewsItem]:
+def fetch_rss_news(state: StateStore, max_per_feed: int = 25, now: datetime | None = None) -> list[NewsItem]:
+    seen_ts = (
+        now.replace(tzinfo=KST) if (now and now.tzinfo is None)
+        else (now.astimezone(KST) if now else datetime.now(KST))
+    ).isoformat()
     collected: list[NewsItem] = []
     for feed in RSS_FEEDS:
         req = urllib.request.Request(
@@ -380,6 +608,7 @@ def fetch_rss_news(state: StateStore, max_per_feed: int = 25) -> list[NewsItem]:
                             published_at=(elem.findtext("pubDate") or "").strip(),
                             summary=strip_html(elem.findtext("description") or "")[:360],
                             priority=int(feed["priority"]),
+                            first_seen=seen_ts,
                         )
                     )
         except Exception as exc:
@@ -400,7 +629,7 @@ def fetch_rss_news(state: StateStore, max_per_feed: int = 25) -> list[NewsItem]:
     return fresh
 
 
-def cluster_news(items: list[NewsItem], max_clusters: int = 25) -> list[EventCluster]:
+def cluster_news_ranked(items: list[NewsItem]) -> list[EventCluster]:
     stops = {"속보", "단독", "종합", "오늘", "내일", "올해", "내년", "관련", "대해", "통해", "위해", "뉴스"}
 
     def _tokens(t: str) -> set[str]:
@@ -425,7 +654,11 @@ def cluster_news(items: list[NewsItem], max_clusters: int = 25) -> list[EventClu
 
     ranked = [c for _, c in clusters]
     ranked.sort(key=lambda c: (-len(c.items), min(i.priority for i in c.items)))
-    return ranked[:max_clusters]
+    return ranked
+
+
+def cluster_news(items: list[NewsItem], max_clusters: int = 25) -> list[EventCluster]:
+    return cluster_news_ranked(items)[:max_clusters]
 
 
 class _TableParser(HTMLParser):
@@ -520,10 +753,9 @@ def load_krx_master(cache_path: Path, allow_network: bool = True) -> dict[str, d
 
         if fetched:
             _merge(fetched)
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(
+            atomic_write_text(
+                cache_path,
                 json.dumps({"updated_at": datetime.now(KST).isoformat(), "companies": fetched}, ensure_ascii=False),
-                encoding="utf-8",
             )
     return companies
 
@@ -785,14 +1017,27 @@ def call_gemini(
     raise RuntimeError(f"모든 Gemini 모델 호출 실패: {last_err}")
 
 
-def format_telegram_html(report: dict[str, Any], quotes: dict[str, StockQuote], articles: list[NewsItem], model_used: str) -> str:
+def format_telegram_html(
+    report: dict[str, Any],
+    quotes: dict[str, StockQuote],
+    articles: list[NewsItem],
+    model_used: str,
+    *,
+    delay_note: str | None = None,
+    now: datetime | None = None,
+) -> str:
     esc = lambda s: html.escape(str(s or ""), quote=False)
     esc_a = lambda s: html.escape(str(s or ""), quote=True)
-    now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M KST")
+    ref = now.astimezone(KST) if (now and now.tzinfo) else (now.replace(tzinfo=KST) if now else datetime.now(KST))
+    now_str = ref.strftime("%Y-%m-%d %H:%M KST")
 
     lines = [
         f"🚨 <b>[이슈 레이더] {esc(report['title'])}</b>",
         f"⭐ 촉매 점수: <b>{float(report['catalyst_score']):.1f}/10</b>  |  🕒 {now_str}",
+    ]
+    if delay_note:
+        lines.append(f"<i>{esc(delay_note)}</i>")
+    lines += [
         "",
         "📰 <b>사건 요약</b>",
         esc(report["event_summary"]),
@@ -846,13 +1091,20 @@ def format_telegram_html(report: dict[str, Any], quotes: dict[str, StockQuote], 
     return "\n".join(lines)
 
 
-def send_telegram(token: str, chat_id: str, html_text: str) -> None:
-    if not (token and chat_id):
-        raise RuntimeError("TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID가 비어 있습니다.")
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    chunks, cur, cur_len = [], [], 0
+class TelegramPartialSendError(RuntimeError):
+    """텔레그램 청크 발송 중 실패 시 이미 전송된 청크 수를 함께 전달."""
+
+    def __init__(self, message: str, sent_chunks: int = 0) -> None:
+        super().__init__(message)
+        self.sent_chunks = sent_chunks
+
+
+def split_telegram_chunks(html_text: str, max_len: int = 3950) -> list[str]:
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
     for line in html_text.splitlines():
-        if cur and cur_len + len(line) + 1 > 3950:
+        if cur and cur_len + len(line) + 1 > max_len:
             chunks.append("\n".join(cur))
             cur, cur_len = [line], len(line)
         else:
@@ -860,8 +1112,19 @@ def send_telegram(token: str, chat_id: str, html_text: str) -> None:
             cur_len += len(line) + 1
     if cur:
         chunks.append("\n".join(cur))
+    return chunks
 
-    for chunk in chunks:
+
+def send_telegram(token: str, chat_id: str, html_text: str, *, start_chunk: int = 0) -> int:
+    if not (token and chat_id):
+        raise TelegramPartialSendError("TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID가 비어 있습니다.", sent_chunks=start_chunk)
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    chunks = split_telegram_chunks(html_text)
+    if start_chunk >= len(chunks):
+        return len(chunks)
+
+    sent = start_chunk
+    for chunk in chunks[start_chunk:]:
         payload = json.dumps({
             "chat_id": chat_id,
             "text": chunk,
@@ -873,10 +1136,16 @@ def send_telegram(token: str, chat_id: str, html_text: str) -> None:
             with urllib.request.urlopen(req, timeout=12) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
                 if not res.get("ok"):
-                    raise RuntimeError(f"텔레그램 발송 실패: {res}")
+                    raise TelegramPartialSendError(f"텔레그램 발송 실패: {res}", sent_chunks=sent)
+            sent += 1
+        except TelegramPartialSendError:
+            raise
         except urllib.error.HTTPError as exc:
             err_body = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"텔레그램 HTTP {exc.code} 오류: {err_body}") from exc
+            raise TelegramPartialSendError(f"텔레그램 HTTP {exc.code} 오류: {err_body}", sent_chunks=sent) from exc
+        except Exception as exc:
+            raise TelegramPartialSendError(f"텔레그램 전송 오류: {exc}", sent_chunks=sent) from exc
+    return sent
 
 
 def run_demo(dry_run: bool, token: str, chat_id: str) -> None:
@@ -953,12 +1222,230 @@ def resolve_loop_schedule(
     return total_cycles, loop_interval, market_window
 
 
+def _earliest_first_seen(cluster: EventCluster, fallback_now: datetime) -> str:
+    best: datetime | None = None
+    for item in cluster.items:
+        ts = parse_iso_kst(item.first_seen)
+        if ts is not None and (best is None or ts < best):
+            best = ts
+    return (best or fallback_now).isoformat()
+
+
+def _format_delay_note(first_seen_iso: str, now: datetime) -> str:
+    fs = parse_iso_kst(first_seen_iso) or now
+    elapsed_min = max(1, int((now - fs).total_seconds() // 60))
+    return f"⏱ 지연 발송 (최초 포착 {fs.strftime('%H:%M')}, {elapsed_min}분 경과)"
+
+
+def _inject_delay_note_into_html(html_text: str, delay_note: str) -> str:
+    tag_line = f"<i>{html.escape(delay_note, quote=False)}</i>"
+    lines = html_text.splitlines()
+    for idx, line in enumerate(lines):
+        if "⏱ 지연 발송" in line:
+            lines[idx] = tag_line
+            return "\n".join(lines)
+    for idx, line in enumerate(lines):
+        if line.startswith("⭐ 촉매 점수:"):
+            lines.insert(idx + 1, tag_line)
+            return "\n".join(lines)
+    return tag_line + "\n" + html_text
+
+
+def _deferred_ttl_minutes(market_window: bool) -> int:
+    return DEFERRED_TTL_MARKET_MIN if market_window else DEFERRED_TTL_OFFHOURS_MIN
+
+
+def enqueue_deferred(
+    state: StateStore,
+    entry: dict[str, Any],
+    trace: TraceLogger,
+    cycle: int,
+    now: datetime,
+) -> None:
+    cid = str(entry.get("cluster", {}).get("cluster_id") or "")
+    tnorm = norm_key(str(entry.get("theme_key") or cid))
+
+    kept: list[dict[str, Any]] = []
+    for existing in state.deferred:
+        ecid = str(existing.get("cluster", {}).get("cluster_id") or "")
+        etnorm = norm_key(str(existing.get("theme_key") or ecid))
+        if (cid and ecid == cid) or (tnorm and etnorm == tnorm):
+            continue
+        kept.append(existing)
+    kept.append(entry)
+
+    kept.sort(key=lambda d: (-float(d.get("catalyst_score", 0.0)), str(d.get("created_at", ""))))
+    dropped = kept[MAX_DEFERRED_ITEMS:]
+    state.deferred = kept[:MAX_DEFERRED_ITEMS]
+
+    trace.emit({
+        "ts": now.isoformat(),
+        "type": "deferred_event",
+        "cycle": cycle,
+        "action": "enqueued",
+        "kind": entry.get("kind"),
+        "cluster_id": cid,
+        "theme_key": entry.get("theme_key"),
+        "catalyst_score": float(entry.get("catalyst_score", 0.0)),
+        "retries": int(entry.get("retries", 0)),
+        "reason": entry.get("reason"),
+    })
+    for d in dropped:
+        trace.emit({
+            "ts": now.isoformat(),
+            "type": "deferred_event",
+            "cycle": cycle,
+            "action": "dropped_capacity",
+            "kind": d.get("kind"),
+            "cluster_id": d.get("cluster", {}).get("cluster_id"),
+            "theme_key": d.get("theme_key"),
+            "catalyst_score": float(d.get("catalyst_score", 0.0)),
+            "retries": int(d.get("retries", 0)),
+            "reason": "capacity_limit",
+        })
+
+
+def _build_stage2_message(
+    *,
+    api_key: str,
+    deep_models: list[str],
+    deep_thinking_level: str,
+    deep_thinking_budget: int,
+    deep_timeout: int,
+    min_score: float,
+    companies: dict[str, dict[str, str]],
+    cluster: EventCluster,
+    cand: dict[str, Any],
+    delay_note: str | None,
+    now: datetime,
+) -> tuple[str, str, str]:
+    matched = match_krx_stocks(
+        companies,
+        cand.get("second_order_keywords") or [],
+        cand.get("first_order_keywords") or [],
+        cand.get("negative_keywords") or [],
+    )
+    quotes = fetch_naver_quotes([m["code"] for m in matched])
+    enriched = []
+    for m in matched:
+        row = {k: v for k, v in m.items() if k != "_score"}
+        q = quotes.get(m["code"])
+        if q:
+            row["quote"] = {
+                "price": q.price,
+                "change_pct": q.change_pct,
+                "volume": q.volume,
+                "reaction_stage": q.reaction_stage,
+            }
+        enriched.append(row)
+
+    deep_raw, deep_model = call_gemini(
+        api_key,
+        deep_models,
+        DEEP_PROMPT,
+        json.dumps(
+            {
+                "event_cluster": cluster.to_prompt_dict(),
+                "stage1_screening": cand,
+                "verified_krx_candidates": enriched,
+            },
+            ensure_ascii=False,
+        ),
+        thinking_level=deep_thinking_level,
+        thinking_budget=deep_thinking_budget,
+        timeout=deep_timeout,
+    )
+
+    # 할루시네이션 가드: 실제 KRX 매칭 후보에 있는 종목코드만 통과
+    valid_by_code = {m["code"]: m for m in matched}
+    clean_stocks = []
+    for s in deep_raw.get("stocks", []):
+        code = str(s.get("code", "")).strip().zfill(6)
+        if code in valid_by_code:
+            s["code"] = code
+            s["name"] = valid_by_code[code]["name"]
+            clean_stocks.append(s)
+    if not clean_stocks and matched:
+        clean_stocks = [
+            {
+                "code": m["code"],
+                "name": m["name"],
+                "direction": "하락주의" if m["order_type"] == "피해_우려" else "상승수혜",
+                "order_tier": "2차 파급(핵심)" if m["order_type"] == "2차_수혜" else "1차 직접",
+                "revenue_link": "검토필요",
+                "reason": f"주요제품: {m['products'][:90]}",
+            }
+            for m in matched[:4]
+        ]
+
+    deep_raw["stocks"] = clean_stocks[:6]
+    deep_raw["catalyst_score"] = float(cand.get("catalyst_score", min_score))
+    deep_raw.setdefault("title", cluster.headline)
+    deep_raw.setdefault("event_summary", cand.get("event_summary", cluster.headline))
+
+    msg = format_telegram_html(deep_raw, quotes, cluster.items, deep_model, delay_note=delay_note, now=now)
+    return msg, str(deep_raw["title"]), deep_model
+
+
+def write_step_summary(
+    *,
+    started_at: datetime,
+    schedule_expr: str,
+    scheduled_at: datetime | None,
+    jitter_sec: int | None,
+    total_cycles: int,
+    successful_cycles: int,
+    skipped_cycles: int,
+    ai_calls: int,
+    sent_this_run: int,
+    deferred_remaining: int,
+    cycle_rows: list[dict[str, Any]],
+) -> None:
+    summary_env = (os.getenv("GITHUB_STEP_SUMMARY") or "").strip()
+    if not summary_env:
+        return
+    try:
+        jitter_txt = (
+            f"{jitter_sec}s (예정 {scheduled_at.strftime('%H:%M KST')}, cron `{schedule_expr}`)"
+            if jitter_sec is not None and scheduled_at is not None
+            else "수동 실행 / 해당 없음"
+        )
+        lines = [
+            "## News Alpha Radar 실행 요약",
+            "",
+            f"- **시작 시각**: {started_at.strftime('%Y-%m-%d %H:%M:%S KST')}",
+            f"- **Cron 지연**: {jitter_txt}",
+            f"- **사이클**: {successful_cycles}/{total_cycles} 성공 (AI 스킵 {skipped_cycles}회, AI 호출 {ai_calls}회)",
+            f"- **발송 알림 / Deferred 잔여**: {sent_this_run}건 / {deferred_remaining}건",
+            "",
+            "| 사이클 | 신규기사 | 클러스터 | Stage1 | Deferred 재시도 | 발송 | 비고 |",
+            "|---:|---:|---:|---|---:|---:|---|",
+        ]
+        for r in cycle_rows:
+            s1 = f"{r['stage1_model']} ({r['stage1_sec']:.1f}s)" if r.get("stage1_model") else ("스킵" if r.get("skipped_ai") else "-")
+            lines.append(
+                f"| {r['cycle']}/{total_cycles} | {r['fresh_count']} | {r['cluster_count']} | "
+                f"{s1} | {r['deferred_retried']} | {r['alerts_sent']} | {r.get('note', '')} |"
+            )
+        lines.append("")
+        summary_path = Path(summary_env)
+        with summary_path.open("a", encoding="utf-8") as fp:
+            fp.write("\n".join(lines) + "\n")
+    except Exception as exc:
+        logger.warning("GITHUB_STEP_SUMMARY 기록 실패: %s", exc)
+
+
 def run_live(
     dry_run: bool,
     cycles: int | None = None,
     interval_sec: int | None = None,
     data_dir: Path | None = None,
+    now_fn: Callable[[], datetime] | None = None,
 ) -> None:
+    def _now() -> datetime:
+        dt = now_fn() if now_fn is not None else datetime.now(KST)
+        return dt.replace(tzinfo=KST) if dt.tzinfo is None else dt.astimezone(KST)
+
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     tg_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -975,21 +1462,46 @@ def run_live(
     screen_timeout = max(5, _env_int("GEMINI_SCREEN_TIMEOUT", DEFAULT_SCREEN_TIMEOUT))
     deep_timeout = max(5, _env_int("GEMINI_DEEP_TIMEOUT", DEFAULT_DEEP_TIMEOUT))
 
-    now_kst = datetime.now(KST)
-    total_cycles, loop_interval, market_window = resolve_loop_schedule(cycles, interval_sec, now=now_kst)
+    started_at = _now()
+    schedule_expr = (os.getenv("GITHUB_EVENT_SCHEDULE") or "").strip()
+    scheduled_at, jitter_sec = compute_cron_jitter(schedule_expr, started_at)
+    total_cycles, loop_interval, market_window = resolve_loop_schedule(cycles, interval_sec, now=started_at)
+
+    if jitter_sec is not None and scheduled_at is not None:
+        logger.info(
+            "Cron 지연 측정: 예정 %s → 시작 %s (지연 %ds, cron=%s)",
+            scheduled_at.strftime("%H:%M KST"),
+            started_at.strftime("%H:%M:%S KST"),
+            jitter_sec,
+            schedule_expr,
+        )
+
     if total_cycles > 1:
         logger.info(
             "장전·장중 워커 루프 시작 (총 %d회, %d초 간격, 장중구간=%s, 시작=%s)",
-            total_cycles, loop_interval, market_window, now_kst.strftime("%Y-%m-%d %H:%M KST"),
+            total_cycles, loop_interval, market_window, started_at.strftime("%Y-%m-%d %H:%M KST"),
         )
     else:
         logger.info(
             "단일 감시 사이클 시작 (장중구간=%s, 시작=%s)",
-            market_window, now_kst.strftime("%Y-%m-%d %H:%M KST"),
+            market_window, started_at.strftime("%Y-%m-%d %H:%M KST"),
         )
 
     base_dir = data_dir if data_dir is not None else Path("data")
     state = StateStore(base_dir / "state.json")
+    trace = TraceLogger(base_dir / "trace.jsonl")
+    trace.emit({
+        "ts": started_at.isoformat(),
+        "type": "run_start",
+        "event_schedule": schedule_expr or None,
+        "scheduled_at": scheduled_at.isoformat() if scheduled_at else None,
+        "jitter_sec": jitter_sec,
+        "cycles": total_cycles,
+        "interval_sec": loop_interval,
+        "market_window": market_window,
+        "dry_run": dry_run,
+    })
+
     companies: dict[str, dict[str, str]] | None = None
     batch_themes: set[str] = set()
     sent_this_run = 0
@@ -998,30 +1510,287 @@ def run_live(
     successful_cycles = 0
     failed_cycles = 0
     last_cycle_err: Exception | None = None
+    cycle_rows: list[dict[str, Any]] = []
+
+    def _ensure_companies(tag: str) -> dict[str, dict[str, str]]:
+        nonlocal companies
+        if companies is None:
+            companies = load_krx_master(base_dir / "krx_master.json", allow_network=True)
+            logger.info("%s KRX 상장사 DB 로드 완료: %d개 기업", tag, len(companies))
+        return companies
 
     try:
         for cycle in range(1, total_cycles + 1):
             cycle_start = time.monotonic()
+            cycle_now = _now()
             tag = f"[사이클 {cycle}/{total_cycles}]"
+            row_summary: dict[str, Any] = {
+                "cycle": cycle,
+                "fresh_count": 0,
+                "cluster_count": 0,
+                "stage1_model": None,
+                "stage1_sec": 0.0,
+                "deferred_retried": 0,
+                "alerts_sent": 0,
+                "skipped_ai": False,
+                "note": "",
+            }
 
-            if state.sent_today() >= max_daily:
+            if state.sent_today(now=cycle_now) >= max_daily:
                 logger.info("%s 오늘 최대 알림(%d건) 도달 — 무료 할당량 보호를 위해 종료합니다.", tag, max_daily)
+                row_summary["note"] = "일일 한도 도달"
+                cycle_rows.append(row_summary)
                 break
             if sent_this_run >= max_per_run:
                 logger.info("%s 이번 실행 최대 알림(%d건) 도달 — 워커 루프를 종료합니다.", tag, max_per_run)
+                row_summary["note"] = "실행당 한도 도달"
+                cycle_rows.append(row_summary)
                 break
 
             try:
-                fresh = fetch_rss_news(state)
+                # 1) 이전 사이클/실행에서 지연·실패된 deferred 항목 먼저 처리
+                if state.deferred:
+                    snapshot = list(state.deferred)
+                    remaining_deferred: list[dict[str, Any]] = []
+                    for idx, entry in enumerate(snapshot):
+                        now_d = _now()
+                        cid = str(entry.get("cluster", {}).get("cluster_id") or "")
+                        tkey = str(entry.get("theme_key") or cid)
+                        tnorm = norm_key(tkey)
+                        retries = int(entry.get("retries", 0))
+                        expires_at = parse_iso_kst(entry.get("expires_at"))
+
+                        if expires_at is not None and now_d > expires_at:
+                            logger.info("%s Deferred TTL 만료 폐기: %s", tag, tkey)
+                            trace.emit({
+                                "ts": now_d.isoformat(),
+                                "type": "deferred_event",
+                                "cycle": cycle,
+                                "action": "expired",
+                                "kind": entry.get("kind"),
+                                "cluster_id": cid,
+                                "theme_key": tkey,
+                                "catalyst_score": float(entry.get("catalyst_score", 0.0)),
+                                "retries": retries,
+                                "reason": "ttl_expired",
+                            })
+                            continue
+
+                        if retries >= MAX_DEFERRED_RETRIES:
+                            logger.info("%s Deferred 최대 재시도(%d회) 초과 폐기: %s", tag, MAX_DEFERRED_RETRIES, tkey)
+                            trace.emit({
+                                "ts": now_d.isoformat(),
+                                "type": "deferred_event",
+                                "cycle": cycle,
+                                "action": "dropped_max_retries",
+                                "kind": entry.get("kind"),
+                                "cluster_id": cid,
+                                "theme_key": tkey,
+                                "catalyst_score": float(entry.get("catalyst_score", 0.0)),
+                                "retries": retries,
+                                "reason": "max_retries",
+                            })
+                            continue
+
+                        if tnorm in batch_themes or state.in_cooldown(tkey, cooldown_h, now=now_d):
+                            logger.info("%s Deferred 중복/쿨다운 스킵: %s", tag, tkey)
+                            continue
+
+                        if sent_this_run >= max_per_run or state.sent_today(now=now_d) >= max_daily:
+                            remaining_deferred.append(entry)
+                            continue
+
+                        kind = str(entry.get("kind") or "stage2_pending")
+                        sent_chunks = int(entry.get("sent_chunks", 0))
+                        first_seen_iso = str(entry.get("first_seen") or entry.get("created_at") or now_d.isoformat())
+                        delay_note = _format_delay_note(first_seen_iso, now_d)
+
+                        # send_pending이 청크 0 전송 전 15분 초과 시 시세 노후화로 stage2_pending 강등
+                        if kind == "send_pending" and sent_chunks == 0:
+                            s2_at = parse_iso_kst(entry.get("stage2_completed_at") or entry.get("created_at"))
+                            if s2_at is not None and (now_d - s2_at) > timedelta(minutes=SEND_PENDING_MAX_AGE_MIN):
+                                kind = "stage2_pending"
+                                entry["kind"] = "stage2_pending"
+                                entry.pop("message_html", None)
+                                logger.info("%s Deferred send_pending 15분 초과 → stage2_pending 강등: %s", tag, tkey)
+                                trace.emit({
+                                    "ts": now_d.isoformat(),
+                                    "type": "deferred_event",
+                                    "cycle": cycle,
+                                    "action": "downgraded",
+                                    "kind": "stage2_pending",
+                                    "cluster_id": cid,
+                                    "theme_key": tkey,
+                                    "catalyst_score": float(entry.get("catalyst_score", 0.0)),
+                                    "retries": retries,
+                                    "reason": "send_pending_stale_15m",
+                                })
+
+                        row_summary["deferred_retried"] += 1
+                        cluster = EventCluster.from_dict(entry.get("cluster") or {})
+                        cand = dict(entry.get("stage1") or {})
+
+                        try:
+                            if kind == "send_pending" and entry.get("message_html"):
+                                msg_to_send = str(entry["message_html"])
+                                if sent_chunks == 0:
+                                    msg_to_send = _inject_delay_note_into_html(msg_to_send, delay_note)
+                                title_str = str(entry.get("deep_title") or cluster.headline)
+                                if dry_run:
+                                    print(msg_to_send)
+                                else:
+                                    send_telegram(tg_token, tg_chat, msg_to_send, start_chunk=sent_chunks)
+                                    state.mark_alerted(tkey, now=now_d)
+                                    logger.info("%s Deferred 재발송 완료(Stage 2 생략, chunk>=%d): %s", tag, sent_chunks, title_str)
+                            else:
+                                comps = _ensure_companies(tag)
+                                msg_to_send, title_str, deep_model = _build_stage2_message(
+                                    api_key=api_key,
+                                    deep_models=deep_models,
+                                    deep_thinking_level=deep_thinking_level,
+                                    deep_thinking_budget=deep_thinking_budget,
+                                    deep_timeout=deep_timeout,
+                                    min_score=min_score,
+                                    companies=comps,
+                                    cluster=cluster,
+                                    cand=cand,
+                                    delay_note=delay_note,
+                                    now=now_d,
+                                )
+                                ai_calls += 1
+                                logger.info("%s Deferred Stage 2 재분석 완료 (%s): %s", tag, deep_model, title_str)
+                                # Stage 2 성공 후 텔레그램 전송 (실패 시 send_pending 승격)
+                                try:
+                                    if dry_run:
+                                        print(msg_to_send)
+                                    else:
+                                        send_telegram(tg_token, tg_chat, msg_to_send, start_chunk=0)
+                                        state.mark_alerted(tkey, now=now_d)
+                                        logger.info("%s Deferred 텔레그램 발송 완료: %s", tag, title_str)
+                                except TelegramPartialSendError as tg_exc:
+                                    new_retries = retries + 1
+                                    if new_retries < MAX_DEFERRED_RETRIES:
+                                        entry["kind"] = "send_pending"
+                                        entry["message_html"] = msg_to_send
+                                        entry["deep_title"] = title_str
+                                        entry["sent_chunks"] = tg_exc.sent_chunks
+                                        entry["stage2_completed_at"] = now_d.isoformat()
+                                        entry["retries"] = new_retries
+                                        entry["reason"] = f"send_error:{str(tg_exc)[:80]}"
+                                        remaining_deferred.append(entry)
+                                        action = "retried_fail"
+                                    else:
+                                        action = "dropped_max_retries"
+                                    logger.warning("%s Deferred 텔레그램 재발송 실패(chunks=%d, retries=%d): %s", tag, tg_exc.sent_chunks, new_retries, tg_exc)
+                                    trace.emit({
+                                        "ts": now_d.isoformat(),
+                                        "type": "deferred_event",
+                                        "cycle": cycle,
+                                        "action": action,
+                                        "kind": "send_pending",
+                                        "cluster_id": cid,
+                                        "theme_key": tkey,
+                                        "catalyst_score": float(entry.get("catalyst_score", 0.0)),
+                                        "retries": new_retries,
+                                        "reason": str(tg_exc)[:120],
+                                    })
+                                    continue
+
+                            # 발송 성공 후에만 batch_themes 등록
+                            batch_themes.add(tnorm)
+                            sent_this_run += 1
+                            row_summary["alerts_sent"] += 1
+                            trace.emit({
+                                "ts": now_d.isoformat(),
+                                "type": "deferred_event",
+                                "cycle": cycle,
+                                "action": "retried_ok",
+                                "kind": kind,
+                                "cluster_id": cid,
+                                "theme_key": tkey,
+                                "catalyst_score": float(entry.get("catalyst_score", 0.0)),
+                                "retries": retries,
+                                "reason": "ok",
+                            })
+                        except GeminiAuthError:
+                            state.deferred = remaining_deferred + snapshot[idx:]
+                            raise
+                        except TelegramPartialSendError as tg_exc:
+                            new_retries = retries + 1
+                            if new_retries < MAX_DEFERRED_RETRIES:
+                                entry["sent_chunks"] = tg_exc.sent_chunks
+                                entry["retries"] = new_retries
+                                entry["reason"] = f"send_error:{str(tg_exc)[:80]}"
+                                remaining_deferred.append(entry)
+                                action = "retried_fail"
+                            else:
+                                action = "dropped_max_retries"
+                            logger.warning("%s Deferred send_pending 재발송 실패(chunks=%d, retries=%d): %s", tag, tg_exc.sent_chunks, new_retries, tg_exc)
+                            trace.emit({
+                                "ts": now_d.isoformat(),
+                                "type": "deferred_event",
+                                "cycle": cycle,
+                                "action": action,
+                                "kind": "send_pending",
+                                "cluster_id": cid,
+                                "theme_key": tkey,
+                                "catalyst_score": float(entry.get("catalyst_score", 0.0)),
+                                "retries": new_retries,
+                                "reason": str(tg_exc)[:120],
+                            })
+                        except Exception as exc:
+                            new_retries = retries + 1
+                            if new_retries < MAX_DEFERRED_RETRIES:
+                                entry["retries"] = new_retries
+                                entry["reason"] = f"stage2_error:{str(exc)[:80]}"
+                                remaining_deferred.append(entry)
+                                action = "retried_fail"
+                            else:
+                                action = "dropped_max_retries"
+                            logger.warning("%s Deferred 재처리 실패(retries=%d): %s", tag, new_retries, exc)
+                            trace.emit({
+                                "ts": now_d.isoformat(),
+                                "type": "deferred_event",
+                                "cycle": cycle,
+                                "action": action,
+                                "kind": kind,
+                                "cluster_id": cid,
+                                "theme_key": tkey,
+                                "catalyst_score": float(entry.get("catalyst_score", 0.0)),
+                                "retries": new_retries,
+                                "reason": str(exc)[:120],
+                            })
+
+                    state.deferred = remaining_deferred
+                    if not dry_run:
+                        state.save(now=_now())
+
+                # Deferred 처리만으로 한도에 도달했으면 RSS/Stage 1 스킵
+                if state.sent_today(now=_now()) >= max_daily or sent_this_run >= max_per_run:
+                    successful_cycles += 1
+                    row_summary["note"] = "Deferred 처리로 한도 도달"
+                    cycle_rows.append(row_summary)
+                    logger.info("%s Deferred 발송으로 알림 한도 도달 — 이번 사이클 RSS 수집을 생략합니다.", tag)
+                    break
+
+                # 2) RSS 수집 및 클러스터링
+                fresh = fetch_rss_news(state, now=_now())
+                row_summary["fresh_count"] = len(fresh)
                 logger.info("%s 신규 수집 기사(노이즈 제거 후): %d건", tag, len(fresh))
+
                 if not fresh:
                     skipped_cycles += 1
                     successful_cycles += 1
+                    row_summary["skipped_ai"] = True
+                    row_summary["note"] = "새 기사 없음"
                     logger.info("%s 새 기사 없음 — AI 호출 스킵 (Gemini 무료 한도 보호)", tag)
                 else:
-                    clusters = cluster_news(fresh)
-                    logger.info("%s 클러스터링 완료: %d개 이벤트", tag, len(clusters))
+                    ranked_clusters = cluster_news_ranked(fresh)
+                    clusters = ranked_clusters[:25]
+                    row_summary["cluster_count"] = len(clusters)
+                    logger.info("%s 클러스터링 완료: %d개 이벤트 (전체 %d개 중 상위 %d개)", tag, len(clusters), len(ranked_clusters), len(clusters))
 
+                    s1_t0 = time.monotonic()
                     screen_raw, screen_model = call_gemini(
                         api_key,
                         screen_models,
@@ -1031,118 +1800,204 @@ def run_live(
                         thinking_budget=0,
                         timeout=screen_timeout,
                     )
+                    s1_sec = time.monotonic() - s1_t0
                     ai_calls += 1
-                    logger.info("%s Stage 1 스크리닝 완료 (%s)", tag, screen_model)
+                    row_summary["stage1_model"] = screen_model
+                    row_summary["stage1_sec"] = round(s1_sec, 2)
+                    logger.info("%s Stage 1 스크리닝 완료 (%s, %.1fs)", tag, screen_model, s1_sec)
 
+                    mark_now = _now()
                     for item in fresh:
-                        state.mark_seen(item.url, item.title)
+                        state.mark_seen(item.url, item.title, now=mark_now)
                     if not dry_run:
-                        state.save()
+                        state.save(now=mark_now)
 
                     by_id = {c.cluster_id: c for c in clusters}
+                    selected_map: dict[str, dict[str, Any]] = {}
+                    for ev in screen_raw.get("selected_events", []):
+                        cid = ev.get("cluster_id")
+                        if cid in by_id:
+                            selected_map[cid] = ev
+
                     candidates = [
-                        e for e in screen_raw.get("selected_events", [])
-                        if e.get("cluster_id") in by_id and float(e.get("catalyst_score", 0) or 0) >= min_score
+                        e for e in selected_map.values()
+                        if float(e.get("catalyst_score", 0) or 0) >= min_score
                     ]
                     candidates.sort(key=lambda e: -float(e.get("catalyst_score", 0)))
 
+                    alerted_cids: set[str] = set()
+                    deferred_reasons: dict[str, str] = {}
+
                     if not candidates:
+                        row_summary["note"] = "촉매 기준 미달"
                         logger.info("%s 촉매 점수 %.1f 이상 핵심 이슈 없음 — 다음 주기에 재탐색합니다.", tag, min_score)
                     else:
-                        if companies is None:
-                            companies = load_krx_master(base_dir / "krx_master.json", allow_network=True)
-                            logger.info("%s KRX 상장사 DB 로드 완료: %d개 기업", tag, len(companies))
-
-                        limit = min(max_per_run - sent_this_run, max(0, max_daily - state.sent_today()))
-                        sent_in_cycle = 0
+                        comps = _ensure_companies(tag)
+                        ttl_min = _deferred_ttl_minutes(is_market_watch_window(_now()))
 
                         for cand in candidates:
-                            if sent_in_cycle >= limit:
-                                break
-                            tkey = str(cand.get("theme_key") or cand["cluster_id"])
+                            cand_now = _now()
+                            cid = str(cand["cluster_id"])
+                            cluster = by_id[cid]
+                            tkey = str(cand.get("theme_key") or cid)
                             tnorm = norm_key(tkey)
-                            if tnorm in batch_themes or state.in_cooldown(tkey, cooldown_h):
+                            score_val = float(cand.get("catalyst_score", min_score))
+                            first_seen_iso = _earliest_first_seen(cluster, cand_now)
+
+                            if tnorm in batch_themes or state.in_cooldown(tkey, cooldown_h, now=cand_now):
+                                deferred_reasons[cid] = "cooldown_skip"
                                 logger.info("%s 중복/쿨다운 테마 스킵: %s", tag, tkey)
                                 continue
-                            batch_themes.add(tnorm)
 
-                            cluster = by_id[cand["cluster_id"]]
-                            matched = match_krx_stocks(
-                                companies,
-                                cand.get("second_order_keywords") or [],
-                                cand.get("first_order_keywords") or [],
-                                cand.get("negative_keywords") or [],
-                            )
-                            quotes = fetch_naver_quotes([m["code"] for m in matched])
-                            enriched = []
-                            for m in matched:
-                                row = {k: v for k, v in m.items() if k != "_score"}
-                                q = quotes.get(m["code"])
-                                if q:
-                                    row["quote"] = {
-                                        "price": q.price,
-                                        "change_pct": q.change_pct,
-                                        "volume": q.volume,
-                                        "reaction_stage": q.reaction_stage,
-                                    }
-                                enriched.append(row)
-
-                            deep_raw, deep_model = call_gemini(
-                                api_key,
-                                deep_models,
-                                DEEP_PROMPT,
-                                json.dumps(
+                            # 실행당/일일 알림 한도 초과 시 영구 유실 대신 deferred 큐 보관
+                            if sent_this_run >= max_per_run or state.sent_today(now=cand_now) >= max_daily:
+                                reason = "over_daily_limit" if state.sent_today(now=cand_now) >= max_daily else "over_run_limit"
+                                deferred_reasons[cid] = reason
+                                enqueue_deferred(
+                                    state,
                                     {
-                                        "event_cluster": cluster.to_prompt_dict(),
-                                        "stage1_screening": cand,
-                                        "verified_krx_candidates": enriched,
+                                        "kind": "stage2_pending",
+                                        "cluster": cluster.to_dict(),
+                                        "stage1": cand,
+                                        "theme_key": tkey,
+                                        "catalyst_score": score_val,
+                                        "first_seen": first_seen_iso,
+                                        "created_at": cand_now.isoformat(),
+                                        "expires_at": (cand_now + timedelta(minutes=ttl_min)).isoformat(),
+                                        "retries": 0,
+                                        "reason": reason,
                                     },
-                                    ensure_ascii=False,
-                                ),
-                                thinking_level=deep_thinking_level,
-                                thinking_budget=deep_thinking_budget,
-                                timeout=deep_timeout,
-                            )
-                            ai_calls += 1
-                            logger.info("%s Stage 2 심층 분석 완료 (%s)", tag, deep_model)
+                                    trace,
+                                    cycle,
+                                    cand_now,
+                                )
+                                if not dry_run:
+                                    state.save(now=cand_now)
+                                logger.info("%s 알림 한도 도달 — 후순위 후보 deferred 보관: %s", tag, tkey)
+                                continue
 
-                            # 할루시네이션 가드: 실제 KRX 매칭 후보에 있는 종목코드만 통과
-                            valid_by_code = {m["code"]: m for m in matched}
-                            clean_stocks = []
-                            for s in deep_raw.get("stocks", []):
-                                code = str(s.get("code", "")).strip().zfill(6)
-                                if code in valid_by_code:
-                                    s["code"] = code
-                                    s["name"] = valid_by_code[code]["name"]
-                                    clean_stocks.append(s)
-                            if not clean_stocks and matched:
-                                clean_stocks = [
+                            # 후보별 개별 try/except: 한 후보 실패 시 나머지 후보 중단 및 유실 방지
+                            try:
+                                msg, title_str, deep_model = _build_stage2_message(
+                                    api_key=api_key,
+                                    deep_models=deep_models,
+                                    deep_thinking_level=deep_thinking_level,
+                                    deep_thinking_budget=deep_thinking_budget,
+                                    deep_timeout=deep_timeout,
+                                    min_score=min_score,
+                                    companies=comps,
+                                    cluster=cluster,
+                                    cand=cand,
+                                    delay_note=None,
+                                    now=cand_now,
+                                )
+                                ai_calls += 1
+                                logger.info("%s Stage 2 심층 분석 완료 (%s): %s", tag, deep_model, title_str)
+                            except GeminiAuthError:
+                                raise
+                            except Exception as exc:
+                                deferred_reasons[cid] = "stage2_error"
+                                logger.warning("%s 후보 Stage 2 실패 — deferred(stage2_pending) 보관 (%s): %s", tag, tkey, exc)
+                                enqueue_deferred(
+                                    state,
                                     {
-                                        "code": m["code"],
-                                        "name": m["name"],
-                                        "direction": "하락주의" if m["order_type"] == "피해_우려" else "상승수혜",
-                                        "order_tier": "2차 파급(핵심)" if m["order_type"] == "2차_수혜" else "1차 직접",
-                                        "revenue_link": "검토필요",
-                                        "reason": f"주요제품: {m['products'][:90]}",
-                                    }
-                                    for m in matched[:4]
-                                ]
+                                        "kind": "stage2_pending",
+                                        "cluster": cluster.to_dict(),
+                                        "stage1": cand,
+                                        "theme_key": tkey,
+                                        "catalyst_score": score_val,
+                                        "first_seen": first_seen_iso,
+                                        "created_at": cand_now.isoformat(),
+                                        "expires_at": (cand_now + timedelta(minutes=ttl_min)).isoformat(),
+                                        "retries": 0,
+                                        "reason": f"stage2_error:{str(exc)[:80]}",
+                                    },
+                                    trace,
+                                    cycle,
+                                    cand_now,
+                                )
+                                if not dry_run:
+                                    state.save(now=cand_now)
+                                continue
 
-                            deep_raw["stocks"] = clean_stocks[:6]
-                            deep_raw["catalyst_score"] = float(cand.get("catalyst_score", min_score))
-                            deep_raw.setdefault("title", cluster.headline)
-                            deep_raw.setdefault("event_summary", cand.get("event_summary", cluster.headline))
+                            try:
+                                if dry_run:
+                                    print(msg)
+                                else:
+                                    send_telegram(tg_token, tg_chat, msg, start_chunk=0)
+                                    state.mark_alerted(tkey, now=cand_now)
+                                    state.save(now=cand_now)
+                                    logger.info("%s 텔레그램 알림 발송 완료: %s", tag, title_str)
+                                # 발송 성공 후에만 batch_themes 등록 (실패 시 재시도 허용)
+                                batch_themes.add(tnorm)
+                                alerted_cids.add(cid)
+                                sent_this_run += 1
+                                row_summary["alerts_sent"] += 1
+                            except TelegramPartialSendError as tg_exc:
+                                deferred_reasons[cid] = "send_error"
+                                logger.warning(
+                                    "%s 텔레그램 발송 실패(sent_chunks=%d) — deferred(send_pending) 보관 (%s): %s",
+                                    tag, tg_exc.sent_chunks, tkey, tg_exc,
+                                )
+                                enqueue_deferred(
+                                    state,
+                                    {
+                                        "kind": "send_pending",
+                                        "cluster": cluster.to_dict(),
+                                        "stage1": cand,
+                                        "theme_key": tkey,
+                                        "catalyst_score": score_val,
+                                        "first_seen": first_seen_iso,
+                                        "created_at": cand_now.isoformat(),
+                                        "stage2_completed_at": cand_now.isoformat(),
+                                        "expires_at": (cand_now + timedelta(minutes=ttl_min)).isoformat(),
+                                        "retries": 0,
+                                        "reason": f"send_error:{str(tg_exc)[:80]}",
+                                        "message_html": msg,
+                                        "deep_title": title_str,
+                                        "sent_chunks": tg_exc.sent_chunks,
+                                    },
+                                    trace,
+                                    cycle,
+                                    cand_now,
+                                )
+                                if not dry_run:
+                                    state.save(now=cand_now)
+                                continue
 
-                            msg = format_telegram_html(deep_raw, quotes, cluster.items, deep_model)
-                            if dry_run:
-                                print(msg)
-                            else:
-                                send_telegram(tg_token, tg_chat, msg)
-                                state.mark_alerted(tkey)
-                                state.save()
-                                logger.info("%s 텔레그램 알림 발송 완료: %s", tag, deep_raw["title"])
-                            sent_in_cycle += 1
-                            sent_this_run += 1
+                    # 기사 단위 상태 전이·판정 trace 기록
+                    trace_now = _now()
+                    for rank, cl in enumerate(ranked_clusters, start=1):
+                        cid = cl.cluster_id
+                        in_s1 = rank <= 25
+                        ev = selected_map.get(cid)
+                        s1_score = float(ev.get("catalyst_score", 0) or 0) if ev else None
+                        s1_selected = bool(ev and (s1_score or 0.0) >= min_score)
+                        d_reason = deferred_reasons.get(cid) or (None if in_s1 else "cluster_rank_overflow")
+                        sent_flag = cid in alerted_cids
+                        for item in cl.items:
+                            fs_dt = parse_iso_kst(item.first_seen) or trace_now
+                            pub_dt = parse_pub_date(item.published_at)
+                            pub_lag = int((fs_dt - pub_dt).total_seconds()) if pub_dt is not None else None
+                            trace.emit({
+                                "ts": trace_now.isoformat(),
+                                "type": "article_decision",
+                                "cycle": cycle,
+                                "first_seen": fs_dt.isoformat(),
+                                "source": item.source,
+                                "pub_date_raw": item.published_at,
+                                "pub_date": pub_dt.isoformat() if pub_dt else None,
+                                "pub_lag_sec": pub_lag,
+                                "url_hash": url_hash(item.url),
+                                "title": item.title[:160],
+                                "cluster_id": cid,
+                                "cluster_rank": rank,
+                                "included_in_stage1": in_s1,
+                                "stage1_score": s1_score,
+                                "stage1_selected": s1_selected,
+                                "deferred_reason": d_reason,
+                                "alert_sent": sent_flag,
+                            })
 
                     successful_cycles += 1
             except GeminiAuthError:
@@ -1152,10 +2007,21 @@ def run_live(
                     raise
                 failed_cycles += 1
                 last_cycle_err = exc
+                row_summary["note"] = f"오류: {str(exc)[:50]}"
                 logger.warning("%s 일시 오류 발생 — 다음 사이클에서 재시도합니다: %s", tag, exc)
 
+            cycle_rows.append(row_summary)
+            trace.emit({
+                "ts": _now().isoformat(),
+                "type": "cycle_summary",
+                "total_cycles": total_cycles,
+                **row_summary,
+                "deferred_remaining": len(state.deferred),
+            })
+
             if cycle < total_cycles:
-                if state.sent_today() >= max_daily or sent_this_run >= max_per_run:
+                check_now = _now()
+                if state.sent_today(now=check_now) >= max_daily or sent_this_run >= max_per_run:
                     logger.info("%s 알림 한도 도달 — 남은 워커 사이클을 조기 종료합니다.", tag)
                     break
                 elapsed = time.monotonic() - cycle_start
@@ -1164,12 +2030,27 @@ def run_live(
                 if wait_sec > 0:
                     time.sleep(wait_sec)
     finally:
+        end_now = _now()
         if not dry_run:
-            state.save()
+            state.save(now=end_now)
+        trace.rotate(now=end_now)
+        write_step_summary(
+            started_at=started_at,
+            schedule_expr=schedule_expr,
+            scheduled_at=scheduled_at,
+            jitter_sec=jitter_sec,
+            total_cycles=total_cycles,
+            successful_cycles=successful_cycles,
+            skipped_cycles=skipped_cycles,
+            ai_calls=ai_calls,
+            sent_this_run=sent_this_run,
+            deferred_remaining=len(state.deferred),
+            cycle_rows=cycle_rows,
+        )
 
     logger.info(
-        "감시 종료 — 성공 %d/%d 사이클 (AI 스킵 %d회, AI 호출 %d회, 알림 %d건)",
-        successful_cycles, total_cycles, skipped_cycles, ai_calls, sent_this_run,
+        "감시 종료 — 성공 %d/%d 사이클 (AI 스킵 %d회, AI 호출 %d회, 알림 %d건, deferred 잔여 %d건)",
+        successful_cycles, total_cycles, skipped_cycles, ai_calls, sent_this_run, len(state.deferred),
     )
     if successful_cycles == 0 and failed_cycles > 0:
         raise RuntimeError(f"모든 감시 사이클 실패: {last_cycle_err}")

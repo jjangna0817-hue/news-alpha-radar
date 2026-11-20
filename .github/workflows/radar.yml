@@ -2,15 +2,17 @@ name: News Alpha Radar (24/7 Free)
 
 on:
   schedule:
-    # 평일 장전·정규장·장마감 직후 (월~금 07:00~17:59 KST): 15분마다 실행
-    # (특히 평일 08:00~15:30 KST에는 1회 실행 시 내부에서 2분 간격 6회 연속 워커 루프 동작)
-    - cron: "*/15 22-23 * * 0-4"
-    - cron: "*/15 0-8 * * 1-5"
-    # 평일 야간·새벽 및 주말: 1시간마다 해외/사건사고 감지 (Public 무제한, Private도 월 2,000분 이내)
-    - cron: "0 9-21 * * 1-5"
-    - cron: "0 22-23 * * 5"
-    - cron: "0 * * * 6"
-    - cron: "0 0-21 * * 0"
+    # 평일 장전·정규장·장후/애프터마켓 (월~금 07:00~20:59 KST): 소수 분 15분 간격 실행
+    # - 08:00~15:30 KST: 1회 실행 내부에서 2분 간격 6회 연속 워커 루프
+    # - 07:00~07:59, 15:30~20:59 KST: 1회 단발 실행
+    - cron: "7,22,37,52 22-23 * * 0-4"
+    - cron: "7,22,37,52 0-11 * * 1-5"
+    # 평일 심야(21:00~06:59 KST) 및 주말: 매시 13분 1회 단발 실행 (정각 폭주 회피)
+    # 참고: Public 저장소는 Actions 무제한 무료 (현재 워커 구성은 월 ~9,000분+ 추정으로 Private 무료 2,000분 한도 초과)
+    - cron: "13 12-21 * * 1-5"
+    - cron: "13 22-23 * * 5"
+    - cron: "13 * * * 6"
+    - cron: "13 0-21 * * 0"
   workflow_dispatch:
     inputs:
       mode:
@@ -63,6 +65,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_EVENT_SCHEDULE: ${{ github.event.schedule }}
           MIN_CATALYST_SCORE: ${{ vars.MIN_CATALYST_SCORE || '7.5' }}
           MAX_ALERTS_PER_RUN: ${{ vars.MAX_ALERTS_PER_RUN || '2' }}
           MAX_DAILY_ALERTS: ${{ vars.MAX_DAILY_ALERTS || '10' }}
@@ -74,7 +77,7 @@ jobs:
           GEMINI_DEEP_THINKING_LEVEL: ${{ vars.GEMINI_DEEP_THINKING_LEVEL || 'LOW' }}
           GEMINI_THINKING_BUDGET: ${{ vars.GEMINI_THINKING_BUDGET || '1024' }}
           GEMINI_SCREEN_TIMEOUT: ${{ vars.GEMINI_SCREEN_TIMEOUT || '25' }}
-          GEMINI_DEEP_TIMEOUT: ${{ vars.GEMINI_DEEP_TIMEOUT || '30' }}
+          GEMINI_DEEP_TIMEOUT: ${{ vars.GEMINI_DEEP_TIMEOUT || '25' }}
         run: |
           mkdir -p data
           MODE="${{ inputs.mode || 'live' }}"
@@ -90,6 +93,15 @@ jobs:
             EXTRA_ARGS="$EXTRA_ARGS --cycles 1"
           fi
           python3 radar.py --mode "$MODE" $EXTRA_ARGS
+
+      - name: Upload trace artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: radar-trace-${{ github.run_id }}
+          path: data/trace.jsonl
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Save updated state and KRX cache
         if: always()
