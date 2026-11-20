@@ -2,11 +2,11 @@
 """News Alpha Radar — 단일 파일 24/7 국내주식 일상뉴스 2차 파급효과 레이더 (추가 비용 0원).
 
 외부 패키지 설치 불필요 (Python 3.11+ 표준 라이브러리 전용).
-- 뉴스 수집: 무료 한국 RSS 10개 피드 (사회·사건사고·IT·경제·국제) + 시황 노이즈 제거 + 클러스터링
+- 뉴스 수집: 무료 한국 RSS 11개 피드 (사회·사건사고·IT·경제·국제) + 시황 노이즈 제거 + 클러스터링
 - 종목 검증: KRX KIND 전체 상장사(코스피·코스닥 약 2,600개) 실시간 로드 & 2차 키워드 매칭
 - 시세 체크: 네이버 금융 공개 JSON 배치 조회 (미반영 초입 vs 과열 급등 자동 판정)
 - AI 추론: Google AI Studio 무료 티어 2단계 (Flash-Lite 스크리닝 → Flash 심층 매매 가이드)
-- 알림 발송: 텔레그램 Bot API 무료 실시간 푸시
+- 알림 발송: 텔레그램 Bot API 무료 실시간 푸시 (평일 장전·장중 08:00~15:30 KST 2분 간격 6회 연속 감시)
 """
 
 from __future__ import annotations
@@ -42,6 +42,16 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
+DEFAULT_SCREEN_MODELS = "gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.8-flash"
+DEFAULT_DEEP_MODELS = "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.8-flash"
+DEFAULT_SCREEN_THINKING_LEVEL = "MINIMAL"
+DEFAULT_DEEP_THINKING_LEVEL = "LOW"
+DEFAULT_THINKING_BUDGET = 1024
+DEFAULT_SCREEN_TIMEOUT = 25
+DEFAULT_DEEP_TIMEOUT = 30
+DEFAULT_MARKET_LOOP_COUNT = 6
+DEFAULT_MARKET_LOOP_INTERVAL_SEC = 120
+
 RSS_FEEDS: list[dict[str, Any]] = [
     {"name": "구글뉴스_한국_주요", "category": "속보", "url": "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko", "priority": 1},
     {"name": "구글뉴스_한국_사회", "category": "사회/사건", "url": "https://news.google.com/rss/headlines/section/topic/NATION?hl=ko&gl=KR&ceid=KR:ko", "priority": 1},
@@ -51,7 +61,8 @@ RSS_FEEDS: list[dict[str, Any]] = [
     {"name": "연합뉴스_최신", "category": "속보", "url": "https://www.yna.co.kr/rss/news.xml", "priority": 1},
     {"name": "연합뉴스_사회", "category": "사회/사건", "url": "https://www.yna.co.kr/rss/society.xml", "priority": 1},
     {"name": "연합뉴스_산업", "category": "산업", "url": "https://www.yna.co.kr/rss/industry.xml", "priority": 2},
-    {"name": "한국경제_IT과학", "category": "IT/신기술", "url": "https://www.hankyung.com/feed/it", "priority": 2},
+    {"name": "지디넷코리아_IT", "category": "IT/신기술", "url": "https://feeds.feedburner.com/zdkorea", "priority": 2},
+    {"name": "매일경제_경제", "category": "경제/산업", "url": "https://www.mk.co.kr/rss/30100041/", "priority": 2},
     {"name": "매일경제_사회", "category": "사회/사건", "url": "https://www.mk.co.kr/rss/50400012/", "priority": 2},
 ]
 
@@ -64,7 +75,7 @@ NOISE_PATTERNS = [
         r"^\[?코스닥\s*마감",
         r"^\[?뉴욕증시\s*마감",
         r"^\[?오늘의\s*운세",
-        r"^\[?부고\]?",
+        r"^\[?(부고|부음)\]?",
         r"^\[?인사\]?",
         r"^\[?동정\]?",
         r"^\[?포토\]?",
@@ -646,18 +657,90 @@ def fetch_naver_quotes(codes: list[str]) -> dict[str, StockQuote]:
     return quotes
 
 
-def call_gemini(api_key: str, models: list[str], system_prompt: str, user_prompt: str) -> tuple[dict[str, Any], str]:
+class GeminiAuthError(RuntimeError):
+    """GEMINI_API_KEY 누락 또는 유효하지 않은 키 오류."""
+
+
+def _env_str(name: str, default: str) -> str:
+    val = (os.getenv(name) or "").strip()
+    return val if val else default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(_env_str(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env_str(name, str(default)))
+    except ValueError:
+        return default
+
+
+def build_gemini_generation_config(
+    model: str,
+    thinking_level: str | None = None,
+    thinking_budget: int | None = None,
+) -> dict[str, Any]:
+    """모델 세대에 맞는 안전한 generationConfig/thinkingConfig 구성.
+
+    - Gemini 3.x / 4.x: thinkingLevel 사용 (thinkingBudget 및 낮은 temperature 미전송).
+      gemini-3.8-flash / 3.7 / Pro / 4.x는 MINIMAL 미지원이므로 LOW로 자동 보정.
+    - Gemini 2.5: thinkingBudget으로 추론 토큰 상한 제한.
+    """
+    cfg: dict[str, Any] = {"responseMimeType": "application/json"}
+    ml = model.strip().lower()
+
+    if "gemini-2.5" in ml:
+        cfg["temperature"] = 0.25
+        if thinking_budget is not None:
+            cfg["thinkingConfig"] = {"thinkingBudget": max(0, int(thinking_budget))}
+    elif re.search(r"gemini-[34](?:[\.\-]|$)", ml):
+        if thinking_level:
+            level = thinking_level.strip().upper()
+            no_minimal = any(k in ml for k in ("gemini-3.8", "gemini-3.7", "gemini-4", "-pro"))
+            if level == "MINIMAL" and no_minimal:
+                level = "LOW"
+            cfg["thinkingConfig"] = {"thinkingLevel": level}
+    else:
+        cfg["temperature"] = 0.25
+
+    return cfg
+
+
+def call_gemini(
+    api_key: str,
+    models: list[str],
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    thinking_level: str | None = None,
+    thinking_budget: int | None = None,
+    timeout: int = DEFAULT_DEEP_TIMEOUT,
+) -> tuple[dict[str, Any], str]:
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY가 비어 있습니다. GitHub Secrets에 등록하세요.")
+        raise GeminiAuthError("GEMINI_API_KEY가 비어 있습니다. GitHub Secrets에 등록하세요.")
+    if not models:
+        raise RuntimeError("호출할 Gemini 모델 목록이 비어 있습니다.")
+
     last_err: Exception | None = None
     for model in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        body = json.dumps({
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-            "generationConfig": {"temperature": 0.25, "responseMimeType": "application/json"},
-        }).encode("utf-8")
+        gen_cfg = build_gemini_generation_config(
+            model,
+            thinking_level=thinking_level,
+            thinking_budget=thinking_budget,
+        )
         for attempt in range(2):
+            t0 = time.monotonic()
+            body = json.dumps({
+                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                "generationConfig": gen_cfg,
+            }).encode("utf-8")
             try:
                 req = urllib.request.Request(
                     url,
@@ -665,21 +748,38 @@ def call_gemini(api_key: str, models: list[str], system_prompt: str, user_prompt
                     headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
                     method="POST",
                 )
-                with urllib.request.urlopen(req, timeout=45) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     res = json.loads(resp.read().decode("utf-8"))
                 parts = (res.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
-                text = "".join(p.get("text", "") for p in parts)
+                text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+                if not text:
+                    text = "".join(p.get("text", "") for p in parts)
+                elapsed = time.monotonic() - t0
+                thoughts = (res.get("usageMetadata") or {}).get("thoughtsTokenCount")
+                if thoughts is not None:
+                    logger.info("Gemini %s 응답 완료 (%.1fs, thoughts=%s)", model, elapsed, thoughts)
+                else:
+                    logger.info("Gemini %s 응답 완료 (%.1fs)", model, elapsed)
                 return extract_json(text), model
             except urllib.error.HTTPError as exc:
-                err_txt = exc.read().decode("utf-8", errors="ignore")[:220]
-                logger.warning("Gemini %s HTTP %d (시도 %d): %s", model, exc.code, attempt + 1, err_txt)
+                err_txt = exc.read().decode("utf-8", errors="ignore")[:260]
+                logger.warning(
+                    "Gemini %s HTTP %d (시도 %d, %.1fs): %s",
+                    model, exc.code, attempt + 1, time.monotonic() - t0, err_txt,
+                )
                 last_err = exc
+                if exc.code == 400 and "api key" in err_txt.lower():
+                    raise GeminiAuthError(f"Gemini API 키 오류 (HTTP 400): {err_txt}") from exc
+                if exc.code == 400 and "thinking" in err_txt.lower() and "thinkingConfig" in gen_cfg and attempt == 0:
+                    logger.info("Gemini %s thinkingConfig 미지원 감지 — 기본 설정으로 재시도합니다.", model)
+                    gen_cfg = {k: v for k, v in gen_cfg.items() if k != "thinkingConfig"}
+                    continue
                 if exc.code in (429, 503) and attempt == 0:
                     time.sleep(3)
                     continue
                 break
             except Exception as exc:
-                logger.warning("Gemini %s 오류: %s", model, exc)
+                logger.warning("Gemini %s 오류 (%.1fs): %s", model, time.monotonic() - t0, exc)
                 last_err = exc
                 break
     raise RuntimeError(f"모든 Gemini 모델 호출 실패: {last_err}")
@@ -817,144 +917,276 @@ def run_demo(dry_run: bool, token: str, chat_id: str) -> None:
         logger.info("데모 테스트 알림을 텔레그램으로 성공적으로 발송했습니다!")
 
 
-def run_live(dry_run: bool) -> None:
+def is_market_watch_window(now: datetime | None = None) -> bool:
+    """평일 장전·장중(월~금 08:00~15:30 KST) 연속 감시 구간 여부 반환."""
+    if now is None:
+        current = datetime.now(KST)
+    elif now.tzinfo is None:
+        current = now.replace(tzinfo=KST)
+    else:
+        current = now.astimezone(KST)
+    if current.weekday() >= 5:
+        return False
+    return (8, 0) <= (current.hour, current.minute) <= (15, 30)
+
+
+def resolve_loop_schedule(
+    cycles_arg: int | None = None,
+    interval_arg: int | None = None,
+    now: datetime | None = None,
+) -> tuple[int, int, bool]:
+    """실행 횟수와 대기 간격(초)을 결정.
+
+    평일 08:00~15:30 KST에는 기본 2분(120초) 간격 6회 연속 감시 워커 루프를 수행하고,
+    그 외 시간대에는 1회 단발 감시를 수행한다.
+    """
+    market_window = is_market_watch_window(now)
+    default_cycles = max(1, _env_int("MARKET_LOOP_COUNT", DEFAULT_MARKET_LOOP_COUNT))
+    default_interval = max(0, _env_int("MARKET_LOOP_INTERVAL_SEC", DEFAULT_MARKET_LOOP_INTERVAL_SEC))
+
+    if cycles_arg is not None:
+        total_cycles = max(1, cycles_arg)
+    else:
+        total_cycles = default_cycles if market_window else 1
+
+    loop_interval = max(0, interval_arg) if interval_arg is not None else default_interval
+    return total_cycles, loop_interval, market_window
+
+
+def run_live(
+    dry_run: bool,
+    cycles: int | None = None,
+    interval_sec: int | None = None,
+    data_dir: Path | None = None,
+) -> None:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     tg_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    min_score = float(os.getenv("MIN_CATALYST_SCORE", "7.5"))
-    max_per_run = int(os.getenv("MAX_ALERTS_PER_RUN", "2"))
-    max_daily = int(os.getenv("MAX_DAILY_ALERTS", "10"))
-    cooldown_h = int(os.getenv("THEME_COOLDOWN_HOURS", "12"))
-    screen_models = [m.strip() for m in os.getenv("GEMINI_SCREEN_MODELS", "gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.8-flash").split(",") if m.strip()]
-    deep_models = [m.strip() for m in os.getenv("GEMINI_DEEP_MODELS", "gemini-3.8-flash,gemini-3.6-flash,gemini-3.5-flash-lite").split(",") if m.strip()]
+    min_score = _env_float("MIN_CATALYST_SCORE", 7.5)
+    max_per_run = max(1, _env_int("MAX_ALERTS_PER_RUN", 2))
+    max_daily = max(1, _env_int("MAX_DAILY_ALERTS", 10))
+    cooldown_h = max(1, _env_int("THEME_COOLDOWN_HOURS", 12))
 
-    data_dir = Path("data")
-    state = StateStore(data_dir / "state.json")
-    if state.sent_today() >= max_daily:
-        logger.info("오늘 최대 알림(%d건) 도달 — 무료 할당량 보호를 위해 종료합니다.", max_daily)
-        return
+    screen_models = [m.strip() for m in _env_str("GEMINI_SCREEN_MODELS", DEFAULT_SCREEN_MODELS).split(",") if m.strip()]
+    deep_models = [m.strip() for m in _env_str("GEMINI_DEEP_MODELS", DEFAULT_DEEP_MODELS).split(",") if m.strip()]
+    screen_thinking_level = _env_str("GEMINI_SCREEN_THINKING_LEVEL", DEFAULT_SCREEN_THINKING_LEVEL)
+    deep_thinking_level = _env_str("GEMINI_DEEP_THINKING_LEVEL", DEFAULT_DEEP_THINKING_LEVEL)
+    deep_thinking_budget = max(0, _env_int("GEMINI_THINKING_BUDGET", DEFAULT_THINKING_BUDGET))
+    screen_timeout = max(5, _env_int("GEMINI_SCREEN_TIMEOUT", DEFAULT_SCREEN_TIMEOUT))
+    deep_timeout = max(5, _env_int("GEMINI_DEEP_TIMEOUT", DEFAULT_DEEP_TIMEOUT))
 
-    fresh = fetch_rss_news(state)
-    logger.info("신규 수집 기사(노이즈 제거 후): %d건", len(fresh))
-    if not fresh:
-        logger.info("새 기사가 없어 AI 호출 없이 종료합니다.")
-        return
+    now_kst = datetime.now(KST)
+    total_cycles, loop_interval, market_window = resolve_loop_schedule(cycles, interval_sec, now=now_kst)
+    if total_cycles > 1:
+        logger.info(
+            "장전·장중 워커 루프 시작 (총 %d회, %d초 간격, 장중구간=%s, 시작=%s)",
+            total_cycles, loop_interval, market_window, now_kst.strftime("%Y-%m-%d %H:%M KST"),
+        )
+    else:
+        logger.info(
+            "단일 감시 사이클 시작 (장중구간=%s, 시작=%s)",
+            market_window, now_kst.strftime("%Y-%m-%d %H:%M KST"),
+        )
 
-    clusters = cluster_news(fresh)
-    logger.info("클러스터링 완료: %d개 이벤트", len(clusters))
-
-    screen_raw, screen_model = call_gemini(
-        api_key,
-        screen_models,
-        SCREENING_PROMPT,
-        json.dumps({"clusters": [c.to_prompt_dict() for c in clusters], "min_score_hint": min_score}, ensure_ascii=False),
-    )
-    logger.info("Stage 1 스크리닝 완료 (%s)", screen_model)
-
-    for item in fresh:
-        state.mark_seen(item.url, item.title)
-
-    by_id = {c.cluster_id: c for c in clusters}
-    candidates = [
-        e for e in screen_raw.get("selected_events", [])
-        if e.get("cluster_id") in by_id and float(e.get("catalyst_score", 0) or 0) >= min_score
-    ]
-    candidates.sort(key=lambda e: -float(e.get("catalyst_score", 0)))
-
-    if not candidates:
-        state.save()
-        logger.info("촉매 점수 %.1f 이상 핵심 이슈 없음 — 다음 주기에 재탐색합니다.", min_score)
-        return
-
-    companies = load_krx_master(data_dir / "krx_master.json", allow_network=True)
-    logger.info("KRX 상장사 DB 로드 완료: %d개 기업", len(companies))
-
-    sent_this_run = 0
+    base_dir = data_dir if data_dir is not None else Path("data")
+    state = StateStore(base_dir / "state.json")
+    companies: dict[str, dict[str, str]] | None = None
     batch_themes: set[str] = set()
-    limit = min(max_per_run, max(0, max_daily - state.sent_today()))
+    sent_this_run = 0
+    ai_calls = 0
+    skipped_cycles = 0
+    successful_cycles = 0
+    failed_cycles = 0
+    last_cycle_err: Exception | None = None
 
-    for cand in candidates:
-        if sent_this_run >= limit:
-            break
-        tkey = str(cand.get("theme_key") or cand["cluster_id"])
-        tnorm = norm_key(tkey)
-        if tnorm in batch_themes or state.in_cooldown(tkey, cooldown_h):
-            logger.info("중복/쿨다운 테마 스킵: %s", tkey)
-            continue
-        batch_themes.add(tnorm)
+    try:
+        for cycle in range(1, total_cycles + 1):
+            cycle_start = time.monotonic()
+            tag = f"[사이클 {cycle}/{total_cycles}]"
 
-        cluster = by_id[cand["cluster_id"]]
-        matched = match_krx_stocks(
-            companies,
-            cand.get("second_order_keywords") or [],
-            cand.get("first_order_keywords") or [],
-            cand.get("negative_keywords") or [],
-        )
-        quotes = fetch_naver_quotes([m["code"] for m in matched])
-        enriched = []
-        for m in matched:
-            row = {k: v for k, v in m.items() if k != "_score"}
-            q = quotes.get(m["code"])
-            if q:
-                row["quote"] = {"price": q.price, "change_pct": q.change_pct, "volume": q.volume, "reaction_stage": q.reaction_stage}
-            enriched.append(row)
+            if state.sent_today() >= max_daily:
+                logger.info("%s 오늘 최대 알림(%d건) 도달 — 무료 할당량 보호를 위해 종료합니다.", tag, max_daily)
+                break
+            if sent_this_run >= max_per_run:
+                logger.info("%s 이번 실행 최대 알림(%d건) 도달 — 워커 루프를 종료합니다.", tag, max_per_run)
+                break
 
-        deep_raw, deep_model = call_gemini(
-            api_key,
-            deep_models,
-            DEEP_PROMPT,
-            json.dumps({"event_cluster": cluster.to_prompt_dict(), "stage1_screening": cand, "verified_krx_candidates": enriched}, ensure_ascii=False),
-        )
+            try:
+                fresh = fetch_rss_news(state)
+                logger.info("%s 신규 수집 기사(노이즈 제거 후): %d건", tag, len(fresh))
+                if not fresh:
+                    skipped_cycles += 1
+                    successful_cycles += 1
+                    logger.info("%s 새 기사 없음 — AI 호출 스킵 (Gemini 무료 한도 보호)", tag)
+                else:
+                    clusters = cluster_news(fresh)
+                    logger.info("%s 클러스터링 완료: %d개 이벤트", tag, len(clusters))
 
-        # 할루시네이션 가드: 실제 KRX 매칭 후보에 있는 종목코드만 통과
-        valid_by_code = {m["code"]: m for m in matched}
-        clean_stocks = []
-        for s in deep_raw.get("stocks", []):
-            code = str(s.get("code", "")).strip().zfill(6)
-            if code in valid_by_code:
-                s["code"] = code
-                s["name"] = valid_by_code[code]["name"]
-                clean_stocks.append(s)
-        if not clean_stocks and matched:
-            clean_stocks = [
-                {
-                    "code": m["code"],
-                    "name": m["name"],
-                    "direction": "하락주의" if m["order_type"] == "피해_우려" else "상승수혜",
-                    "order_tier": "2차 파급(핵심)" if m["order_type"] == "2차_수혜" else "1차 직접",
-                    "revenue_link": "검토필요",
-                    "reason": f"주요제품: {m['products'][:90]}",
-                }
-                for m in matched[:4]
-            ]
+                    screen_raw, screen_model = call_gemini(
+                        api_key,
+                        screen_models,
+                        SCREENING_PROMPT,
+                        json.dumps({"clusters": [c.to_prompt_dict() for c in clusters], "min_score_hint": min_score}, ensure_ascii=False),
+                        thinking_level=screen_thinking_level,
+                        thinking_budget=0,
+                        timeout=screen_timeout,
+                    )
+                    ai_calls += 1
+                    logger.info("%s Stage 1 스크리닝 완료 (%s)", tag, screen_model)
 
-        deep_raw["stocks"] = clean_stocks[:6]
-        deep_raw["catalyst_score"] = float(cand.get("catalyst_score", min_score))
-        deep_raw.setdefault("title", cluster.headline)
-        deep_raw.setdefault("event_summary", cand.get("event_summary", cluster.headline))
+                    for item in fresh:
+                        state.mark_seen(item.url, item.title)
+                    if not dry_run:
+                        state.save()
 
-        msg = format_telegram_html(deep_raw, quotes, cluster.items, deep_model)
-        if dry_run:
-            print(msg)
-        else:
-            send_telegram(tg_token, tg_chat, msg)
-            state.mark_alerted(tkey)
-            logger.info("텔레그램 알림 발송 완료: %s", deep_raw["title"])
-        sent_this_run += 1
+                    by_id = {c.cluster_id: c for c in clusters}
+                    candidates = [
+                        e for e in screen_raw.get("selected_events", [])
+                        if e.get("cluster_id") in by_id and float(e.get("catalyst_score", 0) or 0) >= min_score
+                    ]
+                    candidates.sort(key=lambda e: -float(e.get("catalyst_score", 0)))
 
-    state.save()
+                    if not candidates:
+                        logger.info("%s 촉매 점수 %.1f 이상 핵심 이슈 없음 — 다음 주기에 재탐색합니다.", tag, min_score)
+                    else:
+                        if companies is None:
+                            companies = load_krx_master(base_dir / "krx_master.json", allow_network=True)
+                            logger.info("%s KRX 상장사 DB 로드 완료: %d개 기업", tag, len(companies))
+
+                        limit = min(max_per_run - sent_this_run, max(0, max_daily - state.sent_today()))
+                        sent_in_cycle = 0
+
+                        for cand in candidates:
+                            if sent_in_cycle >= limit:
+                                break
+                            tkey = str(cand.get("theme_key") or cand["cluster_id"])
+                            tnorm = norm_key(tkey)
+                            if tnorm in batch_themes or state.in_cooldown(tkey, cooldown_h):
+                                logger.info("%s 중복/쿨다운 테마 스킵: %s", tag, tkey)
+                                continue
+                            batch_themes.add(tnorm)
+
+                            cluster = by_id[cand["cluster_id"]]
+                            matched = match_krx_stocks(
+                                companies,
+                                cand.get("second_order_keywords") or [],
+                                cand.get("first_order_keywords") or [],
+                                cand.get("negative_keywords") or [],
+                            )
+                            quotes = fetch_naver_quotes([m["code"] for m in matched])
+                            enriched = []
+                            for m in matched:
+                                row = {k: v for k, v in m.items() if k != "_score"}
+                                q = quotes.get(m["code"])
+                                if q:
+                                    row["quote"] = {
+                                        "price": q.price,
+                                        "change_pct": q.change_pct,
+                                        "volume": q.volume,
+                                        "reaction_stage": q.reaction_stage,
+                                    }
+                                enriched.append(row)
+
+                            deep_raw, deep_model = call_gemini(
+                                api_key,
+                                deep_models,
+                                DEEP_PROMPT,
+                                json.dumps(
+                                    {
+                                        "event_cluster": cluster.to_prompt_dict(),
+                                        "stage1_screening": cand,
+                                        "verified_krx_candidates": enriched,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                thinking_level=deep_thinking_level,
+                                thinking_budget=deep_thinking_budget,
+                                timeout=deep_timeout,
+                            )
+                            ai_calls += 1
+                            logger.info("%s Stage 2 심층 분석 완료 (%s)", tag, deep_model)
+
+                            # 할루시네이션 가드: 실제 KRX 매칭 후보에 있는 종목코드만 통과
+                            valid_by_code = {m["code"]: m for m in matched}
+                            clean_stocks = []
+                            for s in deep_raw.get("stocks", []):
+                                code = str(s.get("code", "")).strip().zfill(6)
+                                if code in valid_by_code:
+                                    s["code"] = code
+                                    s["name"] = valid_by_code[code]["name"]
+                                    clean_stocks.append(s)
+                            if not clean_stocks and matched:
+                                clean_stocks = [
+                                    {
+                                        "code": m["code"],
+                                        "name": m["name"],
+                                        "direction": "하락주의" if m["order_type"] == "피해_우려" else "상승수혜",
+                                        "order_tier": "2차 파급(핵심)" if m["order_type"] == "2차_수혜" else "1차 직접",
+                                        "revenue_link": "검토필요",
+                                        "reason": f"주요제품: {m['products'][:90]}",
+                                    }
+                                    for m in matched[:4]
+                                ]
+
+                            deep_raw["stocks"] = clean_stocks[:6]
+                            deep_raw["catalyst_score"] = float(cand.get("catalyst_score", min_score))
+                            deep_raw.setdefault("title", cluster.headline)
+                            deep_raw.setdefault("event_summary", cand.get("event_summary", cluster.headline))
+
+                            msg = format_telegram_html(deep_raw, quotes, cluster.items, deep_model)
+                            if dry_run:
+                                print(msg)
+                            else:
+                                send_telegram(tg_token, tg_chat, msg)
+                                state.mark_alerted(tkey)
+                                state.save()
+                                logger.info("%s 텔레그램 알림 발송 완료: %s", tag, deep_raw["title"])
+                            sent_in_cycle += 1
+                            sent_this_run += 1
+
+                    successful_cycles += 1
+            except GeminiAuthError:
+                raise
+            except Exception as exc:
+                if total_cycles == 1:
+                    raise
+                failed_cycles += 1
+                last_cycle_err = exc
+                logger.warning("%s 일시 오류 발생 — 다음 사이클에서 재시도합니다: %s", tag, exc)
+
+            if cycle < total_cycles:
+                if state.sent_today() >= max_daily or sent_this_run >= max_per_run:
+                    logger.info("%s 알림 한도 도달 — 남은 워커 사이클을 조기 종료합니다.", tag)
+                    break
+                elapsed = time.monotonic() - cycle_start
+                wait_sec = max(0.0, loop_interval - elapsed)
+                logger.info("%s 완료 (소요 %.1fs) — %.0f초 후 다음 감시 시작", tag, elapsed, wait_sec)
+                if wait_sec > 0:
+                    time.sleep(wait_sec)
+    finally:
+        if not dry_run:
+            state.save()
+
+    logger.info(
+        "감시 종료 — 성공 %d/%d 사이클 (AI 스킵 %d회, AI 호출 %d회, 알림 %d건)",
+        successful_cycles, total_cycles, skipped_cycles, ai_calls, sent_this_run,
+    )
+    if successful_cycles == 0 and failed_cycles > 0:
+        raise RuntimeError(f"모든 감시 사이클 실패: {last_cycle_err}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="News Alpha Radar (24/7 Free)")
     parser.add_argument("--mode", choices=["live", "demo"], default="live")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--cycles", type=int, default=None, help="연속 감시 횟수 강제 지정 (미지정 시 장중 6회 / 그 외 1회)")
+    parser.add_argument("--interval", type=int, default=None, help="연속 감시 간격(초) 강제 지정 (기본 120초)")
     args = parser.parse_args()
     try:
         if args.mode == "demo":
             run_demo(args.dry_run, os.getenv("TELEGRAM_BOT_TOKEN", "").strip(), os.getenv("TELEGRAM_CHAT_ID", "").strip())
         else:
-            run_live(args.dry_run)
+            run_live(args.dry_run, cycles=args.cycles, interval_sec=args.interval)
         return 0
     except Exception as exc:
         logger.exception("실행 오류: %s", exc)

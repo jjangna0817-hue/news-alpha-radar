@@ -2,7 +2,8 @@ name: News Alpha Radar (24/7 Free)
 
 on:
   schedule:
-    # 평일 장전·정규장·장마감 직후 (월~금 07:00~17:59 KST): 15분마다 초고속 감지
+    # 평일 장전·정규장·장마감 직후 (월~금 07:00~17:59 KST): 15분마다 실행
+    # (특히 평일 08:00~15:30 KST에는 1회 실행 시 내부에서 2분 간격 6회 연속 워커 루프 동작)
     - cron: "*/15 22-23 * * 0-4"
     - cron: "*/15 0-8 * * 1-5"
     # 평일 야간·새벽 및 주말: 1시간마다 해외/사건사고 감지 (Public 무제한, Private도 월 2,000분 이내)
@@ -25,6 +26,11 @@ on:
         required: false
         default: false
         type: boolean
+      single_cycle:
+        description: "체크 시 장중 워커 루프(6회) 대신 1회만 즉시 실행"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: news-alpha-radar
@@ -33,7 +39,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -61,6 +67,14 @@ jobs:
           MAX_ALERTS_PER_RUN: ${{ vars.MAX_ALERTS_PER_RUN || '2' }}
           MAX_DAILY_ALERTS: ${{ vars.MAX_DAILY_ALERTS || '10' }}
           THEME_COOLDOWN_HOURS: ${{ vars.THEME_COOLDOWN_HOURS || '12' }}
+          MARKET_LOOP_COUNT: ${{ vars.MARKET_LOOP_COUNT || '6' }}
+          MARKET_LOOP_INTERVAL_SEC: ${{ vars.MARKET_LOOP_INTERVAL_SEC || '120' }}
+          GEMINI_SCREEN_MODELS: ${{ vars.GEMINI_SCREEN_MODELS || 'gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.8-flash' }}
+          GEMINI_DEEP_MODELS: ${{ vars.GEMINI_DEEP_MODELS || 'gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.8-flash' }}
+          GEMINI_DEEP_THINKING_LEVEL: ${{ vars.GEMINI_DEEP_THINKING_LEVEL || 'LOW' }}
+          GEMINI_THINKING_BUDGET: ${{ vars.GEMINI_THINKING_BUDGET || '1024' }}
+          GEMINI_SCREEN_TIMEOUT: ${{ vars.GEMINI_SCREEN_TIMEOUT || '25' }}
+          GEMINI_DEEP_TIMEOUT: ${{ vars.GEMINI_DEEP_TIMEOUT || '30' }}
         run: |
           mkdir -p data
           MODE="${{ inputs.mode || 'live' }}"
@@ -70,7 +84,10 @@ jobs:
           fi
           EXTRA_ARGS=""
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            EXTRA_ARGS="--dry-run"
+            EXTRA_ARGS="$EXTRA_ARGS --dry-run"
+          fi
+          if [ "${{ inputs.single_cycle }}" = "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --cycles 1"
           fi
           python3 radar.py --mode "$MODE" $EXTRA_ARGS
 
