@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -221,17 +222,21 @@ def run_self_update(repo_dir: Path = REPO_DIR) -> dict[str, Any]:
     script = repo_dir / "deploy" / "ubuntu" / "update.sh"
     if not script.exists():
         return {"ok": False, "status": "MISSING_SCRIPT", "message": "update.sh 스크립트를 찾을 수 없습니다."}
+    env = dict(os.environ)
+    if sys.executable:
+        env["PYTHON_BIN"] = sys.executable
     try:
         proc = subprocess.run(
             ["bash", str(script), "--defer-dashboard"],
             cwd=str(repo_dir),
+            env=env,
             capture_output=True,
             text=True,
             timeout=120,
             check=False,
         )
     except Exception as exc:
-        return {"ok": False, "status": "ERROR", "message": str(exc)}
+        return {"ok": False, "status": "ERROR", "message": str(exc), "error": str(exc)}
 
     kv: dict[str, str] = {}
     for line in (proc.stdout or "").splitlines():
@@ -246,8 +251,15 @@ def run_self_update(repo_dir: Path = REPO_DIR) -> dict[str, Any]:
         msg = f"업데이트 완료 ({kv.get('BEFORE', '')} → {kv.get('AFTER', '')}). 서비스가 1초 뒤 자동 재시작됩니다."
     elif status == "DIRTY_SKIP":
         msg = "우분투 로컬 파일에 미커밋 변경이 있어 업데이트를 건너뛰었습니다."
+    elif status == "NON_MAIN_SKIP":
+        msg = "현재 브랜치가 main이 아니어서 업데이트를 건너뛰었습니다."
     elif status == "ROLLBACK":
-        msg = "테스트 실패로 이전 버전으로 자동 롤백했습니다."
+        detail = kv.get("TEST_ERROR", "").strip()
+        msg = (
+            f"테스트 실패로 이전 버전으로 자동 롤백했습니다. ({detail})"
+            if detail
+            else "테스트 실패로 이전 버전으로 자동 롤백했습니다."
+        )
     elif status == "BUSY":
         msg = "이미 다른 업데이트 작업이 진행 중입니다."
     else:
@@ -262,6 +274,8 @@ def run_self_update(repo_dir: Path = REPO_DIR) -> dict[str, Any]:
         "after": kv.get("AFTER") or kv.get("COMMIT"),
         "message": msg,
     }
+    if kv.get("PYTHON_BIN"):
+        out["python_bin"] = kv["PYTHON_BIN"]
     if not ok:
         out["error"] = msg
     return out
