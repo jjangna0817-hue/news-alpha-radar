@@ -45,6 +45,7 @@ MAX_REQUEST_BODY_BYTES = 64 * 1024
 
 def _effective_config(data_dir: Path) -> dict[str, Any]:
     raw = radar.load_runtime_config(data_dir)
+    limits = radar.resolve_alert_limits(raw, daemon_mode=True)
     default_feeds = [
         f["name"]
         for f in (radar.resolve_active_feeds(None, daemon_mode=True) or radar.RSS_FEEDS)
@@ -83,10 +84,34 @@ def _effective_config(data_dir: Path) -> dict[str, Any]:
             if raw.get("min_catalyst_score") is not None
             else radar._env_float("MIN_CATALYST_SCORE", 7.5)
         ),
-        "max_daily_alerts": int(
-            raw["max_daily_alerts"]
-            if raw.get("max_daily_alerts") is not None
-            else radar._env_int("MAX_DAILY_ALERTS", 10)
+        "max_market_alerts": int(limits["max_market_alerts"]),
+        "max_offhours_alerts": int(limits["max_offhours_alerts"]),
+        "max_daily_alerts": int(limits["max_daily_alerts"]),
+        "offhours_digest_enabled": bool(limits["offhours_digest_enabled"]),
+        "offhours_digest_time": str(limits["offhours_digest_time"]),
+        "stock_dedup_hours": max(
+            0,
+            int(
+                raw["stock_dedup_hours"]
+                if raw.get("stock_dedup_hours") is not None
+                else radar._env_int("STOCK_DEDUP_HOURS", radar.DEFAULT_STOCK_DEDUP_HOURS)
+            ),
+        ),
+        "max_daily_per_sector": max(
+            0,
+            int(
+                raw["max_daily_per_sector"]
+                if raw.get("max_daily_per_sector") is not None
+                else radar._env_int("MAX_DAILY_PER_SECTOR", radar.DEFAULT_MAX_DAILY_PER_SECTOR)
+            ),
+        ),
+        "max_bullish_prepriced_pct": max(
+            0.0,
+            float(
+                raw["max_bullish_prepriced_pct"]
+                if raw.get("max_bullish_prepriced_pct") is not None
+                else radar._env_float("MAX_BULLISH_PREPRICED_PCT", radar.DEFAULT_MAX_BULLISH_PREPRICED_PCT)
+            ),
         ),
         "max_alerts_per_window": int(
             raw["max_alerts_per_window"]
@@ -312,6 +337,21 @@ def build_overview_payload(data_dir: Path, now: datetime | None = None) -> dict[
         for d in state.deferred
     ]
 
+    overnight_summary = [
+        {
+            "theme_key": q.get("theme_key"),
+            "sector": q.get("sector"),
+            "headline": (q.get("cluster") or {}).get("headline") or "",
+            "catalyst_score": q.get("catalyst_score"),
+            "created_at": q.get("created_at"),
+        }
+        for q in state.overnight_queue
+    ]
+
+    perf_records = radar.PerformanceTracker(data_dir / "performance.jsonl").load_records()
+    perf_summary = radar.summarize_performance(perf_records, recent_limit=50)
+    today_str = ref.strftime("%Y-%m-%d")
+
     return {
         "now_kst": ref.isoformat(),
         "pt_date": pt_today,
@@ -321,7 +361,14 @@ def build_overview_payload(data_dir: Path, now: datetime | None = None) -> dict[
         "config": cfg,
         "metrics": {
             "sent_today": state.sent_today(now=ref),
+            "sent_market_today": state.sent_market_today(now=ref),
+            "sent_offhours_today": state.sent_offhours_today(now=ref),
+            "max_market_alerts": cfg["max_market_alerts"],
+            "max_offhours_alerts": cfg["max_offhours_alerts"],
             "max_daily_alerts": cfg["max_daily_alerts"],
+            "overnight_queue_count": len(state.overnight_queue),
+            "last_digest_date": state.last_digest_date,
+            "daily_sector_counts_today": dict(state.daily_sector_counts.get(today_str) or {}),
             "ai_requests_pt_total": state.ai_requests_today(now=ref),
             "ai_requests_by_model": ai_by_model,
             "primary_screen_model": primary_screen,
@@ -339,6 +386,8 @@ def build_overview_payload(data_dir: Path, now: datetime | None = None) -> dict[
         },
         "recent_alerts": recent_alerts,
         "deferred": deferred_summary,
+        "overnight_queue": overnight_summary,
+        "performance": perf_summary,
         "feeds": feeds_info,
     }
 
@@ -380,8 +429,28 @@ def validate_and_merge_config(data_dir: Path, patch: dict[str, Any]) -> dict[str
     if "min_catalyst_score" in patch:
         val = float(patch["min_catalyst_score"])
         cur["min_catalyst_score"] = round(max(1.0, min(10.0, val)), 1)
+    split_updated = False
+    if "max_market_alerts" in patch:
+        cur["max_market_alerts"] = max(0, min(50, int(patch["max_market_alerts"])))
+        split_updated = True
+    if "max_offhours_alerts" in patch:
+        cur["max_offhours_alerts"] = max(0, min(30, int(patch["max_offhours_alerts"])))
+        split_updated = True
     if "max_daily_alerts" in patch:
-        cur["max_daily_alerts"] = max(1, min(50, int(patch["max_daily_alerts"])))
+        cur["max_daily_alerts"] = max(1, min(80, int(patch["max_daily_alerts"])))
+    elif split_updated:
+        cur["max_daily_alerts"] = max(1, cur["max_market_alerts"] + cur["max_offhours_alerts"])
+    if "offhours_digest_enabled" in patch:
+        cur["offhours_digest_enabled"] = bool(patch["offhours_digest_enabled"])
+    if "offhours_digest_time" in patch:
+        dh, dm = radar._parse_hhmm(str(patch["offhours_digest_time"]), default=(7, 50))
+        cur["offhours_digest_time"] = f"{dh:02d}:{dm:02d}"
+    if "stock_dedup_hours" in patch:
+        cur["stock_dedup_hours"] = max(0, min(168, int(patch["stock_dedup_hours"])))
+    if "max_daily_per_sector" in patch:
+        cur["max_daily_per_sector"] = max(0, min(20, int(patch["max_daily_per_sector"])))
+    if "max_bullish_prepriced_pct" in patch:
+        cur["max_bullish_prepriced_pct"] = round(max(0.0, min(30.0, float(patch["max_bullish_prepriced_pct"]))), 1)
     if "max_alerts_per_window" in patch:
         cur["max_alerts_per_window"] = max(1, min(10, int(patch["max_alerts_per_window"])))
     if "theme_cooldown_hours" in patch:
@@ -784,6 +853,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     .field input[type="number"],
+    .field input[type="text"],
     .field select,
     .field textarea {
       width: 100%;
@@ -796,6 +866,59 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       color: var(--ink);
       font-variant-numeric: tabular-nums;
     }
+
+    .field-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .perf-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 16px;
+    }
+
+    .perf-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 15px 16px;
+    }
+
+    .perf-card-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    .perf-card-title {
+      font-weight: 700;
+      font-size: 14px;
+    }
+
+    .perf-metrics {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 12px;
+    }
+
+    .perf-cell-label {
+      font-size: 11.5px;
+      color: var(--ink-muted);
+    }
+
+    .perf-cell-val {
+      font-size: 14px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .ret-pos { color: var(--green); font-weight: 700; }
+    .ret-neg { color: var(--red); font-weight: 700; }
 
     .field textarea {
       min-height: 78px;
@@ -891,6 +1014,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     @media (max-width: 900px) {
       .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .settings-grid { grid-template-columns: 1fr; }
+      .perf-grid { grid-template-columns: 1fr; }
     }
 
     @media (max-width: 560px) {
@@ -898,6 +1022,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       main { padding: 14px; }
       .kpi-grid { grid-template-columns: 1fr; }
       .feed-toggle-grid { grid-template-columns: 1fr; }
+      .field-row { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -946,6 +1071,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <nav class="tabs" role="tablist">
       <button class="tab-btn active" data-tab="alerts" role="tab" type="button">최근 알림 &amp; 재시도 큐</button>
+      <button class="tab-btn" data-tab="performance" role="tab" type="button">알림 성과 (수익률)</button>
       <button class="tab-btn" data-tab="settings" role="tab" type="button">운영 설정 &amp; 피드 관리</button>
       <button class="tab-btn" data-tab="feeds" role="tab" type="button">피드 상태 &amp; 실시간 점검</button>
       <button class="tab-btn" data-tab="traces" role="tab" type="button">추적 로그 (trace.jsonl)</button>
@@ -960,6 +1086,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div id="alerts-container" class="alert-list"></div>
       </div>
 
+      <div id="overnight-card" class="card" style="margin-bottom: 16px; display: none;">
+        <div class="section-head">
+          <h2>야간 장전 요약 대기열</h2>
+          <span id="overnight-count-label" class="muted">평일 장전 요약 시각에 1건으로 묶어 발송</span>
+        </div>
+        <div id="overnight-container"></div>
+      </div>
+
       <div class="card">
         <div class="section-head">
           <h2>Deferred 재시도 보관함</h2>
@@ -969,29 +1103,109 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </section>
 
+    <section id="tab-performance" class="tab-panel">
+      <div class="section-head" style="margin-bottom: 12px;">
+        <h2>방향별 알림 성과 요약 (data/performance.jsonl)</h2>
+        <span id="perf-meta-label" class="muted">상승수혜: 수익률 &gt; 0% 적중 · 하락/옥석가리기: 하락(&lt; 0%) 적중</span>
+      </div>
+      <div id="perf-summary-grid" class="perf-grid"></div>
+
+      <div class="card">
+        <div class="section-head">
+          <h2>최근 종목별 자동 수익률 추적</h2>
+          <span class="muted">알림가 대비 +5분 · +30분 · 당일 종가 · 익일 종가 자동 기록</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>알림 시각</th>
+                <th>종목</th>
+                <th>방향</th>
+                <th>섹터</th>
+                <th>알림가</th>
+                <th>+5분</th>
+                <th>+30분</th>
+                <th>당일 종가</th>
+                <th>익일 종가</th>
+              </tr>
+            </thead>
+            <tbody id="perf-records-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <section id="tab-settings" class="tab-panel">
       <form id="config-form">
         <div class="settings-grid">
           <div class="card">
             <div class="section-head">
-              <h2>감시 기준 &amp; PR-3 제어</h2>
+              <h2>감시 기준 &amp; 시간대·편중 제어</h2>
               <span class="muted">저장 즉시 다음 사이클부터 반영</span>
             </div>
-            <div class="field">
-              <label for="cfg-min-score">최소 촉매 점수 (1.0 ~ 10.0)</label>
-              <input id="cfg-min-score" type="number" step="0.1" min="1" max="10" />
+            <div class="field-row">
+              <div class="field">
+                <label for="cfg-min-score">최소 촉매 점수 (1.0 ~ 10.0)</label>
+                <input id="cfg-min-score" type="number" step="0.1" min="1" max="10" />
+              </div>
+              <div class="field">
+                <label for="cfg-max-window">15분당 최대 연속 발송 건수</label>
+                <input id="cfg-max-window" type="number" step="1" min="1" max="10" />
+              </div>
             </div>
-            <div class="field">
-              <label for="cfg-max-daily">하루 최대 알림 건수 (KST)</label>
-              <input id="cfg-max-daily" type="number" step="1" min="1" max="50" />
+            <div class="field-row">
+              <div class="field">
+                <label for="cfg-max-market">장중 최대 알림 (평일 08:00~15:30)</label>
+                <input id="cfg-max-market" type="number" step="1" min="0" max="50" />
+              </div>
+              <div class="field">
+                <label for="cfg-max-offhours">야간·주말 최대 알림</label>
+                <input id="cfg-max-offhours" type="number" step="1" min="0" max="30" />
+              </div>
             </div>
-            <div class="field">
-              <label for="cfg-max-window">15분당 최대 연속 발송 건수</label>
-              <input id="cfg-max-window" type="number" step="1" min="1" max="10" />
+            <div class="field-row">
+              <div class="field">
+                <label for="cfg-offhours-digest">야간 후보 장전 요약 묶음 발송</label>
+                <select id="cfg-offhours-digest">
+                  <option value="true">켜짐 — 야간 후보 모아서 평일 장전 1건 요약 (권장)</option>
+                  <option value="false">꺼짐 — 야간에도 한도 내 즉시 발송</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="cfg-digest-time">장전 요약 발송 시각 (KST HH:MM)</label>
+                <input id="cfg-digest-time" type="text" placeholder="07:50" />
+              </div>
             </div>
-            <div class="field">
-              <label for="cfg-cooldown">동일 이슈 쿨다운 시간 (시간)</label>
-              <input id="cfg-cooldown" type="number" step="1" min="1" max="72" />
+            <div class="field-row">
+              <div class="field">
+                <label for="cfg-stock-dedup-hours">동일 종목코드 중복 차단 (시간, 0=해제)</label>
+                <input id="cfg-stock-dedup-hours" type="number" step="1" min="0" max="168" />
+              </div>
+              <div class="field">
+                <label for="cfg-max-per-sector">동일 섹터 하루 최대 건수 (0=무제한)</label>
+                <input id="cfg-max-per-sector" type="number" step="1" min="0" max="20" />
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="cfg-cooldown">동일 이슈 쿨다운 시간 (시간)</label>
+                <input id="cfg-cooldown" type="number" step="1" min="1" max="72" />
+              </div>
+              <div class="field">
+                <label for="cfg-max-daily">일일 전체 상한 (MAX_DAILY_ALERTS 호환)</label>
+                <input id="cfg-max-daily" type="number" step="1" min="1" max="80" />
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="cfg-max-prepriced">정규장 급등 추격 차단 기준 (%, 0=해제)</label>
+                <input id="cfg-max-prepriced" type="number" step="0.5" min="0" max="30" />
+              </div>
+              <div class="field">
+                <label for="cfg-rpd-limit">Stage 1 일일 RPD 기준 한도</label>
+                <input id="cfg-rpd-limit" type="number" step="10" min="10" max="10000" />
+              </div>
             </div>
             <div class="field">
               <label for="cfg-dedup-mode">PR-3 유사도 중복 차단 모드</label>
@@ -1006,10 +1220,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <option value="enforce">enforce — 속보 즉시 / 일반 기사 묶음 호출 (상시 서버 필수)</option>
                 <option value="shadow">shadow — 로그만 기록 (매번 AI 호출)</option>
               </select>
-            </div>
-            <div class="field">
-              <label for="cfg-rpd-limit">Stage 1 일일 RPD 기준 한도 (70%/80%/90% 자동 절전)</label>
-              <input id="cfg-rpd-limit" type="number" step="10" min="10" max="10000" />
             </div>
             <div class="field">
               <label for="cfg-flash-alert">2단 초고속 1보 푸시 (3초 내 1보 → 15초 뒤 2보 심층)</label>
@@ -1108,6 +1318,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <select id="trace-filter" style="padding:6px 10px; border:1px solid var(--border-strong); border-radius:8px; font-size:12.5px;">
               <option value="all">전체 이벤트</option>
               <option value="flash_alert_sent">초고속 1보 푸시</option>
+              <option value="premarket_digest_sent">장전 요약 발송</option>
+              <option value="overnight_queued">야간 요약 대기열</option>
+              <option value="prepriced_skip">장중 급등 추격 차단</option>
+              <option value="stock_dedup_decision">24h 종목 중복 판정</option>
+              <option value="sector_limit_decision">섹터 일일 한도 판정</option>
               <option value="cycle_summary">사이클 요약</option>
               <option value="trigger_decision">PR-3 트리거 판정</option>
               <option value="dedup_decision">PR-3 중복 판정</option>
@@ -1158,6 +1373,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (sec === null || sec === undefined) return "-";
       if (sec < 60) return sec + "초";
       return (sec / 60).toFixed(1) + "분";
+    }
+
+    function fmtPct(val) {
+      if (val === null || val === undefined || isNaN(Number(val))) return "-";
+      const n = Number(val);
+      return (n > 0 ? "+" : "") + n.toFixed(2) + "%";
+    }
+
+    function makePctSpan(val) {
+      const sp = document.createElement("span");
+      if (val === null || val === undefined || isNaN(Number(val))) {
+        sp.className = "muted";
+        sp.textContent = "-";
+        return sp;
+      }
+      const n = Number(val);
+      sp.className = n > 0 ? "ret-pos" : (n < 0 ? "ret-neg" : "muted");
+      sp.textContent = fmtPct(n);
+      return sp;
     }
 
     async function api(url, opts = {}) {
@@ -1216,9 +1450,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       pauseBtn.textContent = cfg.paused ? "감시 재개" : "일시정지";
       pauseBtn.className = cfg.paused ? "primary" : "";
 
+      const mSent = m.sent_market_today ?? 0;
+      const mMax = m.max_market_alerts ?? cfg.max_market_alerts ?? 8;
+      const oSent = m.sent_offhours_today ?? 0;
+      const oMax = m.max_offhours_alerts ?? cfg.max_offhours_alerts ?? 3;
       document.getElementById("kpi-alerts").textContent = m.sent_today + " / " + m.max_daily_alerts + "건";
-      document.getElementById("kpi-alert-badge").textContent = m.sent_today >= m.max_daily_alerts ? "한도 도달" : "정상";
-      document.getElementById("kpi-alerts-sub").textContent = "15분 상한 " + cfg.max_alerts_per_window + "건 · 촉매 " + cfg.min_catalyst_score.toFixed(1) + "+";
+      document.getElementById("kpi-alert-badge").textContent = m.sent_today >= m.max_daily_alerts ? "한도 도달" : "장중 " + mSent + "/" + mMax;
+      document.getElementById("kpi-alerts-sub").textContent =
+        "장중 " + mSent + "/" + mMax + " · 야간 " + oSent + "/" + oMax +
+        (cfg.offhours_digest_enabled ? " (요약 " + (cfg.offhours_digest_time || "07:50") + ", 대기 " + (m.overnight_queue_count || 0) + ")" : "") +
+        " · 촉매 " + Number(cfg.min_catalyst_score || 7.5).toFixed(1) + "+";
 
       const pct = Math.min(100, Math.round((m.rpd_ratio || 0) * 100));
       document.getElementById("kpi-rpd").textContent = m.primary_screen_used + " / " + m.rpd_limit;
@@ -1244,7 +1485,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         : (d.last_error ? "오류: " + d.last_error.slice(0, 40) : "실행 기록 대기 중");
 
       renderAlerts(data.recent_alerts || []);
+      renderOvernightQueue(data.overnight_queue || [], cfg);
       renderDeferred(data.deferred || []);
+      renderPerformance(data.performance || {});
       renderFeedStats(data.feeds || []);
       if (!formDirty) populateSettingsForm(cfg, data.feeds || []);
     }
@@ -1270,7 +1513,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         meta.style.display = "flex";
         meta.style.gap = "6px";
         meta.style.alignItems = "center";
+        meta.style.flexWrap = "wrap";
 
+        if (a.sector) {
+          const secBadge = document.createElement("span");
+          secBadge.className = "badge";
+          secBadge.textContent = a.sector;
+          meta.appendChild(secBadge);
+        }
+        if (a.window) {
+          const wBadge = document.createElement("span");
+          wBadge.className = "badge " + (a.window === "market" ? "ok" : "warn");
+          wBadge.textContent = a.window === "market" ? "장중" : "야간";
+          meta.appendChild(wBadge);
+        }
         const scoreBadge = document.createElement("span");
         scoreBadge.className = "badge score";
         scoreBadge.textContent = "촉매 " + Number(a.catalyst_score || 0).toFixed(1);
@@ -1309,6 +1565,43 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    function renderOvernightQueue(items, cfg) {
+      const card = document.getElementById("overnight-card");
+      const box = document.getElementById("overnight-container");
+      if (!items.length) {
+        card.style.display = "none";
+        box.innerHTML = "";
+        return;
+      }
+      card.style.display = "block";
+      document.getElementById("overnight-count-label").textContent =
+        "대기 " + items.length + "건 · 평일 " + (cfg.offhours_digest_time || "07:50") + " 장전 요약 발송";
+      box.innerHTML = "";
+      const wrap = document.createElement("div");
+      wrap.className = "table-wrap";
+      const table = document.createElement("table");
+      table.innerHTML = "<thead><tr><th>점수</th><th>섹터</th><th>헤드라인 / 테마</th><th>적재 시각</th></tr></thead>";
+      const tb = document.createElement("tbody");
+      for (const q of items) {
+        const tr = document.createElement("tr");
+        const cells = [
+          Number(q.catalyst_score || 0).toFixed(1),
+          q.sector || "-",
+          q.headline || q.theme_key || "-",
+          fmtTime(q.created_at),
+        ];
+        for (const c of cells) {
+          const td = document.createElement("td");
+          td.textContent = c;
+          tr.appendChild(td);
+        }
+        tb.appendChild(tr);
+      }
+      table.appendChild(tb);
+      wrap.appendChild(table);
+      box.appendChild(wrap);
+    }
+
     function renderDeferred(items) {
       const box = document.getElementById("deferred-container");
       box.innerHTML = "";
@@ -1334,6 +1627,126 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       table.appendChild(tb);
       wrap.appendChild(table);
       box.appendChild(wrap);
+    }
+
+    function renderPerformance(perf) {
+      const grid = document.getElementById("perf-summary-grid");
+      const tb = document.getElementById("perf-records-body");
+      grid.innerHTML = "";
+      tb.innerHTML = "";
+
+      const total = perf.total_records || 0;
+      const done = perf.completed_records || 0;
+      const costPct = perf.round_trip_cost_pct ?? 0.23;
+      document.getElementById("perf-meta-label").textContent =
+        "총 " + total + "건 추적 (완료 " + done + "건) · 상승수혜: >0% 적중 (순수익은 왕복비용 " + costPct + "% 차감) / 하락·옥석가리기: <0% 적중";
+
+      const byDir = perf.by_direction || {};
+      const dirMeta = [
+        ["상승수혜", "📈 상승수혜", "ok"],
+        ["하락주의", "📉 하락주의", "err"],
+        ["옥석가리기주의", "⚠️ 옥석가리기주의", "warn"],
+      ];
+      const horizons = [
+        ["ret_5m", "+5분"],
+        ["ret_30m", "+30분"],
+        ["ret_close", "당일 종가"],
+        ["ret_next_close", "익일 종가"],
+      ];
+
+      for (const [key, titleText, badgeCls] of dirMeta) {
+        const info = byDir[key] || { total: 0 };
+        const card = document.createElement("article");
+        card.className = "perf-card";
+
+        const head = document.createElement("div");
+        head.className = "perf-card-head";
+        const ttl = document.createElement("div");
+        ttl.className = "perf-card-title";
+        ttl.textContent = titleText;
+        const cntBadge = document.createElement("span");
+        cntBadge.className = "badge " + badgeCls;
+        cntBadge.textContent = (info.total || 0) + "건";
+        head.append(ttl, cntBadge);
+        card.appendChild(head);
+
+        const metrics = document.createElement("div");
+        metrics.className = "perf-metrics";
+        for (const [hk, hlabel] of horizons) {
+          const hs = info[hk] || {};
+          const cell = document.createElement("div");
+          const lbl = document.createElement("div");
+          lbl.className = "perf-cell-label";
+          lbl.textContent = hlabel + (hs.count ? " (" + hs.count + ")" : "");
+          const val = document.createElement("div");
+          val.className = "perf-cell-val";
+          if (hs.count > 0 && hs.avg_pct !== null && hs.avg_pct !== undefined) {
+            val.appendChild(makePctSpan(hs.avg_pct));
+            const sub = document.createElement("div");
+            sub.className = "muted";
+            sub.style.fontSize = "11.5px";
+            sub.textContent = (hs.net_avg_pct !== null && hs.net_avg_pct !== undefined)
+              ? "순 " + fmtPct(hs.net_avg_pct) + " · 승률 " + Number(hs.win_rate_pct || 0).toFixed(1) + "%"
+              : "승률 " + Number(hs.win_rate_pct || 0).toFixed(1) + "%";
+            cell.append(lbl, val, sub);
+          } else {
+            val.textContent = "-";
+            val.className = "perf-cell-val muted";
+            cell.append(lbl, val);
+          }
+          metrics.appendChild(cell);
+        }
+        card.appendChild(metrics);
+        grid.appendChild(card);
+      }
+
+      const rows = perf.recent_records || [];
+      if (!rows.length) {
+        tb.innerHTML = '<tr><td colspan="9" class="empty">아직 자동 기록된 알림 성과가 없습니다.</td></tr>';
+        return;
+      }
+      for (const r of rows) {
+        const tr = document.createElement("tr");
+        const tdTs = document.createElement("td");
+        tdTs.className = "mono";
+        tdTs.style.whiteSpace = "nowrap";
+        tdTs.textContent = fmtTime(r.alert_ts);
+
+        const tdStock = document.createElement("td");
+        const link = document.createElement("a");
+        link.className = "stock-link";
+        link.href = "https://m.stock.naver.com/domestic/stock/" + encodeURIComponent(r.code || "") + "/total";
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = (r.name || r.code || "-") + " (" + (r.code || "-") + ")";
+        tdStock.appendChild(link);
+
+        const tdDir = document.createElement("td");
+        const db = document.createElement("span");
+        const dCls = r.direction === "상승수혜" ? "ok" : (r.direction === "하락주의" ? "err" : "warn");
+        db.className = "badge " + dCls;
+        db.textContent = r.direction || "-";
+        tdDir.appendChild(db);
+
+        const tdSec = document.createElement("td");
+        tdSec.className = "muted";
+        tdSec.textContent = r.sector || "-";
+
+        const tdPx = document.createElement("td");
+        tdPx.textContent = r.alert_price ? Number(r.alert_price).toLocaleString("ko-KR") + "원" : "-";
+
+        const td5 = document.createElement("td");
+        td5.appendChild(makePctSpan(r.ret_5m));
+        const td30 = document.createElement("td");
+        td30.appendChild(makePctSpan(r.ret_30m));
+        const tdClose = document.createElement("td");
+        tdClose.appendChild(makePctSpan(r.ret_close));
+        const tdNext = document.createElement("td");
+        tdNext.appendChild(makePctSpan(r.ret_next_close));
+
+        tr.append(tdTs, tdStock, tdDir, tdSec, tdPx, td5, td30, tdClose, tdNext);
+        tb.appendChild(tr);
+      }
     }
 
     function renderFeedStats(feeds) {
@@ -1368,6 +1781,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     function populateSettingsForm(cfg, feeds) {
       document.getElementById("cfg-min-score").value = cfg.min_catalyst_score;
+      document.getElementById("cfg-max-market").value = cfg.max_market_alerts;
+      document.getElementById("cfg-max-offhours").value = cfg.max_offhours_alerts;
+      document.getElementById("cfg-offhours-digest").value = cfg.offhours_digest_enabled ? "true" : "false";
+      document.getElementById("cfg-digest-time").value = cfg.offhours_digest_time || "07:50";
+      document.getElementById("cfg-stock-dedup-hours").value = cfg.stock_dedup_hours;
+      document.getElementById("cfg-max-per-sector").value = cfg.max_daily_per_sector;
+      document.getElementById("cfg-max-prepriced").value = cfg.max_bullish_prepriced_pct ?? 15;
       document.getElementById("cfg-max-daily").value = cfg.max_daily_alerts;
       document.getElementById("cfg-max-window").value = cfg.max_alerts_per_window;
       document.getElementById("cfg-cooldown").value = cfg.theme_cooldown_hours;
@@ -1436,6 +1856,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const tdDesc = document.createElement("td");
           if (r.type === "flash_alert_sent") {
             tdDesc.textContent = "⚡ 1보 속보 발송 · " + (r.headline || r.theme_key || "") + " (촉매 " + Number(r.catalyst_score || 0).toFixed(1) + ")";
+          } else if (r.type === "premarket_digest_sent") {
+            tdDesc.textContent = "🌅 장전 요약 발송 · " + (r.count || 0) + "건 (" + (r.themes || []).join(", ") + ")";
+          } else if (r.type === "overnight_queued") {
+            tdDesc.textContent = "🌙 장전 요약 대기열 추가 · " + (r.theme_key || "") + " [" + (r.sector || "-") + "] (대기 " + (r.queue_size || 0) + "건)";
+          } else if (r.type === "prepriced_skip") {
+            tdDesc.textContent = "🛑 장중 급등 추격 차단 (≥+" + Number(r.max_pct || 15).toFixed(1) + "%) · " + (r.theme_key || "") + " · " + (r.details || []).join(", ");
+          } else if (r.type === "stock_dedup_decision") {
+            tdDesc.textContent = "[" + r.phase + "] " + (r.theme_key || "") + " · 제외=" + (r.excluded_codes || []).join(",") + " · 유지=" + (r.kept_codes || []).join(",") + (r.only_weak_leftovers ? " · 단기테마 잔여 차단" : (r.blocked ? " · 차단됨" : ""));
+          } else if (r.type === "sector_limit_decision") {
+            tdDesc.textContent = "[" + r.phase + "] " + (r.sector || "-") + " (" + r.used_today + "/" + r.limit + ") · " + (r.theme_key || "") + (r.blocked ? " · 차단됨" : "");
           } else if (r.type === "cycle_summary") {
             tdDesc.textContent = "신규 " + (r.fresh_count || 0) + "건 · 클러스터 " + (r.cluster_count || 0) + " · 발송 " + (r.alerts_sent || 0) + "건 · pending " + (r.pending_remaining ?? "-") + (r.note ? " (" + r.note + ")" : "");
           } else if (r.type === "trigger_decision") {
@@ -1472,9 +1902,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     document.getElementById("config-form").addEventListener("submit", async (e) => {
       e.preventDefault();
       const checkedFeeds = Array.from(document.querySelectorAll('input[name="enabled_feed"]:checked')).map(i => i.value);
+      const maxMkt = parseInt(document.getElementById("cfg-max-market").value, 10);
+      const maxOff = parseInt(document.getElementById("cfg-max-offhours").value, 10);
+      const maxDailyRaw = parseInt(document.getElementById("cfg-max-daily").value, 10);
+      const prevCfg = (latestOverview && latestOverview.config) || {};
+      const splitChanged = (maxMkt !== prevCfg.max_market_alerts) || (maxOff !== prevCfg.max_offhours_alerts);
+      const dailyUnchanged = maxDailyRaw === prevCfg.max_daily_alerts;
+      const effDaily = (isNaN(maxDailyRaw) || (splitChanged && dailyUnchanged))
+        ? Math.max(1, (isNaN(maxMkt) ? 8 : maxMkt) + (isNaN(maxOff) ? 3 : maxOff))
+        : maxDailyRaw;
       const payload = {
         min_catalyst_score: parseFloat(document.getElementById("cfg-min-score").value),
-        max_daily_alerts: parseInt(document.getElementById("cfg-max-daily").value, 10),
+        max_market_alerts: maxMkt,
+        max_offhours_alerts: maxOff,
+        max_daily_alerts: effDaily,
+        offhours_digest_enabled: document.getElementById("cfg-offhours-digest").value === "true",
+        offhours_digest_time: document.getElementById("cfg-digest-time").value.trim() || "07:50",
+        stock_dedup_hours: parseInt(document.getElementById("cfg-stock-dedup-hours").value, 10),
+        max_daily_per_sector: parseInt(document.getElementById("cfg-max-per-sector").value, 10),
+        max_bullish_prepriced_pct: parseFloat(document.getElementById("cfg-max-prepriced").value),
         max_alerts_per_window: parseInt(document.getElementById("cfg-max-window").value, 10),
         theme_cooldown_hours: parseInt(document.getElementById("cfg-cooldown").value, 10),
         dedup_mode: document.getElementById("cfg-dedup-mode").value,
@@ -1691,6 +2137,13 @@ def create_dashboard_server(
                 self._send_html(DASHBOARD_HTML)
             elif path == "/api/overview":
                 self._send_json(build_overview_payload(base_dir))
+            elif path == "/api/performance":
+                try:
+                    limit = int((qs.get("limit") or ["100"])[0])
+                except ValueError:
+                    limit = 100
+                recs = radar.PerformanceTracker(base_dir / "performance.jsonl").load_records()
+                self._send_json(radar.summarize_performance(recs, recent_limit=max(1, min(500, limit))))
             elif path == "/api/traces":
                 try:
                     limit = int((qs.get("limit") or ["80"])[0])

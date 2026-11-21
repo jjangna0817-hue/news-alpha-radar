@@ -31,7 +31,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -56,7 +56,7 @@ USER_AGENT = (
 )
 
 DEFAULT_SCREEN_MODELS = "gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.8-flash"
-DEFAULT_DEEP_MODELS = "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.8-flash"
+DEFAULT_DEEP_MODELS = "gemini-3.6-flash,gemini-3.8-flash,gemini-3.5-flash-lite"
 DEFAULT_SCREEN_THINKING_LEVEL = "MINIMAL"
 DEFAULT_DEEP_THINKING_LEVEL = "LOW"
 DEFAULT_THINKING_BUDGET = 1024
@@ -83,7 +83,21 @@ DEFAULT_DEDUP_MODE = "shadow"
 DEFAULT_TRIGGER_MODE = "shadow"
 DEFAULT_STAGE1_DAILY_RPD_LIMIT = 500
 HUB_STOCK_MIN_APPEARANCES = 3
+HUB_STOCK_MIN_SECTORS = 2
 ESCALATION_SCORE_DELTA = 1.0
+DEFAULT_MAX_DAILY_ALERTS = 10
+DEFAULT_MAX_MARKET_ALERTS = 8
+DEFAULT_MAX_OFFHOURS_ALERTS = 3
+DEFAULT_OFFHOURS_DIGEST_ENABLED = False
+DEFAULT_OFFHOURS_DIGEST_TIME = "07:50"
+DEFAULT_STOCK_DEDUP_HOURS = 24
+DEFAULT_MAX_DAILY_PER_SECTOR = 2
+DEFAULT_MAX_BULLISH_PREPRICED_PCT = 15.0
+ROUND_TRIP_COST_PCT = 0.23
+MAX_OVERNIGHT_QUEUE_ITEMS = 15
+OVERNIGHT_QUEUE_TTL_HOURS = 72
+PERF_MAX_DAYS = 90
+PERF_MAX_RECORDS = 5000
 DEFAULT_DAEMON_INTERVAL_MARKET_SEC = 60
 DEFAULT_DAEMON_INTERVAL_EXTENDED_SEC = 180
 DEFAULT_DAEMON_INTERVAL_OFFHOURS_SEC = 600
@@ -113,17 +127,18 @@ PROBE_CANDIDATE_FEEDS: list[dict[str, Any]] = [
 ALL_FEEDS: list[dict[str, Any]] = RSS_FEEDS + PROBE_CANDIDATE_FEEDS
 DAEMON_DEFAULT_EXTRA_FEEDS: tuple[str, ...] = ("전자신문_속보", "뉴시스_속보")
 
-# PR-3 Stage 1 트리거 2계층 키워드 (단독/속보 및 단순 정치 용어 제외)
+# PR-3 Stage 1 트리거 2계층 키워드 (단독/속보·정치·일상 소규모 보안 노이즈 제외)
 HARD_TRIGGER_KEYWORDS: tuple[str, ...] = (
-    "해킹", "개인정보 유출", "정보유출", "랜섬웨어", "리콜", "전량 회수", "영업정지", "판매중지",
+    "대규모 해킹", "랜섬웨어", "전산 마비", "리콜", "전량 회수", "영업정지", "판매중지",
     "생산중단", "가동중단", "가동 중단", "공장 화재", "화재 발생", "폭발 사고", "관세 부과",
-    "수출통제", "수출규제", "전파탐지", "불법촬영", "콜레라", "전염병", "감염병", "방역 비상",
+    "수출통제", "수출규제", "콜레라", "전염병", "감염병", "방역 비상",
     "인수합병", "경영권 분쟁", "공개매수", "대규모 수주", "임상 성공", "임상 중단", "품목허가",
     "과징금", "시정명령", "압수수색", "부도", "회생절차", "상장폐지", "대규모 정전", "통신장애",
     "통신 마비", "공급망 마비", "해협 봉쇄", "항로 봉쇄",
 )
 
 SOFT_TRIGGER_KEYWORDS: tuple[str, ...] = (
+    "해킹", "개인정보 유출", "정보유출", "전파탐지", "불법촬영",
     "수주", "공급계약", "계약 체결", "국회 통과", "법안", "의무화", "전수조사", "규제 강화",
     "특허", "승인", "대규모 투자", "증설", "합작", "제재", "파업", "파산", "감산",
     "가격 인상", "품귀", "공급 부족", "결함", "조사 착수", "검찰 기소", "정부 대책",
@@ -169,32 +184,106 @@ KOREAN_POSTPOSITIONS: tuple[str, ...] = (
 )
 
 KEYWORD_EXPANSIONS: dict[str, list[str]] = {
-    "전파탐지기": ["무선도청", "불법촬영", "전파", "보안", "탐지", "rf", "감시"],
-    "전파탐지": ["무선도청", "불법촬영", "전파", "보안", "탐지", "rf"],
-    "몰카탐지": ["불법촬영", "무선도청", "보안", "탐지", "열화상"],
-    "도청방지": ["무선도청", "전파", "보안", "탐지"],
-    "열화상카메라": ["적외선", "열화상", "센서", "카메라", "보안", "감시"],
+    "전파탐지기": ["무선도청", "불법촬영", "전파", "탐지", "rf"],
+    "전파탐지": ["무선도청", "불법촬영", "전파", "탐지", "rf"],
+    "몰카탐지": ["불법촬영", "무선도청", "탐지", "열화상"],
+    "도청방지": ["무선도청", "전파", "탐지"],
+    "열화상카메라": ["적외선", "열화상", "센서", "카메라", "감시"],
     "사이버보안": ["정보보안", "네트워크보안", "악성코드", "edr", "nac", "방화벽", "암호"],
     "스마트안경": ["ar", "마이크로led", "광학", "렌즈", "카메라모듈", "디스플레이"],
     "안티드론": ["드론", "레이더", "전파", "방산", "감시", "무인기"],
     "전력기기": ["변압기", "차단기", "배전반", "전선", "케이블", "송전", "ess"],
+    "원자력": ["원전", "smr", "소형모듈원전", "터빈", "계측제어", "방사성폐기물"],
     "화재안전": ["소화", "화재", "방재", "열폭주", "감지기", "스프링클러"],
     "감염병": ["진단키트", "백신", "항바이러스", "마스크", "방역", "진단시약"],
+    "가축전염병": ["동물의약품", "방역", "진단시약", "사료", "육계", "대체단백질"],
+    "반도체": ["웨이퍼", "패키징", "노광", "식각", "hbm", "소부장", "테스트소켓"],
+    "2차전지": ["양극재", "음극재", "전해질", "분리막", "전고체", "배터리장비"],
     "수자원": ["상하수도", "정수", "수처리", "담수화", "펌프"],
     "해저케이블": ["전선", "광케이블", "해저", "통신케이블"],
+    "조선해운": ["해상운송", "컨테이너", "벌크선", "선박엔진", "조선기자재", "물류"],
     "희토류": ["영구자석", "희소금속", "자원", "제련", "소재"],
     "원격의료": ["비대면", "의료정보", "emr", "헬스케어", "디지털헬스"],
     "로봇": ["협동로봇", "감속기", "액추에이터", "자동화", "무인"],
     "우주항공": ["위성", "발사체", "항공기", "우주", "방산"],
 }
 
+# 일일 섹터별 알림 편중 차단을 위한 정규화 섹터 분류 사전
+SECTOR_TAXONOMY: dict[str, tuple[str, ...]] = {
+    "사이버보안": (
+        "사이버보안", "정보보안", "보안솔루션", "네트워크보안", "해킹", "랜섬웨어",
+        "개인정보", "정보유출", "악성코드", "방화벽", "보안관제", "edr", "nac",
+        "xdr", "클라우드보안", "디도스", "ddos", "제로트러스트", "암호화",
+    ),
+    "전파·물리보안": (
+        "전파탐지", "전파탐지기", "무선도청", "불법촬영", "몰카탐지", "도청방지",
+        "물리보안", "출입통제", "열화상카메라", "보안장비",
+    ),
+    "화재·재난안전": (
+        "화재", "소화설비", "방재", "열폭주", "화재감지", "스프링클러",
+        "배터리화재", "재난안전", "소방",
+    ),
+    "반도체": (
+        "반도체", "hbm", "파운드리", "패키징", "웨이퍼", "노광", "식각",
+        "소부장", "메모리", "시스템반도체", "npu", "ai칩",
+    ),
+    "전력·에너지": (
+        "전력기기", "변압기", "차단기", "배전반", "전선", "송전", "원전",
+        "원자력", "smr", "태양광", "풍력", "신재생", "ess", "전력망", "정전",
+    ),
+    "방산·우주항공": (
+        "방산", "무기", "미사일", "안티드론", "드론", "레이더", "전투기",
+        "위성", "발사체", "우주항공", "무인기", "방위산업",
+    ),
+    "바이오·헬스케어": (
+        "바이오", "임상", "신약", "제약", "품목허가", "감염병", "전염병",
+        "방역", "진단키트", "진단시약", "백신", "항바이러스", "원격의료",
+        "의료기기", "헬스케어",
+    ),
+    "2차전지·전기차": (
+        "2차전지", "이차전지", "배터리", "양극재", "음극재", "전해질",
+        "분리막", "전고체", "전기차", "리튬", "충전인프라",
+    ),
+    "로봇·자동화": (
+        "로봇", "협동로봇", "휴머노이드", "감속기", "액추에이터",
+        "자동화", "스마트팩토리", "자율주행",
+    ),
+    "조선·해운·물류": (
+        "조선", "해운", "선박", "항로", "해협", "운임", "컨테이너",
+        "물류", "항만", "해저케이블",
+    ),
+    "자원·소재·화학": (
+        "희토류", "영구자석", "희소금속", "원자재", "제련", "정유",
+        "석유화학", "철강", "구리", "알루미늄",
+    ),
+    "통신·네트워크": (
+        "통신장애", "통신마비", "통신망", "5g", "6g", "광통신", "기지국",
+        "위성통신", "데이터센터", "idc",
+    ),
+    "식품·농축산·소비": (
+        "식품", "축산", "조류인플루엔자", "아프리카돼지열병", "구제역",
+        "동물의약품", "농산물", "식량", "화장품", "리콜", "유통",
+    ),
+    "수자원·환경": (
+        "수자원", "상하수도", "수처리", "담수화", "폐기물", "탄소포집",
+        "친환경", "재활용",
+    ),
+}
+
+# 오프라인 폴백 전용 최소 상장사 샘플 (실제 KRX KIND DB 로드 시에는 덮어쓰거나 병합하지 않고 KRX 원본을 그대로 사용)
 SEED_COMPANIES: list[dict[str, str]] = [
-    {"code": "446840", "name": "지슨", "market": "KOSDAQ", "sector": "통신 및 방송 장비 제조업", "products": "무선도청 탐지 시스템, 이동형 전파탐지기(알파-P), 불법촬영 탐지(알파-C), 무선백도어 해킹 탐지(알파-H), 시험장 보안 장비"},
-    {"code": "140430", "name": "카티스", "market": "KOSDAQ", "sector": "소프트웨어 개발 및 공급업", "products": "공간보안 플랫폼, 물리보안 시스템, 침입감지·전파탐지 보안 솔루션"},
-    {"code": "263860", "name": "지니언스", "market": "KOSDAQ", "sector": "소프트웨어 개발 및 공급업", "products": "네트워크 접근제어(NAC), 단말 위협 탐지 및 대응(EDR), 사이버보안 솔루션"},
-    {"code": "053800", "name": "안랩", "market": "KOSDAQ", "sector": "소프트웨어 개발 및 공급업", "products": "정보보안 소프트웨어(V3), 네트워크 보안, 보안관제, 위협탐지(XDR)"},
-    {"code": "452430", "name": "사피엔반도체", "market": "KOSDAQ", "sector": "반도체 제조업", "products": "AR/AI 스마트안경용 마이크로LED 디스플레이 구동칩(DDIC) 팹리스"},
-    {"code": "053450", "name": "세코닉스", "market": "KOSDAQ", "sector": "사진장비 및 광학기기 제조업", "products": "모바일·차량용 카메라 렌즈, AR 글래스 초소형 광학 부품, 광학필름"},
+    {"code": "298040", "name": "효성중공업", "market": "KOSPI", "sector": "전동기, 발전기 및 전기 변환·공급·제어 장치 제조업", "products": "초고압 변압기, 차단기, 전력기기, ESS"},
+    {"code": "001440", "name": "대한전선", "market": "KOSPI", "sector": "절연선 및 케이블 제조업", "products": "초고압 전력케이블, 해저케이블, 광통신케이블"},
+    {"code": "012450", "name": "한화에어로스페이스", "market": "KOSPI", "sector": "항공기, 우주선 및 부품 제조업", "products": "항공기 엔진, 방산 화력체계, 우주 발사체, 위성"},
+    {"code": "033540", "name": "파라텍", "market": "KOSDAQ", "sector": "특수 목적용 기계 제조업", "products": "스프링클러, 소화설비, 화재감지 소방기기"},
+    {"code": "096530", "name": "씨젠", "market": "KOSDAQ", "sector": "의료용품 및 기타 의약 관련제품 제조업", "products": "분자진단시약, 감염병 진단키트"},
+    {"code": "277810", "name": "레인보우로보틱스", "market": "KOSDAQ", "sector": "특수 목적용 기계 제조업", "products": "협동로봇, 휴머노이드 로봇, 자동화 솔루션"},
+    {"code": "011200", "name": "HMM", "market": "KOSPI", "sector": "해상 운송업", "products": "컨테이너 해상운송, 벌크선 해운 물류"},
+    {"code": "002150", "name": "도화엔지니어링", "market": "KOSPI", "sector": "건축기술, 엔지니어링 및 관련 기술 서비스업", "products": "상하수도 설계, 수자원, 수처리 환경 플랜트"},
+    {"code": "042700", "name": "한미반도체", "market": "KOSPI", "sector": "특수 목적용 기계 제조업", "products": "반도체 후공정 패키징 장비, TC본더, HBM 장비"},
+    {"code": "263860", "name": "지니언스", "market": "KOSDAQ", "sector": "소프트웨어 개발 및 공급업", "products": "네트워크 접근제어(NAC), 단말 위협 탐지(EDR), 정보보안 소프트웨어"},
+    {"code": "053800", "name": "안랩", "market": "KOSDAQ", "sector": "소프트웨어 개발 및 공급업", "products": "정보보안 소프트웨어, 네트워크 보안, 보안관제"},
+    {"code": "446840", "name": "지슨", "market": "KOSDAQ", "sector": "통신 및 방송 장비 제조업", "products": "무선도청 탐지 시스템, 전파탐지기, 불법촬영 탐지 장비"},
 ]
 
 KRX_KIND_URLS = {
@@ -207,20 +296,22 @@ SCREENING_PROMPT = """당신은 한국 주식시장(코스피·코스닥)의 '�
 [임무]
 입력된 여러 뉴스 이벤트 클러스터 중에서, 국내 증시의 특정 섹터·테마·종목에 강한 자금 유입 또는 하락 충격을 줄 수 있는 '신규 촉매(Catalyst)' 사건만 선별하세요.
 
-[핵심 추론 렌즈 — 2차 연쇄 파급효과를 최우선으로 찾으세요]
-1. 부작용·역기능 해결 수혜 (가장 강력):
-   - 신기술·사회 사건이 유발한 문제/불안을 막거나 해결하는 장비·솔루션·규제 수혜 분야
-   - 예: "AI 안경 시험 부정행위/몰카 논란" → 1차: 스마트안경 부품 / 2차(핵심): 전파탐지기·불법촬영탐지·열화상카메라·보안장비
-   - 예: "전기차 지하주차장 화재" → 2차(핵심): 열폭주방지·소화설비·배터리진단·화재감지기
-   - 예: "대형 해킹·통신망 마비" → 2차(핵심): 사이버보안·네트워크접근제어·관제
+[핵심 추론 렌즈 — 전 산업군에서 2차 연쇄 파급효과를 중립적으로 찾으세요]
+1. 부작용·역기능 해결 및 안전·인프라 대응 수혜:
+   - 신기술·사회·산업 사건이 유발한 병목/불안/결함을 해결하는 장비·부품·솔루션·규제 수혜 분야
+   - 예: "대규모 정전·데이터센터 전력 부족 확산" → 1차: 전력설비 / 2차(핵심): 초고압변압기·배전반·ESS·전력케이블
+   - 예: "전기차·배터리 설비 화재 확산" → 2차(핵심): 열폭주방지·소화설비·배터리진단·화재감지기
+   - 예: "가축전염병·신종 감염병 확산" → 2차(핵심): 진단시약·방역·동물의약품·대체단백질
 2. 정책·예산·의무화 촉발:
-   - 사건 직후 정부·국회·대기업이 전수조사, 예산 증액, 장비 의무 도입, 반입 금지를 검토/발표할 가능성
-3. 공급 차질·규제에 따른 반사이익·대체재:
-   - 수출 통제, 공장 화재, 항로 봉쇄, 전염병 확산 시 국내 대체재/국산화/방역/운임 수혜
+   - 사건 직후 정부·국회·대기업이 전수조사, 예산 증액, 안전·계측 장비 의무 도입 또는 규제 신설을 검토/발표할 가능성
+3. 공급 차질·지정학·무역 규제에 따른 반사이익·대체재:
+   - 핵심 소재 수출통제, 해외 공장 가동중단, 주요 항로 봉쇄, 관세 부과 시 국내 대체재/국산화 부품/해운 운임/자원 재활용 수혜
 
-[반드시 제외할 노이즈]
+[반드시 제외할 노이즈 및 점수 보정 원칙]
 - 이미 끝난 코스피/코스닥 시황, 외국인·기관 수급 요약, 단순 목표가/리포트
 - 산업·정책 파급이 없는 단순 연예·스포츠·단발성 개인 범죄
+- 일상적으로 반복되는 중소규모 개인정보 유출·단발성 해킹·국지적 사고 등 업종 전반의 신규 예산·의무화·대규모 수주로 이어지기 어려운 관성적 뉴스에는 7.5점 이상을 부여하지 마세요.
+- 특정 섹터(예: 사이버보안·방산 등)에 편중하지 말고 전력·인프라·소재·제조·바이오·물류·소비재 등 전 산업군에서 신규성(Novelty)과 실제 매출 직결성이 높은 사건만 엄선하세요.
 
 [출력 JSON 스키마 — 반드시 단일 JSON 객체만 반환]
 {
@@ -244,10 +335,11 @@ DEEP_PROMPT = """당신은 한국 주식시장(코스피·코스닥)의 냉철�
 [절대 원칙]
 1. 할루시네이션 금지: 종목은 반드시 입력된 `verified_krx_candidates` 목록에 있는 실제 6자리 종목코드와 종목명만 선택하세요. 목록에 없는 종목코드를 절대 지어내지 마세요.
 2. 옥석 가리기:
-   - 부정적 사회 사건(부정행위, 화재, 해킹 등)에서는 '문제 해결·차단·정부 예산 수혜(2차)'가 진짜 주도주가 되고, '원인 기기 부품(1차)'은 단기 급등 후 급락하는 경우가 많습니다. 이를 명확히 구분하세요.
-   - 각 종목의 실제 `products`(주요제품)를 보고 `본업직결` / `부분연관` / `단기테마성`을 냉정하게 판정하세요.
+   - 부정적 사건·사고·규제 이슈(안전사고, 공급차질, 규제 강화 등)에서는 '문제 해결·대체·정부 예산 수혜(2차)'가 진짜 주도주가 되고, '원인 기기·단순 연상 종목(1차)'은 단기 급등 후 급락하는 경우가 많습니다. 이를 명확히 구분하세요.
+   - 각 종목의 실제 `products`(주요제품)를 보고 `본업직결` / `부분연관` / `단기테마성`을 냉정하게 판정하세요. `단기테마성` 종목은 `상승수혜`가 아니라 `옥석가리기주의`로 분류하세요.
 3. 선반영 반영:
-   - 입력된 `quote.change_pct`와 `quote.reaction_stage`를 반드시 확인해, 이미 +15% 이상 급등한 종목은 절대 추격 매수를 권하지 말고 눌림목·리스크 경고를 적으세요.
+   - 입력된 `quote.change_pct`와 `quote.reaction_stage`를 반드시 확인해, 이미 +15% 이상 급등한 종목은 절대 추격 매수를 권하지 말고 `옥석가리기주의`로 분류하며 눌림목·리스크 경고를 적으세요.
+   - `상승수혜`는 `본업직결` 또는 명확한 `부분연관`이면서 주가 미반영·초입 구간인 종목 위주로 엄선하세요.
 
 [출력 JSON 스키마 — 반드시 단일 JSON 객체만 반환]
 {
@@ -701,6 +793,128 @@ def resolve_active_feeds(
     return None
 
 
+def _parse_hhmm(raw: str | None, default: tuple[int, int] = (7, 50)) -> tuple[int, int]:
+    text = (raw or "").strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", text)
+    if not m:
+        return default
+    h, mn = int(m.group(1)), int(m.group(2))
+    if 0 <= h <= 23 and 0 <= mn <= 59:
+        return (h, mn)
+    return default
+
+
+def _parse_bool_env(name: str) -> bool | None:
+    raw = (os.getenv(name) or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def offhours_session_key(now: datetime | None = None) -> str:
+    """야간·주말 한도 세션 키 (15:31~익일 07:59를 하나의 야간 세션으로 통합해 자정 전후 이중 소진 방지)."""
+    ref = StateStore._now_kst(now)
+    if (ref.hour, ref.minute) > (15, 30):
+        return (ref.date() + timedelta(days=1)).isoformat()
+    return ref.date().isoformat()
+
+
+def resolve_alert_limits(
+    runtime_cfg: dict[str, Any] | None = None,
+    *,
+    daemon_mode: bool = False,
+) -> dict[str, Any]:
+    """장중/야간·주말 시간대별 알림 한도 + 기존 MAX_DAILY_ALERTS 호환 + 장전 요약 설정 계산."""
+    cfg = runtime_cfg or {}
+
+    def _from_cfg(key: str) -> int | None:
+        if cfg.get(key) is not None:
+            try:
+                return int(cfg[key])
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _from_env(key: str) -> int | None:
+        raw = (os.getenv(key) or "").strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
+    rc_market = _from_cfg("max_market_alerts")
+    rc_offhours = _from_cfg("max_offhours_alerts")
+    rc_daily = _from_cfg("max_daily_alerts")
+
+    env_market = _from_env("MAX_MARKET_ALERTS")
+    env_offhours = _from_env("MAX_OFFHOURS_ALERTS")
+    env_daily = _from_env("MAX_DAILY_ALERTS")
+
+    cfg_market = rc_market if rc_market is not None else env_market
+    cfg_offhours = rc_offhours if rc_offhours is not None else env_offhours
+    cfg_daily = rc_daily if rc_daily is not None else env_daily
+
+    # runtime_cfg에서 시간대별 한도를 직접 지정했고 runtime_cfg에 max_daily_alerts를 따로 주지 않은 경우
+    # 구버전 .env의 MAX_DAILY_ALERTS가 새 시간대 합계를 깎지 않도록 합계 기준으로 동기화한다.
+    rc_split_set = rc_market is not None or rc_offhours is not None
+    if rc_split_set and rc_daily is None:
+        cfg_daily = None
+
+    if cfg_market is None and cfg_offhours is None:
+        if cfg_daily is not None:
+            max_daily = max(1, cfg_daily)
+            if max_daily <= DEFAULT_MAX_MARKET_ALERTS:
+                max_market = max_daily
+                max_offhours = (
+                    min(DEFAULT_MAX_OFFHOURS_ALERTS, max(1, max_daily // 3))
+                    if max_daily >= 2
+                    else max_daily
+                )
+            else:
+                max_offhours = DEFAULT_MAX_OFFHOURS_ALERTS
+                max_market = max(DEFAULT_MAX_MARKET_ALERTS, max_daily - max_offhours)
+        else:
+            max_market = DEFAULT_MAX_MARKET_ALERTS
+            max_offhours = DEFAULT_MAX_OFFHOURS_ALERTS
+            max_daily = max_market + max_offhours
+    else:
+        max_market = max(0, cfg_market) if cfg_market is not None else DEFAULT_MAX_MARKET_ALERTS
+        max_offhours = max(0, cfg_offhours) if cfg_offhours is not None else DEFAULT_MAX_OFFHOURS_ALERTS
+        if cfg_daily is not None:
+            max_daily = max(1, cfg_daily)
+        else:
+            max_daily = max(1, max_market + max_offhours)
+
+    if cfg.get("offhours_digest_enabled") is not None:
+        digest_enabled = bool(cfg["offhours_digest_enabled"])
+    else:
+        env_digest = _parse_bool_env("OFFHOURS_DIGEST_ENABLED")
+        digest_enabled = (
+            env_digest
+            if env_digest is not None
+            else (True if daemon_mode else DEFAULT_OFFHOURS_DIGEST_ENABLED)
+        )
+
+    digest_time_raw = str(
+        cfg.get("offhours_digest_time")
+        or _env_str("OFFHOURS_DIGEST_TIME", DEFAULT_OFFHOURS_DIGEST_TIME)
+    ).strip()
+    dh, dm = _parse_hhmm(digest_time_raw, default=(7, 50))
+    digest_time = f"{dh:02d}:{dm:02d}"
+
+    return {
+        "max_market_alerts": max_market,
+        "max_offhours_alerts": max_offhours,
+        "max_daily_alerts": max_daily,
+        "offhours_digest_enabled": digest_enabled,
+        "offhours_digest_time": digest_time,
+    }
+
+
 def write_status_snapshot(data_dir: Path, payload: dict[str, Any]) -> None:
     """웹 대시보드 모니터링용 data/status.json 하트비트 원자적 기록."""
     try:
@@ -723,6 +937,11 @@ class StateStore:
         self.alerted_themes: dict[str, str] = {}
         self.recent_alerts: list[dict[str, Any]] = []
         self.daily_counts: dict[str, int] = {}
+        self.daily_market_counts: dict[str, int] = {}
+        self.daily_offhours_counts: dict[str, int] = {}
+        self.daily_sector_counts: dict[str, dict[str, int]] = {}
+        self.overnight_queue: list[dict[str, Any]] = []
+        self.last_digest_date: str | None = None
         self.daily_ai_calls: dict[str, dict[str, dict[str, int]]] = {}
         self.exhausted_models: dict[str, str] = {}
         self.last_stage1_at: str | None = None
@@ -742,6 +961,25 @@ class StateStore:
                 self.alerted_themes = dict(raw.get("alerted_themes", {}))
                 self.recent_alerts = [dict(a) for a in (raw.get("recent_alerts") or []) if isinstance(a, dict)]
                 self.daily_counts = {str(k): int(v) for k, v in raw.get("daily_counts", {}).items()}
+                self.daily_market_counts = {
+                    str(k): int(v) for k, v in (raw.get("daily_market_counts") or {}).items()
+                }
+                self.daily_offhours_counts = {
+                    str(k): int(v) for k, v in (raw.get("daily_offhours_counts") or {}).items()
+                }
+                raw_sec = raw.get("daily_sector_counts") or {}
+                if isinstance(raw_sec, dict):
+                    for day_k, sec_map in raw_sec.items():
+                        if isinstance(sec_map, dict):
+                            self.daily_sector_counts[str(day_k)] = {
+                                str(sk): int(sv) for sk, sv in sec_map.items()
+                            }
+                self.overnight_queue = [
+                    dict(q) for q in (raw.get("overnight_queue") or []) if isinstance(q, dict)
+                ]
+                self.last_digest_date = (
+                    str(raw["last_digest_date"]) if raw.get("last_digest_date") else None
+                )
                 raw_ai = raw.get("daily_ai_calls") or {}
                 if isinstance(raw_ai, dict):
                     for day_k, models_v in raw_ai.items():
@@ -857,6 +1095,60 @@ class StateStore:
                 count += 1
         return count
 
+    def sector_count_today(self, sector: str, now: datetime | None = None) -> int:
+        sec = (sector or "").strip()
+        if not sec:
+            return 0
+        day = self._now_kst(now).strftime("%Y-%m-%d")
+        return int((self.daily_sector_counts.get(day) or {}).get(sec, 0))
+
+    def record_sector_alert(self, sector: str, now: datetime | None = None) -> None:
+        sec = (sector or "").strip()
+        if not sec:
+            return
+        day = self._now_kst(now).strftime("%Y-%m-%d")
+        day_map = self.daily_sector_counts.setdefault(day, {})
+        day_map[sec] = int(day_map.get(sec, 0)) + 1
+
+    def enqueue_overnight(self, entry: dict[str, Any], now: datetime | None = None) -> None:
+        """야간·주말 고촉매 후보를 장전 요약(07:50) 큐에 중복 제거 후 상위 점수 순 보관."""
+        ref = self._now_kst(now)
+        self.prune_overnight_queue(now=ref)
+        cid = str((entry.get("cluster") or {}).get("cluster_id") or "")
+        tnorm = norm_key(str(entry.get("theme_key") or cid))
+        new_score = float(entry.get("catalyst_score", 0.0) or 0.0)
+
+        kept: list[dict[str, Any]] = []
+        replaced = False
+        for existing in self.overnight_queue:
+            ecid = str((existing.get("cluster") or {}).get("cluster_id") or "")
+            etnorm = norm_key(str(existing.get("theme_key") or ecid))
+            if (cid and ecid == cid) or (tnorm and etnorm == tnorm):
+                ex_score = float(existing.get("catalyst_score", 0.0) or 0.0)
+                kept.append(entry if new_score >= ex_score else existing)
+                replaced = True
+            else:
+                kept.append(existing)
+        if not replaced:
+            kept.append(entry)
+
+        kept.sort(key=lambda d: (-float(d.get("catalyst_score", 0.0) or 0.0), str(d.get("created_at", ""))))
+        self.overnight_queue = kept[:MAX_OVERNIGHT_QUEUE_ITEMS]
+
+    def prune_overnight_queue(
+        self,
+        now: datetime | None = None,
+        ttl_hours: int = OVERNIGHT_QUEUE_TTL_HOURS,
+    ) -> None:
+        ref = self._now_kst(now)
+        cutoff = ref - timedelta(hours=ttl_hours)
+        kept: list[dict[str, Any]] = []
+        for entry in self.overnight_queue:
+            ts = parse_iso_kst(entry.get("created_at") or entry.get("first_seen"))
+            if ts is None or ts >= cutoff:
+                kept.append(entry)
+        self.overnight_queue = kept
+
     def mark_alerted(
         self,
         theme_key: str,
@@ -869,13 +1161,27 @@ class StateStore:
         catalyst_score: float | None = None,
         title: str | None = None,
         stocks: list[dict[str, str]] | None = None,
+        sector: str | None = None,
+        window: str | None = None,
+        count_alert: bool = True,
     ) -> None:
         ref = self._now_kst(now)
         k = norm_key(theme_key)
         if k:
             self.alerted_themes[k] = ref.isoformat()
         day = ref.strftime("%Y-%m-%d")
-        self.daily_counts[day] = self.daily_counts.get(day, 0) + 1
+        eff_window = window if window in ("market", "offhours") else (
+            "market" if is_market_watch_window(ref) else "offhours"
+        )
+        if count_alert:
+            self.daily_counts[day] = self.daily_counts.get(day, 0) + 1
+            if eff_window == "market":
+                self.daily_market_counts[day] = self.daily_market_counts.get(day, 0) + 1
+            else:
+                off_key = offhours_session_key(ref)
+                self.daily_offhours_counts[off_key] = self.daily_offhours_counts.get(off_key, 0) + 1
+        if sector:
+            self.record_sector_alert(sector, now=ref)
         rec: dict[str, Any] = {
             "ts": ref.isoformat(),
             "theme_key": theme_key,
@@ -884,7 +1190,10 @@ class StateStore:
             "cand_codes": list(cand_codes or []),
             "final_codes": list(final_codes or []),
             "catalyst_score": float(catalyst_score) if catalyst_score is not None else 0.0,
+            "window": eff_window,
         }
+        if sector:
+            rec["sector"] = str(sector)
         if title:
             rec["title"] = str(title)
         if stocks:
@@ -893,6 +1202,12 @@ class StateStore:
 
     def sent_today(self, now: datetime | None = None) -> int:
         return self.daily_counts.get(self._now_kst(now).strftime("%Y-%m-%d"), 0)
+
+    def sent_market_today(self, now: datetime | None = None) -> int:
+        return self.daily_market_counts.get(self._now_kst(now).strftime("%Y-%m-%d"), 0)
+
+    def sent_offhours_today(self, now: datetime | None = None) -> int:
+        return self.daily_offhours_counts.get(offhours_session_key(self._now_kst(now)), 0)
 
     def save(self, now: datetime | None = None) -> None:
         ref = self._now_kst(now)
@@ -916,6 +1231,10 @@ class StateStore:
         ]
         day_cut = (ref - timedelta(days=14)).strftime("%Y-%m-%d")
         self.daily_counts = {k: v for k, v in self.daily_counts.items() if k >= day_cut}
+        self.daily_market_counts = {k: v for k, v in self.daily_market_counts.items() if k >= day_cut}
+        self.daily_offhours_counts = {k: v for k, v in self.daily_offhours_counts.items() if k >= day_cut}
+        self.daily_sector_counts = {k: v for k, v in self.daily_sector_counts.items() if k >= day_cut}
+        self.prune_overnight_queue(now=ref)
         pt_today = pt_date_str(ref)
         pt_cut = (ref.astimezone(PT) - timedelta(days=14)).strftime("%Y-%m-%d")
         self.daily_ai_calls = {k: v for k, v in self.daily_ai_calls.items() if k >= pt_cut}
@@ -931,6 +1250,11 @@ class StateStore:
                 "alerted_themes": self.alerted_themes,
                 "recent_alerts": self.recent_alerts,
                 "daily_counts": self.daily_counts,
+                "daily_market_counts": self.daily_market_counts,
+                "daily_offhours_counts": self.daily_offhours_counts,
+                "daily_sector_counts": self.daily_sector_counts,
+                "overnight_queue": self.overnight_queue,
+                "last_digest_date": self.last_digest_date,
                 "daily_ai_calls": self.daily_ai_calls,
                 "exhausted_models": self.exhausted_models,
                 "last_stage1_at": self.last_stage1_at,
@@ -947,17 +1271,33 @@ def compute_hub_stocks(
     now: datetime | None = None,
     window_days: int = 7,
 ) -> set[str]:
-    """최근 7일 알림 중 3건 이상 반복 등장한 허브 종목코드를 데이터 기반으로 추출."""
+    """최근 7일 알림 중 2개 이상 서로 다른 섹터에서 3건 이상 등장한 대형 허브 종목코드만 추출.
+
+    단일 섹터(예: 사이버보안/전파보안)에서만 반복 등장한 테마주는 허브주로 면제하지 않아 중복 차단을 유지한다.
+    """
     ref = StateStore._now_kst(now)
     cutoff = ref - timedelta(days=window_days)
     counts: Counter[str] = Counter()
+    sectors_by_code: dict[str, set[str]] = {}
     for rec in recent_alerts:
         ts = parse_iso_kst(rec.get("ts"))
         if ts is not None and ts < cutoff:
             continue
+        sec = str(rec.get("sector") or "").strip() or classify_alert_sector(
+            theme_key=str(rec.get("theme_key") or ""),
+            second_keywords=list(rec.get("keywords") or []),
+            headline=str(rec.get("title") or ""),
+        )
         codes = rec.get("final_codes") or rec.get("cand_codes") or []
-        counts.update({str(c).strip() for c in codes if str(c).strip()})
-    return {code for code, cnt in counts.items() if cnt >= HUB_STOCK_MIN_APPEARANCES}
+        uniq = {str(c).strip() for c in codes if str(c).strip()}
+        counts.update(uniq)
+        for code in uniq:
+            sectors_by_code.setdefault(code, set()).add(sec)
+    return {
+        code
+        for code, cnt in counts.items()
+        if cnt >= HUB_STOCK_MIN_APPEARANCES and len(sectors_by_code.get(code, set())) >= HUB_STOCK_MIN_SECTORS
+    }
 
 
 def codes_overlap(codes_a: set[str], codes_b: set[str], hub_stocks: set[str]) -> bool:
@@ -1066,6 +1406,527 @@ def evaluate_duplicate_candidate(
         "kw_overlap": best_match["kw_overlap"],
         "code_overlap": best_match["code_overlap"],
         "hub_stocks": sorted(hubs),
+    }
+
+
+def filter_recently_alerted_stocks(
+    stocks: list[dict[str, Any]],
+    *,
+    catalyst_score: float,
+    recent_alerts: list[dict[str, Any]],
+    now: datetime | None = None,
+    window_hours: int = DEFAULT_STOCK_DEDUP_HOURS,
+) -> dict[str, Any]:
+    """최근 window_hours(기본 24시간) 내 이미 알림된 종목코드 제외 + ESCALATION_SCORE_DELTA 이상 시 [후속] 허용.
+
+    핵심 주도주가 제외되고 '단기테마성' 상승수혜 잔여 종목만 남는 경우에는 노이즈 방지를 위해 전체 차단한다.
+    """
+    if window_hours <= 0 or not stocks:
+        return {
+            "kept_stocks": list(stocks),
+            "excluded_codes": [],
+            "escalated_codes": [],
+            "all_filtered": False,
+            "only_weak_leftovers": False,
+            "escalated": False,
+            "prev_scores": {},
+        }
+
+    ref = StateStore._now_kst(now)
+    cutoff = ref - timedelta(hours=window_hours)
+    prev_max_score: dict[str, float] = {}
+    for rec in recent_alerts:
+        ts = parse_iso_kst(rec.get("ts"))
+        if ts is None or ts < cutoff:
+            continue
+        prev_score = float(rec.get("catalyst_score", 0.0) or 0.0)
+        raw_codes = list(rec.get("final_codes") or [])
+        if not raw_codes and isinstance(rec.get("stocks"), list):
+            raw_codes = [str(s.get("code") or "") for s in rec["stocks"] if isinstance(s, dict)]
+        for raw_c in raw_codes:
+            code = str(raw_c or "").strip()
+            if not code:
+                continue
+            code = code.zfill(6) if code.isdigit() else code
+            if code not in prev_max_score or prev_score > prev_max_score[code]:
+                prev_max_score[code] = prev_score
+
+    kept: list[dict[str, Any]] = []
+    excluded_codes: list[str] = []
+    escalated_codes: list[str] = []
+    prev_scores: dict[str, float] = {}
+
+    for stock in stocks:
+        raw_c = str(stock.get("code") or "").strip()
+        code = raw_c.zfill(6) if raw_c.isdigit() else raw_c
+        if not code or code not in prev_max_score:
+            kept.append(stock)
+            continue
+        prev_s = prev_max_score[code]
+        prev_scores[code] = prev_s
+        if catalyst_score >= prev_s + ESCALATION_SCORE_DELTA:
+            kept.append(stock)
+            escalated_codes.append(code)
+        else:
+            excluded_codes.append(code)
+
+    def _is_weak_leftover(st: dict[str, Any]) -> bool:
+        rev = str(st.get("revenue_link") or "").strip()
+        if rev != "단기테마성":
+            return False
+        raw_dir = str(st.get("direction") or "").strip()
+        if raw_dir and _normalize_perf_direction(raw_dir) in ("하락주의", "옥석가리기주의"):
+            return False
+        return True
+
+    only_weak_leftovers = bool(excluded_codes and kept and all(_is_weak_leftover(s) for s in kept))
+    if only_weak_leftovers:
+        kept = []
+
+    return {
+        "kept_stocks": kept,
+        "excluded_codes": excluded_codes,
+        "escalated_codes": escalated_codes,
+        "all_filtered": bool(stocks) and not kept,
+        "only_weak_leftovers": only_weak_leftovers,
+        "escalated": bool(escalated_codes),
+        "prev_scores": prev_scores,
+    }
+
+
+def is_regular_trading_hours(now: datetime | None = None) -> bool:
+    """KRX 정규장 거래 시간 여부 (평일 09:00~15:30 KST)."""
+    ref = StateStore._now_kst(now)
+    if ref.weekday() >= 5:
+        return False
+    hm = (ref.hour, ref.minute)
+    return (9, 0) <= hm <= (15, 30)
+
+
+def is_all_bullish_prepriced(
+    stocks: list[dict[str, Any]],
+    quotes: dict[str, StockQuote],
+    *,
+    max_pct: float = DEFAULT_MAX_BULLISH_PREPRICED_PCT,
+) -> tuple[bool, list[str]]:
+    """장중 추격매수 차단 가드: 상승수혜 추천 종목이 1개 이상이고 전원이 이미 +max_pct% 이상 선반영이면 True.
+
+    - 순수 하락주의·옥석가리기주의 경고 알림(상승수혜 0건)은 차단하지 않는다.
+    - 상승수혜 종목 중 하나라도 미반영(< max_pct%)이거나 실시간 시세 미확인/장마감 상태면 발송을 허용한다.
+    """
+    if max_pct <= 0 or not stocks:
+        return False, []
+    bullish = [s for s in stocks if _normalize_perf_direction(s.get("direction")) == "상승수혜"]
+    if not bullish:
+        return False, []
+    details: list[str] = []
+    for st in bullish:
+        raw_c = str(st.get("code") or "").strip()
+        code = raw_c.zfill(6) if raw_c.isdigit() else raw_c
+        q = quotes.get(code)
+        if q is None or int(q.price) <= 0:
+            return False, []
+        if str(q.market_status or "").strip().upper() in ("CLOSE", "CLOSED"):
+            return False, []
+        if float(q.change_pct) < max_pct:
+            return False, []
+        details.append(f"{st.get('name') or code}({code} {q.change_pct:+.1f}%)")
+    return True, details
+
+
+
+def classify_alert_sector(
+    *,
+    theme_key: str = "",
+    second_keywords: list[str] | None = None,
+    first_keywords: list[str] | None = None,
+    beneficiary_sectors: list[str] | None = None,
+    headline: str = "",
+    summary: str = "",
+) -> str:
+    """테마 편중 차단을 위해 사건의 키워드·섹터·헤드라인을 대표 섹터명으로 정규화 분류."""
+    def _compact(items: list[str]) -> str:
+        return re.sub(r"\s+", "", " ".join(str(x or "") for x in items)).lower()
+
+    weighted_blobs = [
+        (_compact(list(beneficiary_sectors or [])), 3.0),
+        (_compact(list(second_keywords or [])), 2.5),
+        (_compact([theme_key]), 2.0),
+        (_compact(list(first_keywords or [])), 1.0),
+        (_compact([headline, summary]), 0.8),
+    ]
+
+    best_sector = ""
+    best_score = 0.0
+    for sector_name, terms in SECTOR_TAXONOMY.items():
+        score = 0.0
+        for blob, weight in weighted_blobs:
+            if not blob:
+                continue
+            for term in terms:
+                t = term.replace(" ", "").lower()
+                if t and t in blob:
+                    score += weight
+        if score > best_score:
+            best_score = score
+            best_sector = sector_name
+
+    if best_sector:
+        return best_sector
+
+    for raw in list(beneficiary_sectors or []) + list(second_keywords or []):
+        cleaned = re.sub(r"\([^\)]*\)|\[[^\]]*\]", "", str(raw or "")).strip()
+        if cleaned:
+            return cleaned[:24]
+    cleaned_tk = re.sub(r"[_/\-]+", " ", str(theme_key or "")).strip()
+    return cleaned_tk[:24] if cleaned_tk else "기타"
+
+
+def next_trading_date(d: date) -> date:
+    """주말을 건너뛰어 다음 평일(거래일 기준) 날짜 반환."""
+    cur = d + timedelta(days=1)
+    while cur.weekday() >= 5:
+        cur += timedelta(days=1)
+    return cur
+
+
+def should_flush_premarket_digest(
+    now: datetime,
+    state: StateStore,
+    digest_time: str = DEFAULT_OFFHOURS_DIGEST_TIME,
+) -> bool:
+    """평일 지정 시각(기본 07:50 KST) 이후 40분 창 내에서 미발송 야간 후보 장전 요약 발송 여부 판정."""
+    ref = StateStore._now_kst(now)
+    if ref.weekday() >= 5:
+        return False
+    if not state.overnight_queue:
+        return False
+    if state.last_digest_date == ref.strftime("%Y-%m-%d"):
+        return False
+    dh, dm = _parse_hhmm(digest_time, default=(7, 50))
+    now_min = ref.hour * 60 + ref.minute
+    target_min = dh * 60 + dm
+    return target_min <= now_min <= min(23 * 60 + 59, target_min + 40)
+
+
+def _normalize_perf_direction(raw: str | None) -> str:
+    txt = str(raw or "").strip()
+    if "하락" in txt:
+        return "하락주의"
+    if "옥석" in txt:
+        return "옥석가리기주의"
+    if "상승" in txt or "수혜" in txt:
+        return "상승수혜"
+    return txt or "상승수혜"
+
+
+class PerformanceTracker:
+    """알림 발송 종목의 알림가 및 +5분·+30분·당일 종가·익일 종가 수익률을 data/performance.jsonl에 자동 기록."""
+
+    def __init__(
+        self,
+        path: Path,
+        max_days: int = PERF_MAX_DAYS,
+        max_records: int = PERF_MAX_RECORDS,
+    ) -> None:
+        self.path = path
+        self.max_days = max_days
+        self.max_records = max_records
+
+    def load_records(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        rows: list[dict[str, Any]] = []
+        for raw_line in self.path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    rows.append(obj)
+            except Exception:
+                continue
+        return rows
+
+    def _save_records(self, records: list[dict[str, Any]], now: datetime) -> None:
+        cutoff = now - timedelta(days=self.max_days)
+        kept: list[dict[str, Any]] = []
+        for rec in records:
+            ts = parse_iso_kst(rec.get("alert_ts"))
+            if ts is None or ts >= cutoff:
+                kept.append(rec)
+        if self.max_records > 0 and len(kept) > self.max_records:
+            kept = kept[-self.max_records :]
+        content = ("\n".join(json.dumps(r, ensure_ascii=False) for r in kept) + "\n") if kept else ""
+        atomic_write_text(self.path, content)
+
+    @staticmethod
+    def _compute_schedule(alert_ts: datetime) -> dict[str, Any]:
+        ref = StateStore._now_kst(alert_ts)
+        is_before_or_at_close = ref.weekday() < 5 and (ref.hour, ref.minute) <= (15, 30)
+        close_day = ref.date() if is_before_or_at_close else next_trading_date(ref.date())
+        next_close_day = next_trading_date(close_day)
+        next_next_day = next_trading_date(next_close_day)
+
+        first_open = datetime(close_day.year, close_day.month, close_day.day, 9, 0, tzinfo=KST)
+        anchor = ref if (is_before_or_at_close and ref >= first_open) else first_open
+        return {
+            "due_5m": anchor + timedelta(minutes=5),
+            "expire_5m": anchor + timedelta(minutes=20),
+            "due_30m": anchor + timedelta(minutes=30),
+            "expire_30m": anchor + timedelta(minutes=75),
+            "close_date": close_day.isoformat(),
+            "due_close": datetime(close_day.year, close_day.month, close_day.day, 15, 30, tzinfo=KST),
+            "expire_close": datetime(next_close_day.year, next_close_day.month, next_close_day.day, 9, 0, tzinfo=KST),
+            "next_close_date": next_close_day.isoformat(),
+            "due_next_close": datetime(next_close_day.year, next_close_day.month, next_close_day.day, 15, 30, tzinfo=KST),
+            "expire_next_close": datetime(next_next_day.year, next_next_day.month, next_next_day.day, 9, 0, tzinfo=KST),
+        }
+
+    def record_alert(
+        self,
+        *,
+        alert_ts: datetime,
+        theme_key: str,
+        sector: str,
+        title: str,
+        catalyst_score: float,
+        window: str,
+        stocks: list[dict[str, Any]],
+        quotes: dict[str, StockQuote] | None = None,
+    ) -> list[dict[str, Any]]:
+        if not stocks:
+            return []
+        ref = StateStore._now_kst(alert_ts)
+        qmap = quotes or {}
+        sched = self._compute_schedule(ref)
+        created: list[dict[str, Any]] = []
+        ts_slug = ref.strftime("%Y%m%dT%H%M%S")
+        title_digest = hashlib.sha1(f"{theme_key}:{title}".encode("utf-8")).hexdigest()[:6]
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as fp:
+            for stock in stocks:
+                raw_c = str(stock.get("code") or "").strip()
+                if not raw_c:
+                    continue
+                code = raw_c.zfill(6) if raw_c.isdigit() else raw_c
+                q = qmap.get(code)
+                alert_price = int(q.price) if (q is not None and int(q.price) > 0) else None
+                alert_chg = float(q.change_pct) if (q is not None and alert_price is not None) else None
+                rec = {
+                    "id": f"{ts_slug}_{code}_{title_digest}",
+                    "alert_ts": ref.isoformat(),
+                    "alert_date": ref.strftime("%Y-%m-%d"),
+                    "theme_key": str(theme_key or ""),
+                    "sector": str(sector or ""),
+                    "title": str(title or ""),
+                    "catalyst_score": float(catalyst_score),
+                    "window": str(window or "market"),
+                    "code": code,
+                    "name": str(stock.get("name") or code),
+                    "direction": _normalize_perf_direction(stock.get("direction")),
+                    "order_tier": str(stock.get("order_tier") or ""),
+                    "revenue_link": str(stock.get("revenue_link") or ""),
+                    "alert_price": alert_price,
+                    "alert_change_pct": alert_chg,
+                    "target_close_date": sched["close_date"],
+                    "target_next_close_date": sched["next_close_date"],
+                    "price_5m": None,
+                    "ret_5m": None,
+                    "ts_5m": None,
+                    "price_30m": None,
+                    "ret_30m": None,
+                    "ts_30m": None,
+                    "price_close": None,
+                    "ret_close": None,
+                    "ts_close": None,
+                    "price_next_close": None,
+                    "ret_next_close": None,
+                    "ts_next_close": None,
+                    "complete": alert_price is None,
+                }
+                fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                created.append(rec)
+        return created
+
+    def update_pending(
+        self,
+        now: datetime | None = None,
+        fetch_quotes_fn: Callable[[list[str]], dict[str, StockQuote]] | None = None,
+    ) -> int:
+        if not self.path.exists():
+            return 0
+        ref = StateStore._now_kst(now)
+        records = self.load_records()
+        if not records:
+            return 0
+
+        due_map: list[tuple[int, list[str]]] = []
+        codes_to_fetch: list[str] = []
+        dirty = False
+
+        for idx, rec in enumerate(records):
+            if rec.get("complete"):
+                continue
+            alert_price = rec.get("alert_price")
+            if not alert_price or int(alert_price) <= 0:
+                rec["complete"] = True
+                dirty = True
+                continue
+            alert_ts = parse_iso_kst(rec.get("alert_ts"))
+            if alert_ts is None:
+                rec["complete"] = True
+                dirty = True
+                continue
+
+            sched = self._compute_schedule(alert_ts)
+            horizons: list[str] = []
+
+            if rec.get("ret_5m") is None and not rec.get("missed_5m"):
+                if ref > sched["expire_5m"]:
+                    rec["missed_5m"] = True
+                    dirty = True
+                elif ref >= sched["due_5m"]:
+                    horizons.append("5m")
+
+            if rec.get("ret_30m") is None and not rec.get("missed_30m"):
+                if ref > sched["expire_30m"]:
+                    rec["missed_30m"] = True
+                    dirty = True
+                elif ref >= sched["due_30m"]:
+                    horizons.append("30m")
+
+            if rec.get("ret_close") is None and not rec.get("missed_close"):
+                if ref >= sched["expire_close"]:
+                    rec["missed_close"] = True
+                    dirty = True
+                elif ref >= sched["due_close"]:
+                    horizons.append("close")
+
+            if rec.get("ret_next_close") is None and not rec.get("missed_next_close"):
+                if ref >= sched["expire_next_close"]:
+                    rec["missed_next_close"] = True
+                    rec["complete"] = True
+                    dirty = True
+                elif ref >= sched["due_next_close"]:
+                    horizons.append("next_close")
+            elif rec.get("ret_next_close") is not None or rec.get("missed_next_close"):
+                rec["complete"] = True
+                dirty = True
+
+            if horizons:
+                due_map.append((idx, horizons))
+                code = str(rec.get("code") or "").strip()
+                if code:
+                    codes_to_fetch.append(code)
+
+        updated_points = 0
+        if due_map and codes_to_fetch:
+            fetcher = fetch_quotes_fn if fetch_quotes_fn is not None else fetch_naver_quotes
+            quotes = fetcher(list(dict.fromkeys(codes_to_fetch)))
+            for idx, horizons in due_map:
+                rec = records[idx]
+                code = str(rec.get("code") or "").strip()
+                q = quotes.get(code)
+                if q is None or int(q.price) <= 0:
+                    continue
+                base = float(rec["alert_price"])
+                ret_pct = round(((float(q.price) - base) / base) * 100.0, 2)
+                for h in horizons:
+                    rec[f"price_{h}"] = int(q.price)
+                    rec[f"ret_{h}"] = ret_pct
+                    rec[f"ts_{h}"] = ref.isoformat()
+                    updated_points += 1
+                    dirty = True
+                    if h == "next_close":
+                        rec["complete"] = True
+
+        if dirty:
+            self._save_records(records, ref)
+        return updated_points
+
+
+def _median_float(vals: list[float]) -> float | None:
+    if not vals:
+        return None
+    ordered = sorted(vals)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2 == 1:
+        return round(ordered[mid], 2)
+    return round((ordered[mid - 1] + ordered[mid]) / 2.0, 2)
+
+
+def summarize_performance(records: list[dict[str, Any]], *, recent_limit: int = 50) -> dict[str, Any]:
+    """방향별(상승수혜/하락주의/옥석가리기주의) 평균·중앙값 수익률(상승수혜 왕복비용 차감 순수익 포함) 및 승률 집계."""
+    directions = ("상승수혜", "하락주의", "옥석가리기주의")
+    horizons = ("ret_5m", "ret_30m", "ret_close", "ret_next_close")
+
+    buckets: dict[str, list[dict[str, Any]]] = {d: [] for d in directions}
+    for rec in records:
+        d = _normalize_perf_direction(rec.get("direction"))
+        buckets.setdefault(d, []).append(rec)
+
+    by_direction: dict[str, Any] = {}
+    for d, rows in buckets.items():
+        win_is_negative = d in ("하락주의", "옥석가리기주의")
+        horizon_stats: dict[str, Any] = {}
+        for h in horizons:
+            vals = [float(r[h]) for r in rows if r.get(h) is not None]
+            if vals:
+                avg_v = round(sum(vals) / len(vals), 2)
+                med_v = _median_float(vals)
+                wins = sum(1 for v in vals if (v < 0.0 if win_is_negative else v > 0.0))
+                if win_is_negative:
+                    net_avg = None
+                    net_med = None
+                    net_win = None
+                else:
+                    net_avg = round(avg_v - ROUND_TRIP_COST_PCT, 2)
+                    net_med = round(med_v - ROUND_TRIP_COST_PCT, 2) if med_v is not None else None
+                    net_wins = sum(1 for v in vals if v > ROUND_TRIP_COST_PCT)
+                    net_win = round((net_wins / len(vals)) * 100.0, 1)
+                horizon_stats[h] = {
+                    "count": len(vals),
+                    "avg_pct": avg_v,
+                    "median_pct": med_v,
+                    "win_rate_pct": round((wins / len(vals)) * 100.0, 1),
+                    "net_avg_pct": net_avg,
+                    "net_median_pct": net_med,
+                    "net_win_rate_pct": net_win,
+                }
+            else:
+                horizon_stats[h] = {
+                    "count": 0,
+                    "avg_pct": None,
+                    "median_pct": None,
+                    "win_rate_pct": None,
+                    "net_avg_pct": None,
+                    "net_median_pct": None,
+                    "net_win_rate_pct": None,
+                }
+        by_direction[d] = {
+            "total": len(rows),
+            "win_rule": "하락 적중(<0%)" if win_is_negative else "상승 적중(>0%)",
+            **horizon_stats,
+        }
+
+    completed = sum(1 for r in records if r.get("complete"))
+    ordered_recent = sorted(
+        records,
+        key=lambda r: str(r.get("alert_ts") or ""),
+        reverse=True,
+    )[: max(1, recent_limit)]
+
+    return {
+        "total_records": len(records),
+        "completed_records": completed,
+        "pending_records": len(records) - completed,
+        "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
+        "by_direction": by_direction,
+        "recent_records": ordered_recent,
     }
 
 
@@ -1571,17 +2432,16 @@ class _TableParser(HTMLParser):
 
 
 def load_krx_master(cache_path: Path, allow_network: bool = True) -> dict[str, dict[str, str]]:
-    companies: dict[str, dict[str, str]] = {c["code"]: dict(c) for c in SEED_COMPANIES}
-
-    def _merge(rows: list[dict[str, str]]) -> None:
+    """KRX KIND 전체 상장사 DB 로드. 실제 캐시/네트워크 데이터가 있으면 SEED_COMPANIES를 병합하지 않고 원본만 사용."""
+    def _index_rows(rows: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+        out: dict[str, dict[str, str]] = {}
         for r in rows:
-            code = r["code"]
-            if code not in companies:
-                companies[code] = dict(r)
-            else:
-                prod = companies[code]["products"]
-                if r.get("products") and r["products"] not in prod:
-                    companies[code]["products"] = f"{r['products']}, {prod}".strip(", ")
+            if not isinstance(r, dict):
+                continue
+            code = str(r.get("code") or "").strip()
+            if code:
+                out[code] = dict(r)
+        return out
 
     if cache_path.exists():
         try:
@@ -1590,8 +2450,9 @@ def load_krx_master(cache_path: Path, allow_network: bool = True) -> dict[str, d
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=KST)
             if (datetime.now(KST) - ts) < timedelta(days=7):
-                _merge(cached.get("companies", []))
-                return companies
+                indexed = _index_rows(cached.get("companies", []))
+                if indexed:
+                    return indexed
         except Exception:
             pass
 
@@ -1632,12 +2493,13 @@ def load_krx_master(cache_path: Path, allow_network: bool = True) -> dict[str, d
                 logger.warning("KRX %s 로드 실패: %s", market, exc)
 
         if fetched:
-            _merge(fetched)
             atomic_write_text(
                 cache_path,
                 json.dumps({"updated_at": datetime.now(KST).isoformat(), "companies": fetched}, ensure_ascii=False),
             )
-    return companies
+            return _index_rows(fetched)
+
+    return {c["code"]: dict(c) for c in SEED_COMPANIES}
 
 
 def match_krx_stocks(
@@ -2035,6 +2897,72 @@ def format_flash_alert_html(
     return "\n".join(lines)
 
 
+def format_premarket_digest_html(
+    entries: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> str:
+    """야간·주말 고촉매 후보들을 평일 장전(07:50 KST) 1건 요약 메시지로 묶어 HTML 생성."""
+    esc = lambda s: html.escape(str(s or ""), quote=False)
+    esc_a = lambda s: html.escape(str(s or ""), quote=True)
+    ref = StateStore._now_kst(now)
+    now_str = ref.strftime("%Y-%m-%d %H:%M KST")
+
+    lines = [
+        f"🌅 <b>[장전 요약] 간밤 핵심 2차 파급 이슈 ({len(entries)}건)</b>",
+        f"🕒 {now_str}  |  장 시작 전 핵심 촉매만 압축 정리",
+    ]
+    models_used: list[str] = []
+
+    for idx, item in enumerate(entries, start=1):
+        report = item.get("report") or {}
+        quotes: dict[str, StockQuote] = item.get("quotes") or {}
+        articles: list[NewsItem] = item.get("articles") or []
+        sector = str(item.get("sector") or "")
+        model_used = str(item.get("model_used") or "")
+        if model_used and model_used not in models_used:
+            models_used.append(model_used)
+
+        score = float(report.get("catalyst_score", 0.0) or 0.0)
+        sec_txt = f"  |  🏷 {esc(sector)}" if sector else ""
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━",
+            f"<b>{idx}. {esc(report.get('title') or '(제목 없음)')}</b>",
+            f"⭐ 촉매 점수: <b>{score:.1f}/10</b>{sec_txt}",
+            f"📰 {esc(report.get('event_summary') or '')}",
+        ]
+        if report.get("stocks"):
+            for s in report["stocks"]:
+                code = s["code"]
+                icon = {"상승수혜": "📈", "하락주의": "📉", "옥석가리기주의": "⚠️"}.get(s.get("direction", ""), "•")
+                q = quotes.get(code)
+                if q and q.price > 0:
+                    sign = "+" if q.change_pct > 0 else ""
+                    qtxt = f"{q.price:,}원 ({sign}{q.change_pct:.2f}%) · {q.reaction_stage}"
+                else:
+                    qtxt = "장전 시세 대기"
+                naver = f"https://m.stock.naver.com/domestic/stock/{code}/total"
+                lines.append(
+                    f"{icon} <a href=\"{naver}\"><b>{esc(s['name'])}({code})</b></a> "
+                    f"[{esc(s.get('order_tier', '2차 파급'))} / {esc(s.get('revenue_link', '부분연관'))}]\n"
+                    f"   ├ 현재 반응: {esc(qtxt)}\n"
+                    f"   └ 연결 근거: {esc(s.get('reason', ''))}"
+                )
+        if report.get("entry_strategy"):
+            lines.append(f"📘 <b>전략</b>: {esc(report['entry_strategy'])}")
+        if articles:
+            a0 = articles[0]
+            lines.append(f"📎 <a href=\"{esc_a(a0.url)}\">{esc(a0.title[:65])}</a> ({esc(a0.source)})")
+
+    model_txt = ", ".join(models_used) if models_used else "gemini"
+    lines += [
+        "",
+        f"<i>🤖 분석모델: {esc(model_txt)} | 투자 참고용 정보이며 최종 매매 판단과 책임은 본인에게 있습니다.</i>",
+    ]
+    return "\n".join(lines)
+
+
 class TelegramPartialSendError(RuntimeError):
     """텔레그램 청크 발송 중 실패 시 이미 전송된 청크 수를 함께 전달."""
 
@@ -2249,7 +3177,7 @@ def enqueue_deferred(
         })
 
 
-def _build_stage2_message(
+def _run_stage2_pipeline(
     *,
     api_key: str,
     deep_models: list[str],
@@ -2265,7 +3193,9 @@ def _build_stage2_message(
     state: StateStore | None = None,
     matched_override: list[dict[str, Any]] | None = None,
     title_prefix: str = "",
-) -> tuple[str, str, str, dict[str, Any]]:
+    stock_dedup_hours: int = DEFAULT_STOCK_DEDUP_HOURS,
+    recent_alerts_override: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     matched = (
         list(matched_override)
         if matched_override is not None
@@ -2332,12 +3262,37 @@ def _build_stage2_message(
             for m in matched[:4]
         ]
 
-    deep_raw["stocks"] = clean_stocks[:6]
-    deep_raw["catalyst_score"] = float(cand.get("catalyst_score", min_score))
+    catalyst_score = float(cand.get("catalyst_score", min_score))
+    recent_src = (
+        recent_alerts_override
+        if recent_alerts_override is not None
+        else (state.recent_alerts if state is not None else [])
+    )
+    stock_filter = filter_recently_alerted_stocks(
+        clean_stocks[:6],
+        catalyst_score=catalyst_score,
+        recent_alerts=recent_src,
+        now=now,
+        window_hours=stock_dedup_hours,
+    )
+    kept_stocks = stock_filter["kept_stocks"]
+
+    deep_raw["stocks"] = kept_stocks
+    deep_raw["catalyst_score"] = catalyst_score
     deep_raw.setdefault("title", cluster.headline)
-    if title_prefix and not str(deep_raw["title"]).startswith(title_prefix):
-        deep_raw["title"] = f"{title_prefix}{deep_raw['title']}"
+    eff_prefix = title_prefix or ("[후속] " if stock_filter["escalated"] else "")
+    if eff_prefix and not str(deep_raw["title"]).startswith(eff_prefix):
+        deep_raw["title"] = f"{eff_prefix}{deep_raw['title']}"
     deep_raw.setdefault("event_summary", cand.get("event_summary", cluster.headline))
+
+    sector = classify_alert_sector(
+        theme_key=str(cand.get("theme_key") or ""),
+        second_keywords=list(cand.get("second_order_keywords") or []),
+        first_keywords=list(cand.get("first_order_keywords") or []),
+        beneficiary_sectors=list(deep_raw.get("beneficiary_sectors") or []),
+        headline=cluster.headline,
+        summary=str(deep_raw.get("event_summary") or ""),
+    )
 
     raw_kws = list(cand.get("first_order_keywords") or []) + list(cand.get("second_order_keywords") or [])
     norm_kws = list(dict.fromkeys(tok for kw in raw_kws for tok in extract_normalized_tokens(str(kw))))
@@ -2348,14 +3303,68 @@ def _build_stage2_message(
         "final_codes": [s["code"] for s in deep_raw["stocks"]],
         "catalyst_score": float(deep_raw["catalyst_score"]),
         "title": str(deep_raw["title"]),
+        "sector": sector,
         "stocks": [
-            {"code": s["code"], "name": s["name"], "direction": str(s.get("direction") or "")}
+            {
+                "code": s["code"],
+                "name": s["name"],
+                "direction": str(s.get("direction") or ""),
+                "order_tier": str(s.get("order_tier") or ""),
+                "revenue_link": str(s.get("revenue_link") or ""),
+            }
             for s in deep_raw["stocks"]
         ],
     }
 
     msg = format_telegram_html(deep_raw, quotes, cluster.items, deep_model, delay_note=delay_note, now=now)
-    return msg, str(deep_raw["title"]), deep_model, alert_meta
+    return {
+        "msg": msg,
+        "title": str(deep_raw["title"]),
+        "model": deep_model,
+        "alert_meta": alert_meta,
+        "quotes": quotes,
+        "report": deep_raw,
+        "stock_filter": stock_filter,
+        "sector": sector,
+    }
+
+
+def _build_stage2_message(
+    *,
+    api_key: str,
+    deep_models: list[str],
+    deep_thinking_level: str,
+    deep_thinking_budget: int,
+    deep_timeout: int,
+    min_score: float,
+    companies: dict[str, dict[str, str]],
+    cluster: EventCluster,
+    cand: dict[str, Any],
+    delay_note: str | None,
+    now: datetime,
+    state: StateStore | None = None,
+    matched_override: list[dict[str, Any]] | None = None,
+    title_prefix: str = "",
+    stock_dedup_hours: int = DEFAULT_STOCK_DEDUP_HOURS,
+) -> tuple[str, str, str, dict[str, Any]]:
+    res = _run_stage2_pipeline(
+        api_key=api_key,
+        deep_models=deep_models,
+        deep_thinking_level=deep_thinking_level,
+        deep_thinking_budget=deep_thinking_budget,
+        deep_timeout=deep_timeout,
+        min_score=min_score,
+        companies=companies,
+        cluster=cluster,
+        cand=cand,
+        delay_note=delay_note,
+        now=now,
+        state=state,
+        matched_override=matched_override,
+        title_prefix=title_prefix,
+        stock_dedup_hours=stock_dedup_hours,
+    )
+    return res["msg"], res["title"], res["model"], res["alert_meta"]
 
 
 def write_step_summary(
@@ -2444,12 +3453,34 @@ def run_live(
             else _env_int("MAX_ALERTS_PER_RUN", 2)
         ),
     )
-    max_daily = max(
-        1,
+    alert_limits = resolve_alert_limits(runtime_cfg, daemon_mode=daemon_mode)
+    max_market = alert_limits["max_market_alerts"]
+    max_offhours = alert_limits["max_offhours_alerts"]
+    max_daily = alert_limits["max_daily_alerts"]
+    offhours_digest_enabled = alert_limits["offhours_digest_enabled"]
+    offhours_digest_time = alert_limits["offhours_digest_time"]
+    stock_dedup_hours = max(
+        0,
         int(
-            runtime_cfg["max_daily_alerts"]
-            if runtime_cfg.get("max_daily_alerts") is not None
-            else _env_int("MAX_DAILY_ALERTS", 10)
+            runtime_cfg["stock_dedup_hours"]
+            if runtime_cfg.get("stock_dedup_hours") is not None
+            else _env_int("STOCK_DEDUP_HOURS", DEFAULT_STOCK_DEDUP_HOURS)
+        ),
+    )
+    max_daily_per_sector = max(
+        0,
+        int(
+            runtime_cfg["max_daily_per_sector"]
+            if runtime_cfg.get("max_daily_per_sector") is not None
+            else _env_int("MAX_DAILY_PER_SECTOR", DEFAULT_MAX_DAILY_PER_SECTOR)
+        ),
+    )
+    max_bullish_prepriced_pct = max(
+        0.0,
+        float(
+            runtime_cfg["max_bullish_prepriced_pct"]
+            if runtime_cfg.get("max_bullish_prepriced_pct") is not None
+            else _env_float("MAX_BULLISH_PREPRICED_PCT", DEFAULT_MAX_BULLISH_PREPRICED_PCT)
         ),
     )
     cooldown_h = max(
@@ -2523,6 +3554,7 @@ def run_live(
 
     state = StateStore(base_dir / "state.json")
     trace = TraceLogger(base_dir / "trace.jsonl")
+    perf_tracker = PerformanceTracker(base_dir / "performance.jsonl")
     trace.emit({
         "ts": started_at.isoformat(),
         "type": "run_start",
@@ -2536,6 +3568,13 @@ def run_live(
         "daemon_mode": daemon_mode,
         "dedup_mode": dedup_mode,
         "trigger_mode": trigger_mode,
+        "max_market_alerts": max_market,
+        "max_offhours_alerts": max_offhours,
+        "max_daily_alerts": max_daily,
+        "offhours_digest_enabled": offhours_digest_enabled,
+        "stock_dedup_hours": stock_dedup_hours,
+        "max_daily_per_sector": max_daily_per_sector,
+        "max_bullish_prepriced_pct": max_bullish_prepriced_pct,
     })
 
     companies: dict[str, dict[str, str]] | None = None
@@ -2548,10 +3587,61 @@ def run_live(
     last_cycle_err: Exception | None = None
     cycle_rows: list[dict[str, Any]] = []
 
+    def _window_name(now_dt: datetime) -> str:
+        return "market" if is_market_watch_window(now_dt) else "offhours"
+
+    def _is_post_digest_premarket_gap(now_dt: datetime) -> bool:
+        return (
+            offhours_digest_enabled
+            and now_dt.weekday() < 5
+            and (now_dt.hour, now_dt.minute) < (8, 0)
+            and state.last_digest_date == now_dt.strftime("%Y-%m-%d")
+        )
+
+    def _should_queue_for_digest(now_dt: datetime) -> bool:
+        if not offhours_digest_enabled or is_market_watch_window(now_dt):
+            return False
+        return not _is_post_digest_premarket_gap(now_dt)
+
+    def _alert_limit_status(now_dt: datetime) -> tuple[bool, str]:
+        if _should_queue_for_digest(now_dt):
+            return False, ""
+        if is_market_watch_window(now_dt):
+            if state.sent_market_today(now=now_dt) >= max_market:
+                return True, "over_market_limit"
+            if state.sent_today(now=now_dt) >= max_daily:
+                return True, "over_daily_limit"
+            return False, ""
+        if state.sent_offhours_today(now=now_dt) >= max_offhours:
+            return True, "over_offhours_limit"
+        if state.sent_today(now=now_dt) >= max_daily:
+            return True, "over_daily_limit"
+        return False, ""
+
     def _burst_limit_reached(now_dt: datetime) -> bool:
+        if _should_queue_for_digest(now_dt):
+            return False
         if daemon_mode:
             return state.alerts_in_rolling_window(DEFAULT_DAEMON_BURST_WINDOW_MIN, now=now_dt) >= max_per_run
         return sent_this_run >= max_per_run
+
+    def _serialize_perf_quotes(quotes: dict[str, StockQuote]) -> dict[str, dict[str, Any]]:
+        return {
+            c: {"price": int(q.price), "change_pct": float(q.change_pct)}
+            for c, q in quotes.items()
+            if q and int(q.price) > 0
+        }
+
+    def _deserialize_perf_quotes(raw_q: Any) -> dict[str, StockQuote]:
+        out: dict[str, StockQuote] = {}
+        if not isinstance(raw_q, dict):
+            return out
+        for c, v in raw_q.items():
+            if isinstance(v, dict) and int(v.get("price") or 0) > 0:
+                price = int(v["price"])
+                pct = float(v.get("change_pct") or 0.0)
+                out[str(c)] = StockQuote(str(c), price, 0, pct, 0, "UNKNOWN", "")
+        return out
 
     def _ensure_companies(tag: str) -> dict[str, dict[str, str]]:
         nonlocal companies
@@ -2559,6 +3649,192 @@ def run_live(
             companies = load_krx_master(base_dir / "krx_master.json", allow_network=True)
             logger.info("%s KRX 상장사 DB 로드 완료: %d개 기업", tag, len(companies))
         return companies
+
+    def _flush_premarket_digest(flush_now: datetime, tag: str, cycle: int, row_summary: dict[str, Any]) -> None:
+        nonlocal ai_calls, sent_this_run
+        state.prune_overnight_queue(now=flush_now)
+        if not state.overnight_queue:
+            return
+        queued = sorted(
+            list(state.overnight_queue),
+            key=lambda d: (-float(d.get("catalyst_score", 0.0) or 0.0), str(d.get("created_at", ""))),
+        )
+        digest_limit = max(1, max_offhours)
+        comps = _ensure_companies(tag)
+        local_recent = list(state.recent_alerts)
+        local_sectors: Counter[str] = Counter()
+        digest_entries: list[dict[str, Any]] = []
+
+        for entry in queued:
+            if len(digest_entries) >= digest_limit:
+                break
+            cluster = EventCluster.from_dict(entry.get("cluster") or {})
+            cand = dict(entry.get("stage1") or {})
+            tkey = str(entry.get("theme_key") or cluster.cluster_id)
+            score_val = float(entry.get("catalyst_score", min_score) or min_score)
+            cand_tokens = top_cluster_tokens(cluster, limit=8)
+            raw_kws = list(cand.get("first_order_keywords") or []) + list(cand.get("second_order_keywords") or [])
+            cand_keywords = list(dict.fromkeys(tok for kw in raw_kws for tok in extract_normalized_tokens(str(kw))))
+            matched = match_krx_stocks(
+                comps,
+                cand.get("second_order_keywords") or [],
+                cand.get("first_order_keywords") or [],
+                cand.get("negative_keywords") or [],
+            )
+            cand_codes = [m["code"] for m in matched]
+            cand_sector = classify_alert_sector(
+                theme_key=tkey,
+                second_keywords=list(cand.get("second_order_keywords") or []),
+                first_keywords=list(cand.get("first_order_keywords") or []),
+                headline=cluster.headline,
+                summary=str(cand.get("event_summary") or ""),
+            )
+
+            if max_daily_per_sector > 0 and (
+                state.sector_count_today(cand_sector, now=flush_now) + local_sectors[cand_sector]
+                >= max_daily_per_sector
+            ):
+                logger.info("%s 장전 요약 섹터 일일 한도 스킵(%s): %s", tag, cand_sector, tkey)
+                continue
+
+            if dedup_mode == "enforce":
+                dedup_q = evaluate_duplicate_candidate(
+                    theme_key=tkey,
+                    tokens=cand_tokens,
+                    keywords=cand_keywords,
+                    codes=cand_codes,
+                    catalyst_score=score_val,
+                    recent_alerts=local_recent,
+                    cooldown_hours=cooldown_h,
+                    now=flush_now,
+                    code_field="cand_codes",
+                )
+                if dedup_q["is_dup"]:
+                    continue
+                title_prefix = "[후속] " if dedup_q["escalated"] else ""
+            else:
+                title_prefix = ""
+
+            if stock_dedup_hours > 0 and matched:
+                pre_sf = filter_recently_alerted_stocks(
+                    matched,
+                    catalyst_score=score_val,
+                    recent_alerts=local_recent,
+                    now=flush_now,
+                    window_hours=stock_dedup_hours,
+                )
+                if pre_sf["all_filtered"]:
+                    continue
+
+            try:
+                s2 = _run_stage2_pipeline(
+                    api_key=api_key,
+                    deep_models=deep_models,
+                    deep_thinking_level=deep_thinking_level,
+                    deep_thinking_budget=deep_thinking_budget,
+                    deep_timeout=deep_timeout,
+                    min_score=min_score,
+                    companies=comps,
+                    cluster=cluster,
+                    cand=cand,
+                    delay_note=None,
+                    now=flush_now,
+                    state=state,
+                    matched_override=matched,
+                    title_prefix=title_prefix,
+                    stock_dedup_hours=stock_dedup_hours,
+                    recent_alerts_override=local_recent,
+                )
+                ai_calls += 1
+            except GeminiAuthError:
+                raise
+            except Exception as exc:
+                logger.warning("%s 장전 요약 Stage 2 실패 스킵(%s): %s", tag, tkey, exc)
+                continue
+
+            if s2["stock_filter"]["all_filtered"]:
+                logger.info("%s 장전 요약 24h 중복 종목 제외 후 남은 종목 없음 — 스킵: %s", tag, tkey)
+                continue
+
+            final_sector = s2["sector"]
+            if max_daily_per_sector > 0 and (
+                state.sector_count_today(final_sector, now=flush_now) + local_sectors[final_sector]
+                >= max_daily_per_sector
+            ):
+                logger.info("%s 장전 요약 Stage 2 섹터 한도 스킵(%s): %s", tag, final_sector, tkey)
+                continue
+
+            digest_entries.append({
+                "theme_key": tkey,
+                "report": s2["report"],
+                "quotes": s2["quotes"],
+                "articles": cluster.items,
+                "model_used": s2["model"],
+                "title": s2["title"],
+                "alert_meta": s2["alert_meta"],
+                "sector": final_sector,
+            })
+            local_sectors[final_sector] += 1
+            local_recent.append({
+                "ts": flush_now.isoformat(),
+                "theme_key": tkey,
+                "tokens": s2["alert_meta"]["tokens"],
+                "keywords": s2["alert_meta"]["keywords"],
+                "cand_codes": s2["alert_meta"]["cand_codes"],
+                "final_codes": s2["alert_meta"]["final_codes"],
+                "catalyst_score": s2["alert_meta"]["catalyst_score"],
+                "stocks": s2["alert_meta"]["stocks"],
+            })
+
+        if not digest_entries:
+            state.last_digest_date = flush_now.strftime("%Y-%m-%d")
+            state.overnight_queue = []
+            if not dry_run:
+                state.save(now=flush_now)
+            logger.info("%s 장전 요약 후보가 중복/섹터 필터 후 0건 — 발송 생략합니다.", tag)
+            return
+
+        digest_html = format_premarket_digest_html(digest_entries, now=flush_now)
+        try:
+            if dry_run:
+                print(digest_html)
+            else:
+                send_telegram(tg_token, tg_chat, digest_html, start_chunk=0)
+                for idx_d, de in enumerate(digest_entries):
+                    state.mark_alerted(
+                        de["theme_key"],
+                        now=flush_now,
+                        **de["alert_meta"],
+                        window="offhours",
+                        count_alert=(idx_d == 0),
+                    )
+                    perf_tracker.record_alert(
+                        alert_ts=flush_now,
+                        theme_key=de["theme_key"],
+                        sector=de["sector"],
+                        title=de["title"],
+                        catalyst_score=float(de["alert_meta"]["catalyst_score"]),
+                        window="offhours",
+                        stocks=de["alert_meta"]["stocks"],
+                        quotes=de["quotes"],
+                    )
+                    batch_themes.add(norm_key(de["theme_key"]))
+                state.last_digest_date = flush_now.strftime("%Y-%m-%d")
+                state.overnight_queue = []
+                state.save(now=flush_now)
+                logger.info("%s 장전 요약(07:50) 텔레그램 발송 완료: %d건 묶음", tag, len(digest_entries))
+            sent_this_run += 1
+            row_summary["alerts_sent"] += 1
+            trace.emit({
+                "ts": flush_now.isoformat(),
+                "type": "premarket_digest_sent",
+                "cycle": cycle,
+                "count": len(digest_entries),
+                "themes": [d["theme_key"] for d in digest_entries],
+                "sectors": [d["sector"] for d in digest_entries],
+            })
+        except TelegramPartialSendError as tg_exc:
+            logger.warning("%s 장전 요약 발송 실패 (다음 주기에 재시도): %s", tag, tg_exc)
 
     try:
         for cycle in range(1, total_cycles + 1):
@@ -2577,9 +3853,30 @@ def run_live(
                 "note": "",
             }
 
-            if state.sent_today(now=cycle_now) >= max_daily:
-                logger.info("%s 오늘 최대 알림(%d건) 도달 — 무료 할당량 보호를 위해 종료합니다.", tag, max_daily)
-                row_summary["note"] = "일일 한도 도달"
+            # 0) 기존 발송 알림의 +5분/+30분/당일종가/익일종가 수익률 자동 업데이트 (한도 도달 여부와 무관하게 수행)
+            if not dry_run:
+                try:
+                    perf_updated = perf_tracker.update_pending(now=cycle_now)
+                    if perf_updated > 0:
+                        logger.info("%s 알림 성과 자동 기록 업데이트: %d건 측정 완료", tag, perf_updated)
+                except Exception as perf_exc:
+                    logger.warning("%s 알림 성과 업데이트 스킵: %s", tag, perf_exc)
+
+            # 0-b) 야간 후보 장전 요약(기본 평일 07:50 KST) 자동 발송
+            if offhours_digest_enabled and should_flush_premarket_digest(cycle_now, state, offhours_digest_time):
+                _flush_premarket_digest(cycle_now, tag, cycle, row_summary)
+
+            limit_hit, limit_reason = _alert_limit_status(cycle_now)
+            if limit_hit:
+                if limit_reason == "over_market_limit":
+                    logger.info("%s 오늘 장중 최대 알림(%d건) 도달 — 무료 할당량 보호를 위해 종료합니다.", tag, max_market)
+                    row_summary["note"] = "장중 한도 도달"
+                elif limit_reason == "over_offhours_limit":
+                    logger.info("%s 오늘 야간·주말 최대 알림(%d건) 도달 — 장중 한도 보존을 위해 종료합니다.", tag, max_offhours)
+                    row_summary["note"] = "야간 한도 도달"
+                else:
+                    logger.info("%s 오늘 최대 알림(%d건) 도달 — 무료 할당량 보호를 위해 종료합니다.", tag, max_daily)
+                    row_summary["note"] = "일일 한도 도달"
                 cycle_rows.append(row_summary)
                 break
             if _burst_limit_reached(cycle_now):
@@ -2637,7 +3934,12 @@ def run_live(
                             logger.info("%s Deferred 중복/쿨다운 스킵: %s", tag, tkey)
                             continue
 
-                        if _burst_limit_reached(now_d) or state.sent_today(now=now_d) >= max_daily:
+                        if _should_queue_for_digest(now_d) or _is_post_digest_premarket_gap(now_d):
+                            remaining_deferred.append(entry)
+                            continue
+
+                        d_limit_hit, _ = _alert_limit_status(now_d)
+                        if _burst_limit_reached(now_d) or d_limit_hit:
                             remaining_deferred.append(entry)
                             continue
 
@@ -2678,15 +3980,40 @@ def run_live(
                                     msg_to_send = _inject_delay_note_into_html(msg_to_send, delay_note)
                                 title_str = str(entry.get("deep_title") or cluster.headline)
                                 alert_meta = dict(entry.get("alert_meta") or {})
+                                if sent_chunks == 0 and stock_dedup_hours > 0 and alert_meta.get("stocks"):
+                                    sf_d = filter_recently_alerted_stocks(
+                                        list(alert_meta["stocks"]),
+                                        catalyst_score=float(entry.get("catalyst_score", 0.0) or 0.0),
+                                        recent_alerts=state.recent_alerts,
+                                        now=now_d,
+                                        window_hours=stock_dedup_hours,
+                                    )
+                                    if sf_d["all_filtered"]:
+                                        logger.info("%s Deferred send_pending 24h 종목 중복으로 폐기: %s", tag, tkey)
+                                        continue
+                                if sent_chunks == 0 and max_daily_per_sector > 0 and alert_meta.get("sector"):
+                                    if state.sector_count_today(str(alert_meta["sector"]), now=now_d) >= max_daily_per_sector:
+                                        logger.info("%s Deferred send_pending 섹터 일일 한도 초과 폐기(%s): %s", tag, alert_meta["sector"], tkey)
+                                        continue
                                 if dry_run:
                                     print(msg_to_send)
                                 else:
                                     send_telegram(tg_token, tg_chat, msg_to_send, start_chunk=sent_chunks)
                                     state.mark_alerted(tkey, now=now_d, **alert_meta)
+                                    perf_tracker.record_alert(
+                                        alert_ts=now_d,
+                                        theme_key=tkey,
+                                        sector=str(alert_meta.get("sector") or ""),
+                                        title=title_str,
+                                        catalyst_score=float(alert_meta.get("catalyst_score") or entry.get("catalyst_score") or 0.0),
+                                        window=_window_name(now_d),
+                                        stocks=list(alert_meta.get("stocks") or []),
+                                        quotes=_deserialize_perf_quotes(entry.get("perf_quotes")),
+                                    )
                                     logger.info("%s Deferred 재발송 완료(Stage 2 생략, chunk>=%d): %s", tag, sent_chunks, title_str)
                             else:
                                 comps = _ensure_companies(tag)
-                                msg_to_send, title_str, deep_model, alert_meta = _build_stage2_message(
+                                s2_def = _run_stage2_pipeline(
                                     api_key=api_key,
                                     deep_models=deep_models,
                                     deep_thinking_level=deep_thinking_level,
@@ -2699,8 +4026,42 @@ def run_live(
                                     delay_note=delay_note,
                                     now=now_d,
                                     state=state,
+                                    stock_dedup_hours=stock_dedup_hours,
                                 )
                                 ai_calls += 1
+                                msg_to_send = s2_def["msg"]
+                                title_str = s2_def["title"]
+                                deep_model = s2_def["model"]
+                                alert_meta = s2_def["alert_meta"]
+                                if s2_def["stock_filter"]["all_filtered"]:
+                                    logger.info("%s Deferred 24h 종목 중복 제외 후 남은 종목 없음 — 폐기: %s", tag, tkey)
+                                    continue
+                                if max_daily_per_sector > 0 and state.sector_count_today(s2_def["sector"], now=now_d) >= max_daily_per_sector:
+                                    logger.info("%s Deferred 섹터 일일 한도 초과 폐기(%s): %s", tag, s2_def["sector"], tkey)
+                                    continue
+                                if max_bullish_prepriced_pct > 0 and is_regular_trading_hours(now_d):
+                                    pre_hit_d, pre_det_d = is_all_bullish_prepriced(
+                                        alert_meta.get("stocks") or [],
+                                        s2_def["quotes"],
+                                        max_pct=max_bullish_prepriced_pct,
+                                    )
+                                    if pre_hit_d:
+                                        trace.emit({
+                                            "ts": now_d.isoformat(),
+                                            "type": "prepriced_skip",
+                                            "cycle": cycle,
+                                            "phase": "deferred",
+                                            "cluster_id": cid,
+                                            "theme_key": tkey,
+                                            "catalyst_score": float(alert_meta["catalyst_score"]),
+                                            "max_pct": max_bullish_prepriced_pct,
+                                            "details": pre_det_d,
+                                        })
+                                        logger.info(
+                                            "%s Deferred 장중 급등 선반영(≥+%.1f%%) 추격 차단 — 폐기(%s): %s",
+                                            tag, max_bullish_prepriced_pct, ", ".join(pre_det_d[:3]), tkey,
+                                        )
+                                        continue
                                 logger.info("%s Deferred Stage 2 재분석 완료 (%s): %s", tag, deep_model, title_str)
                                 # Stage 2 성공 후 텔레그램 전송 (실패 시 send_pending 승격)
                                 try:
@@ -2709,6 +4070,16 @@ def run_live(
                                     else:
                                         send_telegram(tg_token, tg_chat, msg_to_send, start_chunk=0)
                                         state.mark_alerted(tkey, now=now_d, **alert_meta)
+                                        perf_tracker.record_alert(
+                                            alert_ts=now_d,
+                                            theme_key=tkey,
+                                            sector=s2_def["sector"],
+                                            title=title_str,
+                                            catalyst_score=float(alert_meta["catalyst_score"]),
+                                            window=_window_name(now_d),
+                                            stocks=alert_meta["stocks"],
+                                            quotes=s2_def["quotes"],
+                                        )
                                         logger.info("%s Deferred 텔레그램 발송 완료: %s", tag, title_str)
                                 except TelegramPartialSendError as tg_exc:
                                     new_retries = retries + 1
@@ -2717,6 +4088,7 @@ def run_live(
                                         entry["message_html"] = msg_to_send
                                         entry["deep_title"] = title_str
                                         entry["alert_meta"] = alert_meta
+                                        entry["perf_quotes"] = _serialize_perf_quotes(s2_def["quotes"])
                                         entry["sent_chunks"] = tg_exc.sent_chunks
                                         entry["stage2_completed_at"] = now_d.isoformat()
                                         entry["retries"] = new_retries
@@ -2810,7 +4182,9 @@ def run_live(
                         state.save(now=_now())
 
                 # Deferred 처리만으로 한도에 도달했으면 RSS/Stage 1 스킵
-                if state.sent_today(now=_now()) >= max_daily or _burst_limit_reached(_now()):
+                after_def_now = _now()
+                after_def_hit, _ = _alert_limit_status(after_def_now)
+                if after_def_hit or _burst_limit_reached(after_def_now):
                     successful_cycles += 1
                     row_summary["note"] = "Deferred 처리로 한도 도달"
                     cycle_rows.append(row_summary)
@@ -3005,6 +4379,13 @@ def run_live(
                                     cand.get("negative_keywords") or [],
                                 )
                                 cand_codes = [m["code"] for m in matched]
+                                cand_sector = classify_alert_sector(
+                                    theme_key=tkey,
+                                    second_keywords=list(cand.get("second_order_keywords") or []),
+                                    first_keywords=list(cand.get("first_order_keywords") or []),
+                                    headline=cluster.headline,
+                                    summary=str(cand.get("event_summary") or ""),
+                                )
 
                                 dedup_pre = evaluate_duplicate_candidate(
                                     theme_key=tkey,
@@ -3057,11 +4438,132 @@ def run_live(
                                     logger.info("%s 중복/쿨다운 테마 스킵(%s): %s", tag, deferred_reasons[cid], tkey)
                                     continue
 
-                                title_prefix = "[후속] " if (dedup_mode == "enforce" and dedup_pre["escalated"]) else ""
+                                # 야간 장전 요약 모드: 야간·주말 후보는 즉시 발송하지 않고 07:50 장전 요약 큐에 보관
+                                if _should_queue_for_digest(cand_now):
+                                    state.enqueue_overnight(
+                                        {
+                                            "cluster": cluster.to_dict(),
+                                            "stage1": cand,
+                                            "theme_key": tkey,
+                                            "sector": cand_sector,
+                                            "catalyst_score": score_val,
+                                            "first_seen": first_seen_iso,
+                                            "created_at": cand_now.isoformat(),
+                                        },
+                                        now=cand_now,
+                                    )
+                                    if not dry_run:
+                                        state.save(now=cand_now)
+                                    deferred_reasons[cid] = "overnight_digest_queued"
+                                    trace.emit({
+                                        "ts": cand_now.isoformat(),
+                                        "type": "overnight_queued",
+                                        "cycle": cycle,
+                                        "cluster_id": cid,
+                                        "theme_key": tkey,
+                                        "sector": cand_sector,
+                                        "catalyst_score": score_val,
+                                        "queue_size": len(state.overnight_queue),
+                                    })
+                                    logger.info(
+                                        "%s 야간 후보 장전 요약(%s) 대기열 보관 (%d건): %s",
+                                        tag, offhours_digest_time, len(state.overnight_queue), tkey,
+                                    )
+                                    continue
 
-                                # 실행당/단기/일일 알림 한도 초과 시 영구 유실 대신 deferred 큐 보관
-                                if _burst_limit_reached(cand_now) or state.sent_today(now=cand_now) >= max_daily:
-                                    reason = "over_daily_limit" if state.sent_today(now=cand_now) >= max_daily else "over_run_limit"
+                                # 07:50 요약 발송 직후 ~ 08:00 장개시 전 신규 후보는 장중 시작까지 deferred 보관
+                                if _is_post_digest_premarket_gap(cand_now):
+                                    deferred_reasons[cid] = "pre_market_wait"
+                                    enqueue_deferred(
+                                        state,
+                                        {
+                                            "kind": "stage2_pending",
+                                            "cluster": cluster.to_dict(),
+                                            "stage1": cand,
+                                            "theme_key": tkey,
+                                            "catalyst_score": score_val,
+                                            "first_seen": first_seen_iso,
+                                            "created_at": cand_now.isoformat(),
+                                            "expires_at": (cand_now + timedelta(minutes=ttl_min)).isoformat(),
+                                            "retries": 0,
+                                            "reason": "pre_market_wait",
+                                        },
+                                        trace,
+                                        cycle,
+                                        cand_now,
+                                    )
+                                    if not dry_run:
+                                        state.save(now=cand_now)
+                                    logger.info("%s 장전 요약 완료 후 08:00 전 신규 후보 deferred 보관: %s", tag, tkey)
+                                    continue
+
+                                # 섹터 일일 편중 제한 (Stage 2 이전 1차 가드)
+                                if max_daily_per_sector > 0:
+                                    sec_used = state.sector_count_today(cand_sector, now=cand_now)
+                                    sec_blocked = sec_used >= max_daily_per_sector
+                                    trace.emit({
+                                        "ts": cand_now.isoformat(),
+                                        "type": "sector_limit_decision",
+                                        "cycle": cycle,
+                                        "phase": "pre_stage2",
+                                        "cluster_id": cid,
+                                        "theme_key": tkey,
+                                        "sector": cand_sector,
+                                        "used_today": sec_used,
+                                        "limit": max_daily_per_sector,
+                                        "blocked": sec_blocked,
+                                    })
+                                    if sec_blocked:
+                                        deferred_reasons[cid] = f"sector_daily_limit:{cand_sector}"
+                                        logger.info(
+                                            "%s 섹터 일일 한도 도달 스킵(%s %d/%d): %s",
+                                            tag, cand_sector, sec_used, max_daily_per_sector, tkey,
+                                        )
+                                        continue
+
+                                # 24시간 종목코드 중복 사전 차단 (매칭 후보 전체가 24h 기알림 & 에스컬레이션 미달이면 Stage 2/1보 모두 절약)
+                                pre_stock_escalated = False
+                                if stock_dedup_hours > 0 and matched:
+                                    pre_sf = filter_recently_alerted_stocks(
+                                        matched,
+                                        catalyst_score=score_val,
+                                        recent_alerts=state.recent_alerts,
+                                        now=cand_now,
+                                        window_hours=stock_dedup_hours,
+                                    )
+                                    pre_stock_escalated = bool(pre_sf["escalated"])
+                                    if pre_sf["all_filtered"]:
+                                        trace.emit({
+                                            "ts": cand_now.isoformat(),
+                                            "type": "stock_dedup_decision",
+                                            "cycle": cycle,
+                                            "phase": "pre_stage2",
+                                            "cluster_id": cid,
+                                            "theme_key": tkey,
+                                            "catalyst_score": score_val,
+                                            "window_hours": stock_dedup_hours,
+                                            "excluded_codes": pre_sf["excluded_codes"],
+                                            "kept_codes": [],
+                                            "escalated_codes": [],
+                                            "blocked": True,
+                                        })
+                                        deferred_reasons[cid] = "stock_code_dedup_24h"
+                                        logger.info(
+                                            "%s 최근 %d시간 기알림 종목 중복으로 Stage 2 스킵(%s): %s",
+                                            tag, stock_dedup_hours, ",".join(pre_sf["excluded_codes"][:4]), tkey,
+                                        )
+                                        continue
+
+                                title_prefix = (
+                                    "[후속] "
+                                    if ((dedup_mode == "enforce" and dedup_pre["escalated"]) or pre_stock_escalated)
+                                    else ""
+                                )
+
+                                # 실행당/단기/시간대/일일 알림 한도 초과 시 영구 유실 대신 deferred 큐 보관
+                                cand_limit_hit, cand_limit_reason = _alert_limit_status(cand_now)
+                                if _burst_limit_reached(cand_now) or cand_limit_hit:
+                                    reason = cand_limit_reason if cand_limit_hit else "over_run_limit"
                                     deferred_reasons[cid] = reason
                                     enqueue_deferred(
                                         state,
@@ -3083,7 +4585,7 @@ def run_live(
                                     )
                                     if not dry_run:
                                         state.save(now=cand_now)
-                                    logger.info("%s 알림 한도 도달 — 후순위 후보 deferred 보관: %s", tag, tkey)
+                                    logger.info("%s 알림 한도 도달(%s) — 후순위 후보 deferred 보관: %s", tag, reason, tkey)
                                     continue
 
                                 # 2단 초고속 1보 푸시: Stage 2(10~15초) 대기 전에 3초 만에 1차 속보 먼저 발송
@@ -3091,7 +4593,7 @@ def run_live(
                                     flash_msg = format_flash_alert_html(
                                         cluster,
                                         cand,
-                                        escalated=bool(dedup_mode == "enforce" and dedup_pre["escalated"]),
+                                        escalated=bool(title_prefix),
                                         now=cand_now,
                                     )
                                     try:
@@ -3114,7 +4616,7 @@ def run_live(
 
                                 # 후보별 개별 try/except: 한 후보 실패 시 나머지 후보 중단 및 유실 방지
                                 try:
-                                    msg, title_str, deep_model, alert_meta = _build_stage2_message(
+                                    s2_res = _run_stage2_pipeline(
                                         api_key=api_key,
                                         deep_models=deep_models,
                                         deep_thinking_level=deep_thinking_level,
@@ -3129,8 +4631,15 @@ def run_live(
                                         state=state,
                                         matched_override=matched,
                                         title_prefix=title_prefix,
+                                        stock_dedup_hours=stock_dedup_hours,
                                     )
                                     ai_calls += 1
+                                    msg = s2_res["msg"]
+                                    title_str = s2_res["title"]
+                                    deep_model = s2_res["model"]
+                                    alert_meta = s2_res["alert_meta"]
+                                    stock_filter = s2_res["stock_filter"]
+                                    final_sector = s2_res["sector"]
                                     logger.info("%s Stage 2 심층 분석 완료 (%s): %s", tag, deep_model, title_str)
                                 except GeminiAuthError:
                                     raise
@@ -3158,6 +4667,64 @@ def run_live(
                                     if not dry_run:
                                         state.save(now=cand_now)
                                     continue
+
+                                # 최종 추천 종목(final_codes) 기준 24시간 중복 차단 결과 기록 및 차단
+                                if stock_dedup_hours > 0 and (
+                                    stock_filter["excluded_codes"] or stock_filter["escalated_codes"]
+                                ):
+                                    trace.emit({
+                                        "ts": cand_now.isoformat(),
+                                        "type": "stock_dedup_decision",
+                                        "cycle": cycle,
+                                        "phase": "pre_send",
+                                        "cluster_id": cid,
+                                        "theme_key": tkey,
+                                        "catalyst_score": score_val,
+                                        "window_hours": stock_dedup_hours,
+                                        "excluded_codes": stock_filter["excluded_codes"],
+                                        "kept_codes": alert_meta.get("final_codes") or [],
+                                        "escalated_codes": stock_filter["escalated_codes"],
+                                        "only_weak_leftovers": bool(stock_filter.get("only_weak_leftovers")),
+                                        "blocked": bool(stock_filter["all_filtered"]),
+                                    })
+                                if stock_filter["all_filtered"]:
+                                    deferred_reasons[cid] = (
+                                        "stock_code_dedup_weak_leftovers"
+                                        if stock_filter.get("only_weak_leftovers")
+                                        else "stock_code_dedup_24h"
+                                    )
+                                    logger.info(
+                                        "%s 최근 %d시간 기알림 종목 제외 후 %s — 발송 생략(%s): %s",
+                                        tag,
+                                        stock_dedup_hours,
+                                        "단기테마성 잔여 종목만 남아 차단" if stock_filter.get("only_weak_leftovers") else "남은 종목 없음",
+                                        ",".join(stock_filter["excluded_codes"][:4]),
+                                        tkey,
+                                    )
+                                    continue
+
+                                # Stage 2 확정 섹터 기준 일일 편중 2차 가드
+                                if max_daily_per_sector > 0:
+                                    sec_used_post = state.sector_count_today(final_sector, now=cand_now)
+                                    if sec_used_post >= max_daily_per_sector:
+                                        trace.emit({
+                                            "ts": cand_now.isoformat(),
+                                            "type": "sector_limit_decision",
+                                            "cycle": cycle,
+                                            "phase": "pre_send",
+                                            "cluster_id": cid,
+                                            "theme_key": tkey,
+                                            "sector": final_sector,
+                                            "used_today": sec_used_post,
+                                            "limit": max_daily_per_sector,
+                                            "blocked": True,
+                                        })
+                                        deferred_reasons[cid] = f"sector_daily_limit:{final_sector}"
+                                        logger.info(
+                                            "%s 발송 직전 섹터 일일 한도 차단(%s %d/%d): %s",
+                                            tag, final_sector, sec_used_post, max_daily_per_sector, tkey,
+                                        )
+                                        continue
 
                                 # 발송 직전 2차 중복 안전망 체크 (final_codes 기준)
                                 dedup_post = evaluate_duplicate_candidate(
@@ -3190,12 +4757,48 @@ def run_live(
                                     logger.info("%s 발송 직전 2차 중복 차단(%s): %s", tag, dedup_post["reason"], tkey)
                                     continue
 
+                                # 장중 급등 선반영 추격매수 차단 가드 (정규장 09:00~15:30 한정)
+                                if max_bullish_prepriced_pct > 0 and is_regular_trading_hours(cand_now):
+                                    pre_hit, pre_details = is_all_bullish_prepriced(
+                                        alert_meta.get("stocks") or [],
+                                        s2_res["quotes"],
+                                        max_pct=max_bullish_prepriced_pct,
+                                    )
+                                    if pre_hit:
+                                        trace.emit({
+                                            "ts": cand_now.isoformat(),
+                                            "type": "prepriced_skip",
+                                            "cycle": cycle,
+                                            "phase": "pre_send",
+                                            "cluster_id": cid,
+                                            "theme_key": tkey,
+                                            "catalyst_score": score_val,
+                                            "max_pct": max_bullish_prepriced_pct,
+                                            "details": pre_details,
+                                        })
+                                        deferred_reasons[cid] = "prepriced_skip"
+                                        logger.info(
+                                            "%s 장중 급등 선반영(≥+%.1f%%) 추격 차단 — 발송 생략(%s): %s",
+                                            tag, max_bullish_prepriced_pct, ", ".join(pre_details[:3]), tkey,
+                                        )
+                                        continue
+
                                 try:
                                     if dry_run:
                                         print(msg)
                                     else:
                                         send_telegram(tg_token, tg_chat, msg, start_chunk=0)
                                         state.mark_alerted(tkey, now=cand_now, **alert_meta)
+                                        perf_tracker.record_alert(
+                                            alert_ts=cand_now,
+                                            theme_key=tkey,
+                                            sector=final_sector,
+                                            title=title_str,
+                                            catalyst_score=float(alert_meta["catalyst_score"]),
+                                            window=_window_name(cand_now),
+                                            stocks=alert_meta["stocks"],
+                                            quotes=s2_res["quotes"],
+                                        )
                                         state.save(now=cand_now)
                                         logger.info("%s 텔레그램 알림 발송 완료: %s", tag, title_str)
                                     # 발송 성공 후에만 batch_themes 등록 (실패 시 재시도 허용)
@@ -3226,6 +4829,7 @@ def run_live(
                                             "message_html": msg,
                                             "deep_title": title_str,
                                             "alert_meta": alert_meta,
+                                            "perf_quotes": _serialize_perf_quotes(s2_res["quotes"]),
                                             "sent_chunks": tg_exc.sent_chunks,
                                         },
                                         trace,
@@ -3289,11 +4893,13 @@ def run_live(
                 **row_summary,
                 "pending_remaining": len(state.pending),
                 "deferred_remaining": len(state.deferred),
+                "overnight_queue_remaining": len(state.overnight_queue),
             })
 
             if cycle < total_cycles:
                 check_now = _now()
-                if state.sent_today(now=check_now) >= max_daily or _burst_limit_reached(check_now):
+                chk_hit, _ = _alert_limit_status(check_now)
+                if chk_hit or _burst_limit_reached(check_now):
                     logger.info("%s 알림 한도 도달 — 남은 워커 사이클을 조기 종료합니다.", tag)
                     break
                 elapsed = time.monotonic() - cycle_start
