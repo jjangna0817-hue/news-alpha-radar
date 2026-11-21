@@ -1,0 +1,17 @@
+[Unit]
+Description=News Alpha Radar External HTTPS Tunnel (Cloudflare Quick Tunnel)
+After=network-online.target news-alpha-dashboard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__WORKDIR__
+EnvironmentFile=-__WORKDIR__/.env
+ExecStart=__PYTHON__ -u __WORKDIR__/tunnel_manager.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

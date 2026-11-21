@@ -2162,5 +2162,202 @@ class TestBacktestFixesAndPerformanceTracking(unittest.TestCase):
             self.assertEqual(len(sent_pre), 1)
 
 
+class TestRemoteHttpsTunnelAndCookieAuth(unittest.TestCase):
+    def test_tunnel_url_extraction_password_generation_and_telegram_notice(self) -> None:
+        import tunnel_manager
+
+        # 1) URL extraction accepts real trycloudflare tunnel URLs and rejects api.trycloudflare.com
+        self.assertEqual(
+            tunnel_manager.extract_trycloudflare_url(
+                "2026-11-21T14:00:02Z INF |  https://bright-alpha-radar-news.trycloudflare.com  |"
+            ),
+            "https://bright-alpha-radar-news.trycloudflare.com",
+        )
+        self.assertIsNone(tunnel_manager.extract_trycloudflare_url("https://api.trycloudflare.com/tunnel"))
+        self.assertIsNone(tunnel_manager.extract_trycloudflare_url("Requesting new quick Tunnel on trycloudflare.com..."))
+
+        # 2) Architecture detection
+        self.assertEqual(tunnel_manager.detect_cloudflared_asset("x86_64"), "cloudflared-linux-amd64")
+        self.assertEqual(tunnel_manager.detect_cloudflared_asset("aarch64"), "cloudflared-linux-arm64")
+        self.assertEqual(tunnel_manager.detect_cloudflared_asset("armv7l"), "cloudflared-linux-arm")
+
+        # 3) Auto-generate strong DASHBOARD_PASSWORD when empty, preserve comments, and send once via Telegram
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DASHBOARD_PASSWORD", None)
+            tmp_dir = Path(tmp)
+            env_path = tmp_dir / ".env"
+            data_dir = tmp_dir / "data"
+            env_path.write_text(
+                "# 주석 유지 테스트\nTELEGRAM_BOT_TOKEN=tok123\nTELEGRAM_CHAT_ID=999\nDASHBOARD_PASSWORD=\n",
+                encoding="utf-8",
+            )
+
+            pw1, created1 = tunnel_manager.ensure_dashboard_password(env_path, data_dir=data_dir)
+            self.assertTrue(created1)
+            self.assertEqual(len(pw1), 12)
+            self.assertIn("# 주석 유지 테스트", env_path.read_text(encoding="utf-8"))
+            self.assertEqual(tunnel_manager.read_dotenv_value(env_path, "DASHBOARD_PASSWORD"), pw1)
+
+            # Second call preserves existing password
+            pw2, created2 = tunnel_manager.ensure_dashboard_password(env_path, data_dir=data_dir)
+            self.assertFalse(created2)
+            self.assertEqual(pw2, pw1)
+
+            now = datetime.now(KST)
+            tunnel_manager.write_tunnel_status(
+                data_dir,
+                {
+                    "pid": 111,
+                    "state": "running",
+                    "url": "https://quick-alpha-radar.trycloudflare.com",
+                    "heartbeat_at": now.isoformat(),
+                },
+            )
+            st = tunnel_manager.read_tunnel_status(data_dir, now=now)
+            self.assertTrue(st["alive"])
+            self.assertEqual(st["url"], "https://quick-alpha-radar.trycloudflare.com")
+
+            # Stale heartbeat (> 90s) marks tunnel offline
+            st_stale = tunnel_manager.read_tunnel_status(data_dir, now=now + timedelta(minutes=5))
+            self.assertFalse(st_stale["alive"])
+            self.assertEqual(st_stale["state"], "offline")
+
+            sent_msgs: list[str] = []
+            with mock.patch.object(radar, "send_telegram", side_effect=lambda t, c, m, start_chunk=0: sent_msgs.append(m) or 1):
+                ok1 = tunnel_manager.send_tunnel_link_telegram(
+                    data_dir,
+                    tmp_dir,
+                    include_generated_password=True,
+                )
+                self.assertTrue(ok1)
+                self.assertEqual(len(sent_msgs), 1)
+                self.assertIn("https://quick-alpha-radar.trycloudflare.com", sent_msgs[0])
+                self.assertIn(pw1, sent_msgs[0])  # First send includes newly generated password
+
+                # Subsequent notification does NOT leak raw password again
+                ok2 = tunnel_manager.send_tunnel_link_telegram(
+                    data_dir,
+                    tmp_dir,
+                    include_generated_password=True,
+                )
+                self.assertTrue(ok2)
+                self.assertEqual(len(sent_msgs), 2)
+                self.assertNotIn(pw1, sent_msgs[1])
+
+    def test_dashboard_cookie_login_logout_and_tunnel_actions(self) -> None:
+        import threading as _th
+        import dashboard
+        import tunnel_manager
+
+        now = datetime.now(KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            tunnel_manager.write_tunnel_status(
+                tmp_dir,
+                {
+                    "pid": 222,
+                    "state": "running",
+                    "url": "https://mobile-radar-link.trycloudflare.com",
+                    "target": "http://127.0.0.1:8787",
+                    "heartbeat_at": now.isoformat(),
+                },
+            )
+            srv = dashboard.create_dashboard_server("127.0.0.1", 0, data_dir=tmp_dir, password="my-mobile-pw")
+            port = srv.server_address[1]
+            t = _th.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            base = f"http://127.0.0.1:{port}"
+            try:
+                # 1) Unauthenticated browser GET / serves mobile-friendly LOGIN_HTML (200) instead of raw JSON
+                with urllib.request.urlopen(f"{base}/", timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    login_page = resp.read().decode("utf-8")
+                self.assertIn('id="login-form"', login_page)
+                self.assertNotIn('id="kpi-alerts"', login_page)
+
+                # 2) Unauthenticated API request still returns 401
+                with self.assertRaises(urllib.error.HTTPError) as ctx_unauth:
+                    urllib.request.urlopen(f"{base}/api/overview", timeout=5)
+                self.assertEqual(ctx_unauth.exception.code, 401)
+
+                # 3) Wrong password on POST /api/auth/login -> 401
+                bad_req = urllib.request.Request(
+                    f"{base}/api/auth/login",
+                    data=json.dumps({"password": "wrong"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "X-Requested-With": "fetch"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx_bad:
+                    urllib.request.urlopen(bad_req, timeout=5)
+                self.assertEqual(ctx_bad.exception.code, 401)
+
+                # 4) Valid password over HTTPS forwarded header -> 200 + Set-Cookie with HttpOnly & Secure
+                ok_req = urllib.request.Request(
+                    f"{base}/api/auth/login",
+                    data=json.dumps({"password": "my-mobile-pw"}).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Requested-With": "fetch",
+                        "X-Forwarded-Proto": "https",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(ok_req, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    set_cookie = resp.headers.get("Set-Cookie") or ""
+                self.assertIn("nar_session=", set_cookie)
+                self.assertIn("HttpOnly", set_cookie)
+                self.assertIn("Secure", set_cookie)
+                cookie_pair = set_cookie.split(";", 1)[0]
+
+                # 5) Cookie-authenticated GET / and GET /api/overview return full dashboard & tunnel URL!
+                dash_req = urllib.request.Request(f"{base}/", headers={"Cookie": cookie_pair})
+                with urllib.request.urlopen(dash_req, timeout=5) as resp:
+                    self.assertIn('id="kpi-alerts"', resp.read().decode("utf-8"))
+
+                ov_req = urllib.request.Request(f"{base}/api/overview", headers={"Cookie": cookie_pair})
+                with urllib.request.urlopen(ov_req, timeout=5) as resp:
+                    ov = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(ov["auth_enabled"])
+                self.assertTrue(ov["tunnel"]["alive"])
+                self.assertEqual(ov["tunnel"]["url"], "https://mobile-radar-link.trycloudflare.com")
+
+                # 6) POST /api/actions/send-tunnel-link triggers Telegram send
+                with mock.patch.object(tunnel_manager, "send_tunnel_link_telegram", return_value=True) as m_send:
+                    link_req = urllib.request.Request(
+                        f"{base}/api/actions/send-tunnel-link",
+                        data=b"{}",
+                        headers={"Cookie": cookie_pair, "Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(link_req, timeout=5) as resp:
+                        self.assertTrue(json.loads(resp.read().decode("utf-8"))["ok"])
+                    m_send.assert_called_once()
+
+                # 7) POST /api/config toggles tunnel_enabled=False
+                cfg_req = urllib.request.Request(
+                    f"{base}/api/config",
+                    data=json.dumps({"tunnel_enabled": False}).encode("utf-8"),
+                    headers={"Cookie": cookie_pair, "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(cfg_req, timeout=5) as resp:
+                    cfg_out = json.loads(resp.read().decode("utf-8"))
+                self.assertFalse(cfg_out["config"]["tunnel_enabled"])
+
+                # 8) POST /api/auth/logout clears cookie
+                out_req = urllib.request.Request(
+                    f"{base}/api/auth/logout",
+                    data=b"{}",
+                    headers={"Cookie": cookie_pair, "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(out_req, timeout=5) as resp:
+                    self.assertIn("Max-Age=0", resp.headers.get("Set-Cookie") or "")
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

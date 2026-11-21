@@ -34,10 +34,28 @@ fi
 chmod 600 "${REPO_DIR}/.env"
 chmod +x "${SCRIPT_DIR}/update.sh" "${SCRIPT_DIR}/install.sh" || true
 
+TUNNEL_RAW="$(grep -E '^DASHBOARD_TUNNEL_ENABLED=' "${REPO_DIR}/.env" | tail -n 1 | cut -d= -f2- | tr -d ' "\r' | tr '[:upper:]' '[:lower:]' || true)"
+TUNNEL_ENABLED=1
+if [ "${TUNNEL_RAW}" = "0" ] || [ "${TUNNEL_RAW}" = "false" ] || [ "${TUNNEL_RAW}" = "no" ] || [ "${TUNNEL_RAW}" = "off" ]; then
+  TUNNEL_ENABLED=0
+fi
+
+PW_INFO=""
+if [ "${TUNNEL_ENABLED}" = "1" ]; then
+  PW_OUT="$("${PYTHON_BIN}" "${REPO_DIR}/tunnel_manager.py" --data-dir "${REPO_DIR}/data" --ensure-password || true)"
+  PW_STATUS="$(printf '%s\n' "${PW_OUT}" | awk -F= '/^STATUS=/{print $2; exit}')"
+  PW_VAL="$(printf '%s\n' "${PW_OUT}" | awk -F= '/^PASSWORD=/{print $2; exit}')"
+  if [ "${PW_STATUS}" = "CREATED" ] && [ -n "${PW_VAL}" ]; then
+    PW_INFO="${PW_VAL} (자동 생성됨 — 텔레그램으로도 안내됩니다)"
+  elif [ -n "${PW_VAL}" ]; then
+    PW_INFO="${PW_VAL}"
+  fi
+fi
+
 UNIT_DIR="${HOME}/.config/systemd/user"
 mkdir -p "${UNIT_DIR}"
 
-for svc in news-alpha-radar.service news-alpha-dashboard.service news-alpha-updater.service news-alpha-updater.timer news-alpha-telegram.service; do
+for svc in news-alpha-radar.service news-alpha-dashboard.service news-alpha-updater.service news-alpha-updater.timer news-alpha-telegram.service news-alpha-tunnel.service; do
   sed \
     -e "s|__WORKDIR__|${REPO_DIR}|g" \
     -e "s|__PYTHON__|${PYTHON_BIN}|g" \
@@ -48,6 +66,23 @@ done
 systemctl --user daemon-reload
 systemctl --user enable --now news-alpha-radar.service news-alpha-dashboard.service news-alpha-updater.timer
 systemctl --user restart news-alpha-radar.service news-alpha-dashboard.service
+
+TUNNEL_URL_MSG="비활성화됨 (DASHBOARD_TUNNEL_ENABLED=false)"
+if [ "${TUNNEL_ENABLED}" = "1" ]; then
+  systemctl --user enable --now news-alpha-tunnel.service
+  systemctl --user restart news-alpha-tunnel.service
+  TUNNEL_URL_MSG="발급 중... (수 초 내 텔레그램으로 자동 전송됩니다)"
+  for _ in $(seq 1 18); do
+    if [ -f "${REPO_DIR}/data/tunnel_status.json" ]; then
+      FOUND_URL="$("${PYTHON_BIN}" -c "import json, pathlib; p=pathlib.Path('${REPO_DIR}/data/tunnel_status.json'); d=json.loads(p.read_text()) if p.exists() else {}; print(d.get('url') or '')" 2>/dev/null || true)"
+      if [ -n "${FOUND_URL}" ]; then
+        TUNNEL_URL_MSG="${FOUND_URL} (텔레그램으로도 자동 전송됨)"
+        break
+      fi
+    fi
+    sleep 0.5
+  done
+fi
 
 # 선택 기능: TELEGRAM_API_ID & TELEGRAM_API_HASH가 설정되어 있으면 실시간 콜백용 .venv 준비
 TG_API_ID="$(grep -E '^TELEGRAM_API_ID=' "${REPO_DIR}/.env" | tail -n 1 | cut -d= -f2- | tr -d ' "\r' || true)"
@@ -80,10 +115,13 @@ LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || echo '127.0.0.1')"
 
 echo ""
 echo "============================================================"
-echo " News Alpha Radar 상시 서버 + 웹 대시보드 + 자동 업데이트 완료!"
+echo " News Alpha Radar 상시 서버 + 웹 대시보드 + 외부접속 설정 완료!"
 echo "============================================================"
-echo " • 로컬 대시보드   : http://127.0.0.1:${PORT}"
-echo " • 맥북/폰 접속    : http://${LAN_IP}:${PORT}"
+echo " • 집 와이파이 접속 : http://${LAN_IP}:${PORT}"
+echo " • LTE/외부 접속    : ${TUNNEL_URL_MSG}"
+if [ -n "${PW_INFO}" ]; then
+  echo " • 대시보드 비밀번호: ${PW_INFO}"
+fi
 echo " • GitHub 자동반영 : 2분마다 main 체크 (news-alpha-updater.timer 활성)"
 echo " • 텔레그램 콜백   : ${TG_STATE}"
 if [ -n "${TG_API_ID}" ] && [ -n "${TG_API_HASH}" ] && [ ! -f "${REPO_DIR}/data/telegram_user.session" ]; then
@@ -93,6 +131,6 @@ if [ -n "${TG_API_ID}" ] && [ -n "${TG_API_HASH}" ] && [ ! -f "${REPO_DIR}/data/
   echo "   systemctl --user enable --now news-alpha-telegram.service"
 fi
 echo ""
-echo " • 상태 확인       : systemctl --user status news-alpha-radar news-alpha-dashboard news-alpha-updater.timer"
+echo " • 상태 확인       : systemctl --user status news-alpha-radar news-alpha-dashboard news-alpha-tunnel news-alpha-updater.timer"
 echo " • 실시간 로그     : journalctl --user -u news-alpha-radar -f"
 echo "============================================================"
