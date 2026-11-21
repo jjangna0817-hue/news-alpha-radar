@@ -28,6 +28,7 @@ _APP_ENV_PREFIXES = (
     "MAX_BULLISH_PREPRICED_", "OFFHOURS_DIGEST_", "STOCK_DEDUP_",
     "THEME_COOLDOWN_", "DEDUP_MODE", "TRIGGER_MODE", "STAGE1_DAILY_",
     "INSTANT_FLASH_", "EXTRA_RSS_", "MARKET_LOOP_",
+    "AUTOTRADE_", "KIS_",
     "GITHUB_EVENT_SCHEDULE", "GITHUB_STEP_SUMMARY",
 )
 _SAVED_ENV: dict[str, str] = {}
@@ -2820,5 +2821,428 @@ class TestQuotaConservationDigestResilienceAndLiquidity(unittest.TestCase):
                 srv.server_close()
 
 
+class TestPaperAutoTraderAndKISVTS(unittest.TestCase):
+    def test_second_order_entry_filter_slippage_and_liquidity_cap(self) -> None:
+        import paper_trader
+
+        # 1) Candidate filter blocks 1차 직접, 단기테마성, and 하락주의 while allowing 2차 파급 + 본업직결/부분연관
+        self.assertFalse(
+            paper_trader.is_second_order_candidate(
+                {"code": "005930", "name": "삼성전자", "direction": "상승수혜", "order_tier": "1차 직접", "revenue_link": "본업직결"}
+            )
+        )
+        self.assertFalse(
+            paper_trader.is_second_order_candidate(
+                {"code": "999999", "name": "테마주", "direction": "상승수혜", "order_tier": "2차 파급", "revenue_link": "단기테마성"}
+            )
+        )
+        self.assertFalse(
+            paper_trader.is_second_order_candidate(
+                {"code": "011200", "name": "HMM", "direction": "하락주의", "order_tier": "2차 파급", "revenue_link": "본업직결"}
+            )
+        )
+        self.assertTrue(
+            paper_trader.is_second_order_candidate(
+                {"code": "263860", "name": "지니언스", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}
+            )
+        )
+
+        # 2) Intraday buy applies KRX tick slippage, 0.015% buy fee, and 1% liquidity cap
+        t_buy = datetime(2026, 11, 20, 10, 5, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+            sent_tg: list[str] = []
+
+            # Daily turnover 6억 -> 1% position cap = 6,000,000원, order budget 1,000,000원 -> ~1,000,000원 used.
+            # Now test smaller turnover 8억 with order_amount=10,000,000원 -> capped to 8,000,000원 (1% of 8억)!
+            quotes = {
+                "005930": radar.StockQuote("005930", 70000, 1000, 1.5, 500000, "OPEN", "", trading_value=50_000_000_000),
+                "263860": radar.StockQuote(
+                    "263860",
+                    10000,
+                    150,
+                    1.5,
+                    80000,
+                    "OPEN",
+                    "🟢 미반영/초입 구간",
+                    trading_value=800_000_000,
+                    prev_trading_value=600_000_000,
+                ),
+            }
+            res = trader.on_alert_candidates(
+                alert_ts=t_buy,
+                theme_key="통신망_해킹",
+                sector="사이버보안",
+                title="통신망 해킹 → 보안솔루션 2차 수혜",
+                catalyst_score=8.8,
+                stocks=[
+                    {"code": "005930", "name": "삼성전자", "direction": "상승수혜", "order_tier": "1차 직접", "revenue_link": "본업직결"},
+                    {"code": "263860", "name": "지니언스", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                ],
+                quotes=quotes,
+                runtime_cfg={"autotrade_enabled": True, "autotrade_order_amount_krw": 10_000_000},
+                daemon_mode=True,
+                send_fn=sent_tg.append,
+            )
+            self.assertIsNotNone(res)
+            assert res is not None
+            self.assertEqual(res["action"], "bought")
+            pos = res["position"]
+            self.assertEqual(pos["code"], "263860")  # 1차 직접(005930) skipped, 2차 파급(263860) bought!
+            # 10,000원 in <15억 liquidity -> +3 ticks * 10원 = 10,030원 fill price
+            self.assertEqual(pos["avg_buy_price"], 10030)
+            # Capped by 1% of 8억 = 8,000,000원 (not 9,800,000원)
+            self.assertLessEqual(pos["invested_krw"], 8_010_000)
+            self.assertGreater(pos["invested_krw"], 7_900_000)
+            self.assertEqual(len(sent_tg), 1)
+            self.assertIn("[모의 자동매수 체결]", sent_tg[0])
+
+            # Same code on same day is NOT bought a second time
+            dup_res = trader.on_alert_candidates(
+                alert_ts=t_buy + timedelta(minutes=10),
+                theme_key="통신망_해킹_후속",
+                sector="사이버보안",
+                title="후속 기사",
+                catalyst_score=9.1,
+                stocks=[{"code": "263860", "name": "지니언스", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                quotes=quotes,
+                daemon_mode=True,
+            )
+            self.assertIsNone(dup_res)
+
+    def test_premarket_queue_buys_calm_open_and_cancels_gap_up(self) -> None:
+        import paper_trader
+
+        t_digest = datetime(2026, 11, 20, 7, 50, tzinfo=KST)
+        t_open = datetime(2026, 11, 20, 9, 2, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+            sent_tg: list[str] = []
+
+            # Queue 2 premarket candidates at 07:50
+            q1 = trader.on_alert_candidates(
+                alert_ts=t_digest,
+                theme_key="변압기_수주",
+                sector="전력기기·전선",
+                title="북미 변압기 공급 부족",
+                catalyst_score=8.7,
+                stocks=[{"code": "267260", "name": "HD현대일렉트릭", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                quotes={},
+                daemon_mode=True,
+                send_fn=sent_tg.append,
+            )
+            q2 = trader.on_alert_candidates(
+                alert_ts=t_digest,
+                theme_key="전파탐지_이슈",
+                sector="전파·물리보안",
+                title="시험장 전파차단 의무화",
+                catalyst_score=8.4,
+                stocks=[{"code": "446840", "name": "지슨", "direction": "상승수혜", "order_tier": "2차 파급", "revenue_link": "본업직결"}],
+                quotes={},
+                daemon_mode=True,
+                send_fn=sent_tg.append,
+            )
+            self.assertEqual(q1["action"], "queued_for_open")  # type: ignore[index]
+            self.assertEqual(q2["action"], "queued_for_open")  # type: ignore[index]
+            self.assertEqual(len(sent_tg), 0)  # No premature buy before 09:01!
+
+            # At 09:02: 267260 opens calmly (+1.8%, 50억) -> BOUGHT; 446840 gaps up (+12.5%) -> CANCELLED!
+            open_quotes = {
+                "267260": radar.StockQuote("267260", 50000, 900, 1.8, 100000, "OPEN", "", trading_value=5_000_000_000),
+                "446840": radar.StockQuote("446840", 11250, 1250, 12.5, 100000, "OPEN", "", trading_value=1_500_000_000),
+            }
+            tick_res = trader.tick_positions(
+                now=t_open,
+                daemon_mode=True,
+                fetch_quotes_fn=lambda codes: {c: open_quotes[c] for c in codes if c in open_quotes},
+                send_fn=sent_tg.append,
+            )
+            self.assertEqual(tick_res, {"bought": 1, "sold": 0})
+            ov = trader.build_overview(now=t_open)
+            self.assertEqual([p["code"] for p in ov["positions"]], ["267260"])
+            self.assertEqual(ov["pending_open_entries"], [])
+            self.assertEqual(len(sent_tg), 1)
+            self.assertIn("HD현대일렉트릭(267260)", sent_tg[0])
+
+    def test_exit_engine_trailing_stop_stoploss_and_eod_liquidation(self) -> None:
+        import paper_trader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+            trace = radar.TraceLogger(tmp_dir / "trace.jsonl")
+            sent_tg: list[str] = []
+
+            # Buy 3 positions at 09:30 (50억+ turnover -> 1 tick slippage)
+            t0 = datetime(2026, 11, 20, 9, 30, tzinfo=KST)
+            for idx, (code, name) in enumerate([("100001", "트레일링주"), ("100002", "손절주"), ("100003", "장마감주")]):
+                trader.on_alert_candidates(
+                    alert_ts=t0 + timedelta(minutes=idx),
+                    theme_key=f"테마_{idx}",
+                    sector="사이버보안",
+                    title=f"이슈 {idx}",
+                    catalyst_score=8.5,
+                    stocks=[{"code": code, "name": name, "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                    quotes={code: radar.StockQuote(code, 10000, 100, 1.0, 600000, "OPEN", "", trading_value=6_000_000_000)},
+                    daemon_mode=True,
+                    send_fn=sent_tg.append,
+                    trace=trace,
+                )
+            self.assertEqual(len(trader.load_account(t0)["positions"]), 3)
+
+            # 1) 10:00 -> 100001 rises to 10,600 (+5.9% vs 10,010 buy) -> arms trailing stop, does NOT sell yet!
+            #    100002 drops to 9,650 (-3.6% vs 10,010 buy) -> triggers -3.0% hard stop-loss!
+            t1 = datetime(2026, 11, 20, 10, 0, tzinfo=KST)
+            r1 = trader.tick_positions(
+                now=t1,
+                daemon_mode=True,
+                fetch_quotes_fn=lambda codes: {
+                    "100001": radar.StockQuote("100001", 10600, 700, 7.0, 700000, "OPEN", "", trading_value=7_000_000_000),
+                    "100002": radar.StockQuote("100002", 9650, -250, -2.5, 650000, "OPEN", "", trading_value=6_500_000_000),
+                    "100003": radar.StockQuote("100003", 10150, 250, 2.5, 600000, "OPEN", "", trading_value=6_000_000_000),
+                },
+                send_fn=sent_tg.append,
+                trace=trace,
+            )
+            self.assertEqual(r1, {"bought": 0, "sold": 1})
+            acc1 = trader.load_account(t1)
+            self.assertTrue(acc1["positions"]["100001"]["trailing_armed"])
+            self.assertNotIn("100002", acc1["positions"])
+
+            # 2) 10:20 -> 100001 surges to 11,100 (+10.89% peak), still rising -> held!
+            t2 = datetime(2026, 11, 20, 10, 20, tzinfo=KST)
+            r2 = trader.tick_positions(
+                now=t2,
+                daemon_mode=True,
+                fetch_quotes_fn=lambda codes: {
+                    "100001": radar.StockQuote("100001", 11100, 1200, 12.1, 800000, "OPEN", "", trading_value=8_000_000_000),
+                    "100003": radar.StockQuote("100003", 10200, 300, 3.0, 620000, "OPEN", "", trading_value=6_200_000_000),
+                },
+                send_fn=sent_tg.append,
+                trace=trace,
+            )
+            self.assertEqual(r2, {"bought": 0, "sold": 0})
+            self.assertEqual(trader.load_account(t2)["positions"]["100001"]["highest_price"], 11100)
+
+            # 3) 10:35 -> 100001 pulls back from 11,100 to 10,820 (-2.52% pullback >= 2.0% trailing) -> trailing profit exit!
+            t3 = datetime(2026, 11, 20, 10, 35, tzinfo=KST)
+            r3 = trader.tick_positions(
+                now=t3,
+                daemon_mode=True,
+                fetch_quotes_fn=lambda codes: {
+                    "100001": radar.StockQuote("100001", 10820, 920, 9.3, 850000, "OPEN", "", trading_value=8_500_000_000),
+                    "100003": radar.StockQuote("100003", 10200, 300, 3.0, 620000, "OPEN", "", trading_value=6_200_000_000),
+                },
+                send_fn=sent_tg.append,
+                trace=trace,
+            )
+            self.assertEqual(r3, {"bought": 0, "sold": 1})
+
+            # 4) 15:15 -> 100003 liquidated by EOD rule!
+            t4 = datetime(2026, 11, 20, 15, 15, tzinfo=KST)
+            r4 = trader.tick_positions(
+                now=t4,
+                daemon_mode=True,
+                fetch_quotes_fn=lambda codes: {
+                    "100003": radar.StockQuote("100003", 10180, 280, 2.8, 700000, "OPEN", "", trading_value=7_000_000_000),
+                },
+                send_fn=sent_tg.append,
+                trace=trace,
+            )
+            self.assertEqual(r4, {"bought": 0, "sold": 1})
+
+            ov = trader.build_overview(now=t4)
+            self.assertEqual(ov["positions"], [])
+            self.assertEqual(ov["trade_count"], 3)
+            self.assertEqual(ov["win_count"], 2)
+            self.assertEqual(ov["loss_count"], 1)
+            reasons = [tr["exit_reason"] for tr in ov["recent_trades"]]
+            self.assertTrue(any("장마감 시간청산" in r for r in reasons))
+            self.assertTrue(any("트레일링 익절" in r for r in reasons))
+            self.assertTrue(any("손절" in r for r in reasons))
+
+    def test_kis_vts_client_mocked_token_cache_and_vts_orders(self) -> None:
+        import paper_trader
+
+        now = datetime(2026, 11, 20, 10, 0, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            (tmp_dir / ".env").write_text(
+                "KIS_APP_KEY=PS_MOCK_KEY_12345\nKIS_APP_SECRET= MOCK_SECRET_67890 \nKIS_CANO=50123456-01\n",
+                encoding="utf-8",
+            )
+            creds = paper_trader.resolve_kis_credentials(tmp_dir)
+            self.assertEqual(creds["configured"], "true")
+            self.assertEqual(creds["cano"], "50123456")
+            self.assertEqual(creds["acnt_prdt_cd"], "01")
+            self.assertEqual(creds["cano_masked"], "5012****-01")
+
+            called_reqs: list[tuple[str, str, dict[str, str]]] = []
+
+            def fake_kis_http(req, timeout=0):
+                url = req.full_url
+                hdrs = {k.lower(): v for k, v in req.header_items()}
+                called_reqs.append((req.get_method(), url, hdrs))
+                # Hard safety check: EVERY request must target openapivts.koreainvestment.com:29443!
+                self.assertTrue(url.startswith("https://openapivts.koreainvestment.com:29443/"))
+                if url.endswith("/oauth2/tokenP"):
+                    return _FakeResponse({"access_token": "vts_tok_abc", "expires_in": 86400})
+                if "/uapi/domestic-stock/v1/trading/order-cash" in url:
+                    return _FakeResponse({"rt_cd": "0", "msg1": "모의주문 접수 완료", "output": {"ODNO": "0009876"}})
+                if "/uapi/domestic-stock/v1/trading/inquire-balance" in url:
+                    return _FakeResponse(
+                        {
+                            "rt_cd": "0",
+                            "output1": [{"pdno": "263860", "hldg_qty": "10"}],
+                            "output2": [{"dnca_tot_amt": "9500000", "tot_evlu_amt": "10120000", "evlu_pfls_smtl_amt": "120000"}],
+                        }
+                    )
+                raise AssertionError(f"Unexpected URL: {url}")
+
+            client = paper_trader.KISPaperClient(creds, tmp_dir)
+            with mock.patch("urllib.request.urlopen", side_effect=fake_kis_http):
+                ok_buy, odno_buy, _ = client.place_market_order(side="buy", code="263860", qty=10, now=now)
+                ok_sell, odno_sell, _ = client.place_market_order(side="sell", code="263860", qty=10, now=now + timedelta(minutes=5))
+                bal = client.inquire_balance(now=now + timedelta(minutes=6))
+
+            self.assertTrue(ok_buy)
+            self.assertEqual(odno_buy, "0009876")
+            self.assertTrue(ok_sell)
+            self.assertEqual(odno_sell, "0009876")
+            self.assertEqual(bal["total_equity_krw"], 10120000)
+
+            # Token issued ONCE and reused from kis_token_vts.json for all 3 API calls!
+            token_calls = [u for _, u, _ in called_reqs if u.endswith("/oauth2/tokenP")]
+            self.assertEqual(len(token_calls), 1)
+            order_tr_ids = [h["tr_id"] for _, u, h in called_reqs if "order-cash" in u]
+            self.assertEqual(order_tr_ids, ["VTTC0802U", "VTTC0801U"])
+
+    def test_e2e_run_live_autotrader_and_dashboard_autotrade_endpoints(self) -> None:
+        import threading as _th
+        import dashboard
+
+        t_live = datetime(2026, 11, 20, 10, 12, tzinfo=KST)
+        comps = {c["code"]: dict(c) for c in radar.SEED_COMPANIES}
+        item = radar.NewsItem(
+            "대형 통신사 유심 서버 해킹 발생… 보안 관제 긴급 도입",
+            "https://ex.com/hack_auto_1",
+            "연합뉴스_IT",
+            "IT/과학",
+            first_seen=t_live.isoformat(),
+        )
+
+        def fake_gemini(api_key, models, sp, up, **kw):
+            if sp == radar.SCREENING_PROMPT:
+                cid = json.loads(up)["clusters"][0]["cluster_id"]
+                return {
+                    "selected_events": [
+                        {
+                            "cluster_id": cid,
+                            "catalyst_score": 8.9,
+                            "theme_key": "통신해킹_보안수혜",
+                            "second_order_keywords": ["네트워크 접근제어", "EDR"],
+                        }
+                    ]
+                }, "gemini-2.5-flash-lite"
+            return {
+                "title": "통신사 유심 해킹 → EDR·접근제어 2차 수혜",
+                "event_summary": "해킹 사고로 보안 솔루션 긴급 발주",
+                "stocks": [
+                    {"code": "005930", "name": "삼성전자", "direction": "상승수혜", "order_tier": "1차 직접", "revenue_link": "본업직결"},
+                    {"code": "263860", "name": "지니언스", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                ],
+            }, "gemini-2.5-flash"
+
+        q_live = {
+            "005930": radar.StockQuote("005930", 70000, 700, 1.0, 500000, "OPEN", "", trading_value=30_000_000_000),
+            "263860": radar.StockQuote("263860", 12000, 180, 1.5, 250000, "OPEN", "🟢 미반영/초입 구간", trading_value=2_500_000_000),
+        }
+        q_higher = {
+            "263860": radar.StockQuote("263860", 12650, 830, 7.0, 320000, "OPEN", "", trading_value=3_500_000_000),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            sent_msgs: list[str] = []
+            env = {
+                "GEMINI_API_KEY": "k",
+                "TELEGRAM_BOT_TOKEN": "t",
+                "TELEGRAM_CHAT_ID": "c",
+                "INSTANT_FLASH_ALERT": "false",
+                "TRIGGER_MODE": "shadow",
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.object(radar, "fetch_rss_news", return_value=[item]),
+                mock.patch.object(radar, "call_gemini", side_effect=fake_gemini),
+                mock.patch.object(radar, "load_krx_master", return_value=comps),
+                mock.patch.object(radar, "fetch_naver_quotes", return_value=q_live),
+                mock.patch.object(radar, "send_telegram", side_effect=lambda t, c, m, start_chunk=0: sent_msgs.append(m) or 1),
+            ):
+                radar.run_live(dry_run=False, cycles=1, data_dir=tmp_dir, now_fn=lambda: t_live, daemon_mode=True)
+
+            # Message 0 = Stage 2 Radar report, Message 1 = Paper Auto-Buy execution alert!
+            self.assertEqual(len(sent_msgs), 2)
+            self.assertIn("[모의 자동매수 체결]", sent_msgs[1])
+            self.assertIn("지니언스(263860)", sent_msgs[1])
+
+            srv = dashboard.create_dashboard_server("127.0.0.1", 0, data_dir=tmp_dir, password="")
+            port = srv.server_address[1]
+            th = _th.Thread(target=srv.serve_forever, daemon=True)
+            th.start()
+            base = f"http://127.0.0.1:{port}"
+            try:
+                # 1) GET /api/overview exposes open position in autotrade
+                with urllib.request.urlopen(f"{base}/api/overview", timeout=5) as resp:
+                    ov = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(len(ov["autotrade"]["positions"]), 1)
+                self.assertEqual(ov["autotrade"]["positions"][0]["code"], "263860")
+
+                # 2) POST /api/config updates autotrade rules cleanly
+                req_cfg = urllib.request.Request(
+                    f"{base}/api/config",
+                    data=json.dumps({"autotrade_take_profit_pct": 6.5, "autotrade_order_amount_krw": 1_500_000}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_cfg, timeout=5) as resp:
+                    cfg_saved = json.loads(resp.read().decode("utf-8"))["config"]
+                self.assertEqual(cfg_saved["autotrade_take_profit_pct"], 6.5)
+                self.assertEqual(cfg_saved["autotrade_order_amount_krw"], 1_500_000)
+
+                # 3) POST /api/actions/autotrade/close liquidates position at q_higher (+5% profit)
+                with mock.patch.object(radar, "fetch_naver_quotes", return_value=q_higher):
+                    req_close = urllib.request.Request(
+                        f"{base}/api/actions/autotrade/close",
+                        data=json.dumps({"code": "ALL"}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req_close, timeout=5) as resp:
+                        close_res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(close_res["ok"])
+                self.assertEqual(close_res["result"]["closed_count"], 1)
+                self.assertEqual(close_res["autotrade"]["positions"], [])
+                self.assertGreater(close_res["autotrade"]["realized_pnl_krw"], 0)
+
+                # 4) POST /api/actions/autotrade/reset restores 10,000,000원 clean slate
+                req_reset = urllib.request.Request(
+                    f"{base}/api/actions/autotrade/reset",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_reset, timeout=5) as resp:
+                    reset_res = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(reset_res["autotrade"]["cash_krw"], 10_000_000)
+                self.assertEqual(reset_res["autotrade"]["trade_count"], 0)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

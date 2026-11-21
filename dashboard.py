@@ -31,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import paper_trader
 import radar
 import telegram_listener
 import tunnel_manager
@@ -79,6 +80,7 @@ def _verify_session_token(token: str, password: str, *, now_ts: int | None = Non
 def _effective_config(data_dir: Path) -> dict[str, Any]:
     raw = radar.load_runtime_config(data_dir)
     limits = radar.resolve_alert_limits(raw, daemon_mode=True)
+    at_cfg = paper_trader.resolve_autotrade_config(raw, daemon_mode=True)
     default_feeds = [
         f["name"]
         for f in (radar.resolve_active_feeds(None, daemon_mode=True) or radar.RSS_FEEDS)
@@ -147,14 +149,18 @@ def _effective_config(data_dir: Path) -> dict[str, Any]:
                 else radar._env_float("MAX_BULLISH_PREPRICED_PCT", radar.DEFAULT_MAX_BULLISH_PREPRICED_PCT)
             ),
         ),
-        "min_trading_value_eok": max(
-            0.0,
-            float(
-                raw["min_trading_value_eok"]
-                if raw.get("min_trading_value_eok") is not None
-                else radar._env_float("MIN_TRADING_VALUE_EOK", radar.DEFAULT_MIN_TRADING_VALUE_EOK)
-            ),
-        ),
+        "min_trading_value_eok": float(at_cfg["min_trading_value_eok"]),
+        "autotrade_enabled": bool(at_cfg["autotrade_enabled"]),
+        "autotrade_only_second_order": bool(at_cfg["autotrade_only_second_order"]),
+        "autotrade_order_amount_krw": int(at_cfg["autotrade_order_amount_krw"]),
+        "autotrade_max_positions": int(at_cfg["autotrade_max_positions"]),
+        "autotrade_min_change_pct": float(at_cfg["autotrade_min_change_pct"]),
+        "autotrade_max_change_pct": float(at_cfg["autotrade_max_change_pct"]),
+        "autotrade_take_profit_pct": float(at_cfg["autotrade_take_profit_pct"]),
+        "autotrade_trailing_stop_pct": float(at_cfg["autotrade_trailing_stop_pct"]),
+        "autotrade_stop_loss_pct": float(at_cfg["autotrade_stop_loss_pct"]),
+        "autotrade_eod_exit_enabled": bool(at_cfg["autotrade_eod_exit_enabled"]),
+        "autotrade_eod_exit_time": str(at_cfg["autotrade_eod_exit_time"]),
         "max_alerts_per_window": int(
             raw["max_alerts_per_window"]
             if raw.get("max_alerts_per_window") is not None
@@ -411,6 +417,7 @@ def build_overview_payload(
 
     perf_records = radar.PerformanceTracker(data_dir / "performance.jsonl").load_records()
     perf_summary = radar.summarize_performance(perf_records, recent_limit=50)
+    autotrade_summary = paper_trader.PaperAutoTrader(data_dir, REPO_DIR).build_overview(now=ref, runtime_cfg=cfg)
     today_str = ref.strftime("%Y-%m-%d")
 
     return {
@@ -451,6 +458,7 @@ def build_overview_payload(
         "deferred": deferred_summary,
         "overnight_queue": overnight_summary,
         "performance": perf_summary,
+        "autotrade": autotrade_summary,
         "feeds": feeds_info,
     }
 
@@ -518,6 +526,34 @@ def validate_and_merge_config(data_dir: Path, patch: dict[str, Any]) -> dict[str
         cur["max_bullish_prepriced_pct"] = round(max(0.0, min(30.0, float(patch["max_bullish_prepriced_pct"]))), 1)
     if "min_trading_value_eok" in patch:
         cur["min_trading_value_eok"] = round(max(0.0, min(500.0, float(patch["min_trading_value_eok"]))), 1)
+    if "autotrade_enabled" in patch:
+        cur["autotrade_enabled"] = bool(patch["autotrade_enabled"])
+    if "autotrade_only_second_order" in patch:
+        cur["autotrade_only_second_order"] = bool(patch["autotrade_only_second_order"])
+    if "autotrade_order_amount_krw" in patch:
+        cur["autotrade_order_amount_krw"] = max(100_000, min(50_000_000, int(patch["autotrade_order_amount_krw"])))
+    if "autotrade_max_positions" in patch:
+        cur["autotrade_max_positions"] = max(1, min(15, int(patch["autotrade_max_positions"])))
+    if "autotrade_min_change_pct" in patch:
+        cur["autotrade_min_change_pct"] = round(max(-15.0, min(15.0, float(patch["autotrade_min_change_pct"]))), 1)
+    if "autotrade_max_change_pct" in patch:
+        cur["autotrade_max_change_pct"] = round(max(-10.0, min(25.0, float(patch["autotrade_max_change_pct"]))), 1)
+    if cur["autotrade_min_change_pct"] > cur["autotrade_max_change_pct"]:
+        cur["autotrade_min_change_pct"], cur["autotrade_max_change_pct"] = (
+            cur["autotrade_max_change_pct"],
+            cur["autotrade_min_change_pct"],
+        )
+    if "autotrade_take_profit_pct" in patch:
+        cur["autotrade_take_profit_pct"] = round(max(0.5, min(30.0, abs(float(patch["autotrade_take_profit_pct"])))), 1)
+    if "autotrade_trailing_stop_pct" in patch:
+        cur["autotrade_trailing_stop_pct"] = round(min(15.0, abs(float(patch["autotrade_trailing_stop_pct"]))), 1)
+    if "autotrade_stop_loss_pct" in patch:
+        cur["autotrade_stop_loss_pct"] = round(max(0.5, min(20.0, abs(float(patch["autotrade_stop_loss_pct"])))), 1)
+    if "autotrade_eod_exit_enabled" in patch:
+        cur["autotrade_eod_exit_enabled"] = bool(patch["autotrade_eod_exit_enabled"])
+    if "autotrade_eod_exit_time" in patch:
+        eh, em = radar._parse_hhmm(str(patch["autotrade_eod_exit_time"]), default=(15, 15))
+        cur["autotrade_eod_exit_time"] = f"{eh:02d}:{em:02d}"
     if "max_alerts_per_window" in patch:
         cur["max_alerts_per_window"] = max(1, min(10, int(patch["max_alerts_per_window"])))
     if "theme_cooldown_hours" in patch:
@@ -1298,6 +1334,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <nav class="tabs" role="tablist">
       <button class="tab-btn active" data-tab="alerts" role="tab" type="button">최근 알림 &amp; 재시도 큐</button>
+      <button class="tab-btn" data-tab="autotrade" role="tab" type="button">모의 자동매매</button>
       <button class="tab-btn" data-tab="performance" role="tab" type="button">알림 성과 (수익률)</button>
       <button class="tab-btn" data-tab="settings" role="tab" type="button">운영 설정 &amp; 피드 관리</button>
       <button class="tab-btn" data-tab="feeds" role="tab" type="button">피드 상태 &amp; 실시간 점검</button>
@@ -1327,6 +1364,174 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <span class="muted">Stage 2 실패·텔레그램 부분 실패·한도 초과 시 자동 재시도</span>
         </div>
         <div id="deferred-container"></div>
+      </div>
+    </section>
+
+    <section id="tab-autotrade" class="tab-panel">
+      <div class="card" style="margin-bottom: 16px;">
+        <div class="section-head" style="margin-bottom: 6px;">
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <span id="at-mode-badge" class="badge ok">자동매매 켜짐</span>
+            <h2 id="at-broker-label">내장 실전형 가상 모의계좌</h2>
+          </div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button id="btn-at-close-all" type="button">보유 종목 전량 청산</button>
+            <button id="btn-at-reset" type="button">모의계좌 초기화</button>
+          </div>
+        </div>
+        <div id="at-broker-sub" class="muted">별도 가입 없이 1,000만 원 가상 모의계좌로 즉시 작동 중 · .env에 한국투자증권 모의투자 키(KIS_APP_KEY 등)를 넣으면 공식 모의계좌로 자동 전환됩니다.</div>
+      </div>
+
+      <div class="kpi-grid" style="margin-bottom: 16px;">
+        <article class="card">
+          <div class="kpi-label"><span>총 평가자산</span><span id="at-equity-badge" class="badge">-</span></div>
+          <div id="at-equity" class="kpi-value">-</div>
+          <div id="at-equity-sub" class="kpi-sub">초기 자본 대비</div>
+        </article>
+        <article class="card">
+          <div class="kpi-label"><span>주문가능 예수금</span><span id="at-pos-count-badge" class="badge">보유 0종목</span></div>
+          <div id="at-cash" class="kpi-value">-</div>
+          <div id="at-cash-sub" class="kpi-sub">보유 주식 평가금 확인 중</div>
+        </article>
+        <article class="card">
+          <div class="kpi-label"><span>누적 실현 순손익</span><span class="badge">수수료·세금 차감</span></div>
+          <div id="at-realized" class="kpi-value">-</div>
+          <div id="at-realized-sub" class="kpi-sub">금일 실현손익 확인 중</div>
+        </article>
+        <article class="card">
+          <div class="kpi-label"><span>모의매매 승률</span><span id="at-trades-badge" class="badge">0전</span></div>
+          <div id="at-winrate" class="kpi-value">-</div>
+          <div id="at-winrate-sub" class="kpi-sub">승 / 패 집계 대기 중</div>
+        </article>
+      </div>
+
+      <div class="card" style="margin-bottom: 16px;">
+        <div class="section-head">
+          <h2>현재 보유 포지션</h2>
+          <span class="muted">장중 10초마다 고점 트레일링 · 칼손절 · 장마감 청산 자동 감시</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>매수 시각</th>
+                <th>종목</th>
+                <th>구분</th>
+                <th>수량</th>
+                <th>매수단가 → 현재가</th>
+                <th>순평가손익 (최고점)</th>
+                <th>트레일링</th>
+                <th>관리</th>
+              </tr>
+            </thead>
+            <tbody id="at-positions-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="at-pending-card" class="card" style="margin-bottom: 16px; display: none;">
+        <div class="section-head">
+          <h2>장전 후보 09:01 시초 진입 대기열</h2>
+          <span class="muted">개장 직후 시초가가 허용 등락률 범위일 때만 진입 (갭상승 과열 종목은 자동 취소)</span>
+        </div>
+        <div id="at-pending-body"></div>
+      </div>
+
+      <div class="card" style="margin-bottom: 16px;">
+        <form id="autotrade-form">
+          <div class="section-head">
+            <h2>모의 자동매매 진입·청산 규칙</h2>
+            <span class="muted">1차 공시·단말기 추격 종목 제외 · 하루 거래대금 1% 이내 자동 제한</span>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="at-cfg-enabled">자동매매 가동 상태</label>
+              <select id="at-cfg-enabled">
+                <option value="true">켜짐 — 조건 통과 시 자동 모의매수·자동 청산 (권장)</option>
+                <option value="false">꺼짐 — 신규 매수 중단 (알림만 수신)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="at-cfg-second-only">진입 종목 성격 필터</label>
+              <select id="at-cfg-second-only">
+                <option value="true">2차 파급 전용 — 1차 직접·단기테마 배제 (권장)</option>
+                <option value="false">상승수혜 전체 허용 — 단기테마성만 배제</option>
+              </select>
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="at-cfg-order-manwon">1회 종목당 최대 주문금액 (만 원)</label>
+              <input id="at-cfg-order-manwon" type="number" step="10" min="10" max="5000" />
+            </div>
+            <div class="field">
+              <label for="at-cfg-max-pos">최대 동시 보유 종목 수</label>
+              <input id="at-cfg-max-pos" type="number" step="1" min="1" max="15" />
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="at-cfg-min-chg">진입 허용 등락률 하한 (%)</label>
+              <input id="at-cfg-min-chg" type="number" step="0.5" min="-15" max="15" />
+            </div>
+            <div class="field">
+              <label for="at-cfg-max-chg">진입 허용 등락률 상한 (% — 급등 추격 방지)</label>
+              <input id="at-cfg-max-chg" type="number" step="0.5" min="-10" max="25" />
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="at-cfg-tp">익절 트레일링 가동 목표 (+%)</label>
+              <input id="at-cfg-tp" type="number" step="0.5" min="0.5" max="30" />
+            </div>
+            <div class="field">
+              <label for="at-cfg-trail">고점 대비 하락 시 익절 폭 (%, 0=즉시 익절)</label>
+              <input id="at-cfg-trail" type="number" step="0.5" min="0" max="15" />
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="at-cfg-sl">칼손절 기준 (-%)</label>
+              <input id="at-cfg-sl" type="number" step="0.5" min="0.5" max="20" />
+            </div>
+            <div class="field">
+              <label for="at-cfg-eod-enabled">당일 장마감 전 전량 청산 (오버나잇 방지)</label>
+              <div style="display:flex; gap:8px;">
+                <select id="at-cfg-eod-enabled" style="flex:2;">
+                  <option value="true">켜짐 — 지정 시각 전량 자동매도 (권장)</option>
+                  <option value="false">꺼짐 — 익절·손절 전까지 보유</option>
+                </select>
+                <input id="at-cfg-eod-time" type="text" placeholder="15:15" style="flex:1; max-width:95px;" />
+              </div>
+            </div>
+          </div>
+          <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;">
+            <button id="btn-save-autotrade" class="primary" type="submit">자동매매 규칙 저장</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="card">
+        <div class="section-head">
+          <h2>최근 청산 완료 내역 (data/paper_trades.jsonl)</h2>
+          <span class="muted">KRX 호가 슬리피지 + 매매수수료·증권거래세(약 0.21%) 차감 후 실제 순손익</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>청산 시각</th>
+                <th>종목</th>
+                <th>수량</th>
+                <th>매수가 → 매도가</th>
+                <th>실현 순손익</th>
+                <th>청산 사유</th>
+                <th>진입 테마</th>
+              </tr>
+            </thead>
+            <tbody id="at-trades-body"></tbody>
+          </table>
+        </div>
       </div>
     </section>
 
@@ -1565,6 +1770,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div style="display:flex; gap:8px; align-items:center;">
             <select id="trace-filter" style="padding:6px 10px; border:1px solid var(--border-strong); border-radius:8px; font-size:12.5px;">
               <option value="all">전체 이벤트</option>
+              <option value="paper_trade_event">모의 자동매매 체결</option>
               <option value="flash_alert_sent">초고속 1보 푸시</option>
               <option value="premarket_digest_sent">장전 요약 발송</option>
               <option value="premarket_digest_prewarm">장전 요약 사전분석</option>
@@ -1603,6 +1809,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <script>
     let latestOverview = null;
     let formDirty = false;
+    let autotradeDirty = false;
 
     function toast(msg) {
       const el = document.getElementById("toast");
@@ -1629,6 +1836,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (val === null || val === undefined || isNaN(Number(val))) return "-";
       const n = Number(val);
       return (n > 0 ? "+" : "") + n.toFixed(2) + "%";
+    }
+
+    function fmtKrw(val) {
+      if (val === null || val === undefined || isNaN(Number(val))) return "-";
+      return Math.round(Number(val)).toLocaleString("ko-KR") + "원";
+    }
+
+    function fmtSignedKrw(val) {
+      if (val === null || val === undefined || isNaN(Number(val))) return "-";
+      const n = Math.round(Number(val));
+      return (n > 0 ? "+" : "") + n.toLocaleString("ko-KR") + "원";
     }
 
     function makePctSpan(val) {
@@ -1785,9 +2003,220 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       renderAlerts(data.recent_alerts || []);
       renderOvernightQueue(data.overnight_queue || [], cfg);
       renderDeferred(data.deferred || []);
+      renderAutotrade(data.autotrade || {}, cfg);
       renderPerformance(data.performance || {});
       renderFeedStats(data.feeds || []);
       if (!formDirty) populateSettingsForm(cfg, data.feeds || []);
+    }
+
+    function renderAutotrade(at, cfg) {
+      const acfg = at.config || cfg || {};
+      const enabled = at.enabled !== false;
+      const modeBadge = document.getElementById("at-mode-badge");
+      modeBadge.textContent = enabled ? "자동매매 켜짐" : "자동매매 일시중단";
+      modeBadge.className = "badge " + (enabled ? "ok" : "warn");
+
+      document.getElementById("at-broker-label").textContent = at.broker_label || "내장 실전형 가상 모의계좌";
+      const brokerSub = document.getElementById("at-broker-sub");
+      if (at.kis_configured) {
+        brokerSub.textContent = "한국투자증권 공식 모의투자 서버(openapivts:29443) 연동 중 · 실전 계좌로는 절대 주문이 전송되지 않도록 잠금되어 있습니다.";
+      } else {
+        brokerSub.textContent = "별도 증권사 가입 없이 " + fmtKrw(at.initial_capital_krw || 10000000) + " 가상 모의계좌로 즉시 작동 중 · 나중에 .env에 KIS 모의투자 키를 넣으면 한투 공식 모의계좌로 자동 전환됩니다.";
+      }
+
+      const eqPnl = Number(at.total_pnl_krw || 0);
+      const eqPct = Number(at.total_pnl_pct || 0);
+      document.getElementById("at-equity").textContent = fmtKrw(at.total_equity_krw ?? 10000000);
+      const eqBadge = document.getElementById("at-equity-badge");
+      eqBadge.textContent = fmtPct(eqPct);
+      eqBadge.className = "badge " + (eqPnl > 0 ? "ok" : (eqPnl < 0 ? "err" : ""));
+      document.getElementById("at-equity-sub").textContent =
+        "초기 " + fmtKrw(at.initial_capital_krw || 10000000) + " 대비 " + fmtSignedKrw(eqPnl);
+
+      const positions = at.positions || [];
+      const maxPos = acfg.autotrade_max_positions ?? 4;
+      document.getElementById("at-cash").textContent = fmtKrw(at.cash_krw ?? 10000000);
+      document.getElementById("at-pos-count-badge").textContent = "보유 " + positions.length + "/" + maxPos + "종목";
+      document.getElementById("at-cash-sub").textContent =
+        "보유주식 순평가 " + fmtKrw(at.positions_value_krw || 0) + " (" + fmtSignedKrw(at.unrealized_pnl_krw || 0) + ")";
+
+      const rPnl = Number(at.realized_pnl_krw || 0);
+      const rEl = document.getElementById("at-realized");
+      rEl.textContent = fmtSignedKrw(rPnl);
+      rEl.className = "kpi-value " + (rPnl > 0 ? "ret-pos" : (rPnl < 0 ? "ret-neg" : ""));
+      document.getElementById("at-realized-sub").textContent =
+        "오늘 실현 " + fmtSignedKrw(at.today_realized_pnl_krw || 0) + " · 누적 비용 " + fmtKrw(at.total_fees_krw || 0);
+
+      const tCnt = Number(at.trade_count || 0);
+      document.getElementById("at-trades-badge").textContent = tCnt + "전";
+      document.getElementById("at-winrate").textContent =
+        (at.win_rate_pct !== null && at.win_rate_pct !== undefined) ? Number(at.win_rate_pct).toFixed(1) + "%" : "-";
+      document.getElementById("at-winrate-sub").textContent =
+        (at.win_count || 0) + "승 / " + (at.loss_count || 0) + "패";
+
+      document.getElementById("btn-at-close-all").disabled = positions.length === 0;
+
+      const posTb = document.getElementById("at-positions-body");
+      posTb.innerHTML = "";
+      if (!positions.length) {
+        posTb.innerHTML = '<tr><td colspan="8" class="empty">현재 보유 중인 모의투자 포지션이 없습니다. (장중 2차 파급 미반영 종목 포착 시 자동 진입)</td></tr>';
+      } else {
+        for (const p of positions) {
+          const tr = document.createElement("tr");
+          const tdTs = document.createElement("td");
+          tdTs.className = "mono";
+          tdTs.style.whiteSpace = "nowrap";
+          tdTs.textContent = fmtTime(p.entry_ts);
+
+          const tdStock = document.createElement("td");
+          const link = document.createElement("a");
+          link.className = "stock-link";
+          link.href = "https://m.stock.naver.com/domestic/stock/" + encodeURIComponent(p.code || "") + "/total";
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = (p.name || p.code) + " (" + p.code + ")";
+          tdStock.appendChild(link);
+
+          const tdTier = document.createElement("td");
+          const tb = document.createElement("span");
+          tb.className = "badge ok";
+          tb.textContent = (p.order_tier || "2차 파급") + (p.revenue_link ? " · " + p.revenue_link : "");
+          tdTier.appendChild(tb);
+
+          const tdQty = document.createElement("td");
+          tdQty.textContent = Number(p.qty || 0).toLocaleString("ko-KR") + "주";
+
+          const tdPx = document.createElement("td");
+          tdPx.className = "mono";
+          tdPx.textContent = fmtKrw(p.avg_buy_price) + " → " + fmtKrw(p.last_price || p.avg_buy_price);
+
+          const tdPnl = document.createElement("td");
+          const upnl = Number(p.unrealized_pnl_krw || 0);
+          const upct = Number(p.unrealized_pnl_pct || 0);
+          const sp = document.createElement("span");
+          sp.className = upnl > 0 ? "ret-pos" : (upnl < 0 ? "ret-neg" : "muted");
+          sp.textContent = fmtSignedKrw(upnl) + " (" + fmtPct(upct) + ")";
+          tdPnl.appendChild(sp);
+          if (p.peak_ret_pct !== undefined && p.peak_ret_pct !== null) {
+            const pk = document.createElement("div");
+            pk.className = "muted";
+            pk.style.fontSize = "11.5px";
+            pk.textContent = "고점 " + fmtPct(p.peak_ret_pct);
+            tdPnl.appendChild(pk);
+          }
+
+          const tdTrail = document.createElement("td");
+          const trBadge = document.createElement("span");
+          trBadge.className = "badge " + (p.trailing_armed ? "ok" : "");
+          trBadge.textContent = p.trailing_armed ? "가동 중" : "대기";
+          tdTrail.appendChild(trBadge);
+
+          const tdAct = document.createElement("td");
+          const closeBtn = document.createElement("button");
+          closeBtn.type = "button";
+          closeBtn.style.padding = "4px 9px";
+          closeBtn.style.fontSize = "12px";
+          closeBtn.dataset.closeCode = p.code;
+          closeBtn.dataset.closeName = p.name || p.code;
+          closeBtn.textContent = "즉시 매도";
+          tdAct.appendChild(closeBtn);
+
+          tr.append(tdTs, tdStock, tdTier, tdQty, tdPx, tdPnl, tdTrail, tdAct);
+          posTb.appendChild(tr);
+        }
+      }
+
+      const pend = at.pending_open_entries || [];
+      const pendCard = document.getElementById("at-pending-card");
+      const pendBody = document.getElementById("at-pending-body");
+      pendBody.innerHTML = "";
+      if (!pend.length) {
+        pendCard.style.display = "none";
+      } else {
+        pendCard.style.display = "block";
+        for (const item of pend) {
+          const row = document.createElement("div");
+          row.className = "deferred-row";
+          const left = document.createElement("div");
+          const st = item.stock || {};
+          const strong = document.createElement("strong");
+          strong.textContent = (st.name || item.code) + " (" + item.code + ") — " + (item.title || item.theme_key || "");
+          const sub = document.createElement("div");
+          sub.className = "muted";
+          sub.style.marginTop = "2px";
+          sub.textContent = "촉매 " + Number(item.catalyst_score || 0).toFixed(1) + " · 만료 " + fmtTime(item.expires_at);
+          left.append(strong, sub);
+          row.appendChild(left);
+          pendBody.appendChild(row);
+        }
+      }
+
+      const trades = at.recent_trades || [];
+      const trTb = document.getElementById("at-trades-body");
+      trTb.innerHTML = "";
+      if (!trades.length) {
+        trTb.innerHTML = '<tr><td colspan="7" class="empty">아직 청산 완료된 모의매매 내역이 없습니다.</td></tr>';
+      } else {
+        for (const t of trades) {
+          const tr = document.createElement("tr");
+          const tdTs = document.createElement("td");
+          tdTs.className = "mono";
+          tdTs.style.whiteSpace = "nowrap";
+          tdTs.textContent = fmtTime(t.exit_ts);
+
+          const tdStock = document.createElement("td");
+          const link = document.createElement("a");
+          link.className = "stock-link";
+          link.href = "https://m.stock.naver.com/domestic/stock/" + encodeURIComponent(t.code || "") + "/total";
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.textContent = (t.name || t.code) + " (" + t.code + ")";
+          tdStock.appendChild(link);
+
+          const tdQty = document.createElement("td");
+          tdQty.textContent = Number(t.qty || 0).toLocaleString("ko-KR") + "주";
+
+          const tdPx = document.createElement("td");
+          tdPx.className = "mono";
+          tdPx.textContent = fmtKrw(t.buy_price) + " → " + fmtKrw(t.sell_price);
+
+          const tdPnl = document.createElement("td");
+          const npnl = Number(t.net_pnl_krw || 0);
+          const npct = Number(t.net_pnl_pct || 0);
+          const sp = document.createElement("span");
+          sp.className = npnl > 0 ? "ret-pos" : (npnl < 0 ? "ret-neg" : "muted");
+          sp.textContent = fmtSignedKrw(npnl) + " (" + fmtPct(npct) + ")";
+          tdPnl.appendChild(sp);
+
+          const tdReason = document.createElement("td");
+          const rb = document.createElement("span");
+          rb.className = "badge " + (npnl > 0 ? "ok" : (npnl < 0 ? "err" : ""));
+          rb.textContent = t.exit_reason || "-";
+          tdReason.appendChild(rb);
+
+          const tdTheme = document.createElement("td");
+          tdTheme.className = "muted";
+          tdTheme.textContent = t.title || t.theme_key || "-";
+
+          tr.append(tdTs, tdStock, tdQty, tdPx, tdPnl, tdReason, tdTheme);
+          trTb.appendChild(tr);
+        }
+      }
+
+      if (!autotradeDirty) {
+        document.getElementById("at-cfg-enabled").value = (cfg.autotrade_enabled ?? enabled) ? "true" : "false";
+        document.getElementById("at-cfg-second-only").value = (cfg.autotrade_only_second_order ?? acfg.autotrade_only_second_order ?? true) ? "true" : "false";
+        const ordKrw = cfg.autotrade_order_amount_krw ?? acfg.autotrade_order_amount_krw ?? 1000000;
+        document.getElementById("at-cfg-order-manwon").value = Math.max(10, Math.round(Number(ordKrw) / 10000));
+        document.getElementById("at-cfg-max-pos").value = cfg.autotrade_max_positions ?? acfg.autotrade_max_positions ?? 4;
+        document.getElementById("at-cfg-min-chg").value = cfg.autotrade_min_change_pct ?? acfg.autotrade_min_change_pct ?? -2.0;
+        document.getElementById("at-cfg-max-chg").value = cfg.autotrade_max_change_pct ?? acfg.autotrade_max_change_pct ?? 4.0;
+        document.getElementById("at-cfg-tp").value = cfg.autotrade_take_profit_pct ?? acfg.autotrade_take_profit_pct ?? 5.0;
+        document.getElementById("at-cfg-trail").value = cfg.autotrade_trailing_stop_pct ?? acfg.autotrade_trailing_stop_pct ?? 2.0;
+        document.getElementById("at-cfg-sl").value = cfg.autotrade_stop_loss_pct ?? acfg.autotrade_stop_loss_pct ?? 3.0;
+        document.getElementById("at-cfg-eod-enabled").value = (cfg.autotrade_eod_exit_enabled ?? acfg.autotrade_eod_exit_enabled ?? true) ? "true" : "false";
+        document.getElementById("at-cfg-eod-time").value = cfg.autotrade_eod_exit_time || acfg.autotrade_eod_exit_time || "15:15";
+      }
     }
 
     function renderAlerts(alerts) {
@@ -2166,7 +2595,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           tdType.appendChild(b);
 
           const tdDesc = document.createElement("td");
-          if (r.type === "flash_alert_sent") {
+          if (r.type === "paper_trade_event") {
+            if (r.action === "buy") {
+              tdDesc.textContent = "🤖📈 모의매수 체결 · " + (r.name || r.code) + "(" + r.code + ") " + r.qty + "주 @ " + fmtKrw(r.fill_price) + " (진입 " + fmtPct(r.entry_change_pct) + " · " + (r.theme_key || "") + ")";
+            } else if (r.action === "sell") {
+              tdDesc.textContent = "🤖💰 모의매도 청산(" + (r.exit_reason || "-") + ") · " + (r.name || r.code) + "(" + r.code + ") " + r.qty + "주 · " + fmtKrw(r.buy_price) + "→" + fmtKrw(r.sell_price) + " (" + fmtSignedKrw(r.net_pnl_krw) + ", " + fmtPct(r.net_pnl_pct) + ")";
+            } else {
+              tdDesc.textContent = "⚠️ KIS 모의주문 오류(" + (r.action || "-") + ") · " + (r.name || r.code || "") + " · " + (r.error || "");
+            }
+          } else if (r.type === "flash_alert_sent") {
             tdDesc.textContent = "⚡ 1보 속보 발송 · " + (r.headline || r.theme_key || "") + " (촉매 " + Number(r.catalyst_score || 0).toFixed(1) + ")";
           } else if (r.type === "premarket_digest_sent") {
             tdDesc.textContent = "🌅 장전 요약 발송 · " + (r.count || 0) + "건 (" + (r.themes || []).join(", ") + ")" + (r.fallback_count ? " · Stage1 폴백 " + r.fallback_count + "건" : "");
@@ -2212,6 +2649,80 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
         if (btn.dataset.tab === "traces") loadTraces();
       });
+    });
+
+    document.getElementById("autotrade-form").addEventListener("input", () => { autotradeDirty = true; });
+    document.getElementById("autotrade-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const manwon = parseFloat(document.getElementById("at-cfg-order-manwon").value);
+      const payload = {
+        autotrade_enabled: document.getElementById("at-cfg-enabled").value === "true",
+        autotrade_only_second_order: document.getElementById("at-cfg-second-only").value === "true",
+        autotrade_order_amount_krw: Math.round((isNaN(manwon) ? 100 : manwon) * 10000),
+        autotrade_max_positions: parseInt(document.getElementById("at-cfg-max-pos").value, 10),
+        autotrade_min_change_pct: parseFloat(document.getElementById("at-cfg-min-chg").value),
+        autotrade_max_change_pct: parseFloat(document.getElementById("at-cfg-max-chg").value),
+        autotrade_take_profit_pct: parseFloat(document.getElementById("at-cfg-tp").value),
+        autotrade_trailing_stop_pct: parseFloat(document.getElementById("at-cfg-trail").value),
+        autotrade_stop_loss_pct: parseFloat(document.getElementById("at-cfg-sl").value),
+        autotrade_eod_exit_enabled: document.getElementById("at-cfg-eod-enabled").value === "true",
+        autotrade_eod_exit_time: document.getElementById("at-cfg-eod-time").value.trim() || "15:15",
+      };
+      try {
+        await api("/api/config", { method: "POST", body: JSON.stringify(payload) });
+        autotradeDirty = false;
+        toast("자동매매 규칙을 저장했습니다. 즉시 반영됩니다.");
+        loadOverview();
+      } catch (err) {
+        toast("자동매매 규칙 저장 실패: " + err.message);
+      }
+    });
+
+    document.getElementById("at-positions-body").addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("button[data-close-code]");
+      if (!btn) return;
+      const code = btn.dataset.closeCode;
+      const name = btn.dataset.closeName || code;
+      if (!window.confirm(name + "(" + code + ") 모의 보유 물량을 지금 즉시 현재가로 전량 매도할까요?")) return;
+      btn.disabled = true;
+      try {
+        await api("/api/actions/autotrade/close", { method: "POST", body: JSON.stringify({ code }) });
+        toast(name + " 수동 매도 청산 완료");
+        loadOverview();
+      } catch (err) {
+        toast("수동 매도 실패: " + err.message);
+        btn.disabled = false;
+      }
+    });
+
+    document.getElementById("btn-at-close-all").addEventListener("click", async (ev) => {
+      if (!window.confirm("현재 보유 중인 모든 모의투자 종목을 즉시 전량 매도할까요?")) return;
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      try {
+        const res = await api("/api/actions/autotrade/close", { method: "POST", body: JSON.stringify({ code: "ALL" }) });
+        toast("보유 종목 전량 청산 완료 (" + ((res.result && res.result.closed_count) || 0) + "종목)");
+        loadOverview();
+      } catch (err) {
+        toast("전량 청산 실패: " + err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    document.getElementById("btn-at-reset").addEventListener("click", async (ev) => {
+      if (!window.confirm("모의계좌 잔고(1,000만 원)와 거래 기록을 처음 상태로 초기화할까요?")) return;
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      try {
+        await api("/api/actions/autotrade/reset", { method: "POST", body: "{}" });
+        toast("모의계좌를 초기 자본(1,000만 원)으로 초기화했습니다.");
+        loadOverview();
+      } catch (err) {
+        toast("초기화 실패: " + err.message);
+      } finally {
+        btn.disabled = false;
+      }
     });
 
     document.getElementById("config-form").addEventListener("input", () => { formDirty = true; });
@@ -2547,6 +3058,12 @@ def create_dashboard_server(
 
             if path == "/api/overview":
                 self._send_json(build_overview_payload(base_dir, auth_enabled=bool(_active_password())))
+            elif path == "/api/autotrade":
+                self._send_json(
+                    paper_trader.PaperAutoTrader(base_dir, REPO_DIR).build_overview(
+                        runtime_cfg=_effective_config(base_dir)
+                    )
+                )
             elif path == "/api/performance":
                 try:
                     limit = int((qs.get("limit") or ["100"])[0])
@@ -2612,6 +3129,49 @@ def create_dashboard_server(
                     self._send_json({"ok": True, "config": updated})
                 except ValueError as exc:
                     self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+
+            if path == "/api/actions/autotrade/close":
+                code = str(body.get("code") or "").strip()
+                if not code:
+                    self._send_json({"error": "청산할 종목코드(또는 ALL)가 필요합니다."}, HTTPStatus.BAD_REQUEST)
+                    return
+                trader = paper_trader.PaperAutoTrader(base_dir, REPO_DIR)
+                tg_tok = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+                tg_cid = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+                send_fn = (
+                    (lambda m: radar.send_telegram(tg_tok, tg_cid, m, start_chunk=0))
+                    if (tg_tok and tg_cid)
+                    else None
+                )
+                res = trader.close_position_manual(
+                    code,
+                    send_fn=send_fn,
+                    trace=radar.TraceLogger(base_dir / "trace.jsonl"),
+                )
+                if res is None:
+                    self._send_json({"error": "청산할 보유 포지션이 없습니다."}, HTTPStatus.BAD_REQUEST)
+                    return
+                self._send_json(
+                    {
+                        "ok": True,
+                        "result": res,
+                        "autotrade": trader.build_overview(runtime_cfg=_effective_config(base_dir)),
+                    }
+                )
+                return
+
+            if path == "/api/actions/autotrade/reset":
+                trader = paper_trader.PaperAutoTrader(base_dir, REPO_DIR)
+                raw_cap = body.get("initial_capital_krw")
+                cap_int = int(raw_cap) if raw_cap is not None else None
+                trader.reset_account(initial_capital_krw=cap_int)
+                self._send_json(
+                    {
+                        "ok": True,
+                        "autotrade": trader.build_overview(runtime_cfg=_effective_config(base_dir)),
+                    }
+                )
                 return
 
             if path == "/api/actions/send-tunnel-link":
