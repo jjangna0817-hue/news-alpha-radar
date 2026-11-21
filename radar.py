@@ -61,6 +61,8 @@ DEFAULT_SCREEN_MODELS = (
 DEFAULT_DEEP_MODELS = (
     "gemini-3.6-flash,gemini-3.8-flash,gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite"
 )
+LEGACY_SCREEN_MODELS = "gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.8-flash"
+LEGACY_DEEP_MODELS = "gemini-3.6-flash,gemini-3.8-flash,gemini-3.5-flash-lite"
 DEFAULT_SCREEN_THINKING_LEVEL = "MINIMAL"
 DEFAULT_DEEP_THINKING_LEVEL = "LOW"
 DEFAULT_THINKING_BUDGET = 1024
@@ -3044,6 +3046,15 @@ def _env_str(name: str, default: str) -> str:
     return val if val else default
 
 
+def resolve_gemini_models(env_name: str, default_csv: str, legacy_csv: str = "") -> list[str]:
+    """우분투 기존 .env에 구버전 기본 3개 모델 문자열이 그대로 남아 있으면 새 5개 모델 기본값으로 자동 승격."""
+    raw = _env_str(env_name, default_csv)
+    norm_raw = ",".join(m.strip() for m in raw.split(",") if m.strip())
+    norm_leg = ",".join(m.strip() for m in legacy_csv.split(",") if m.strip())
+    effective = default_csv if (norm_leg and norm_raw == norm_leg) else raw
+    return [m.strip() for m in effective.split(",") if m.strip()]
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(_env_str(name, str(default)))
@@ -4090,8 +4101,8 @@ def run_live(
             instant_flash_alert = bool(daemon_mode)
     active_feeds = resolve_active_feeds(runtime_cfg, daemon_mode=daemon_mode)
 
-    screen_models = [m.strip() for m in _env_str("GEMINI_SCREEN_MODELS", DEFAULT_SCREEN_MODELS).split(",") if m.strip()]
-    deep_models = [m.strip() for m in _env_str("GEMINI_DEEP_MODELS", DEFAULT_DEEP_MODELS).split(",") if m.strip()]
+    screen_models = resolve_gemini_models("GEMINI_SCREEN_MODELS", DEFAULT_SCREEN_MODELS, LEGACY_SCREEN_MODELS)
+    deep_models = resolve_gemini_models("GEMINI_DEEP_MODELS", DEFAULT_DEEP_MODELS, LEGACY_DEEP_MODELS)
     screen_thinking_level = _env_str("GEMINI_SCREEN_THINKING_LEVEL", DEFAULT_SCREEN_THINKING_LEVEL)
     deep_thinking_level = _env_str("GEMINI_DEEP_THINKING_LEVEL", DEFAULT_DEEP_THINKING_LEVEL)
     deep_thinking_budget = max(0, _env_int("GEMINI_THINKING_BUDGET", DEFAULT_THINKING_BUDGET))
