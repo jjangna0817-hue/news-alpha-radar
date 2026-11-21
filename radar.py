@@ -4134,9 +4134,16 @@ def run_live(
             market_window, dedup_mode, trigger_mode, started_at.strftime("%Y-%m-%d %H:%M KST"),
         )
 
+    import paper_trader
+
     state = StateStore(base_dir / "state.json")
     trace = TraceLogger(base_dir / "trace.jsonl")
     perf_tracker = PerformanceTracker(base_dir / "performance.jsonl")
+    auto_trader = paper_trader.PaperAutoTrader(base_dir, Path(__file__).resolve().parent)
+
+    def _send_trade_tg(msg_html: str) -> None:
+        if not dry_run and tg_token and tg_chat:
+            send_telegram(tg_token, tg_chat, msg_html, start_chunk=0)
     trace.emit({
         "ts": started_at.isoformat(),
         "type": "run_start",
@@ -4624,6 +4631,22 @@ def run_live(
                         stocks=de["alert_meta"]["stocks"],
                         quotes=de["quotes"],
                     )
+                    try:
+                        auto_trader.on_alert_candidates(
+                            alert_ts=flush_now,
+                            theme_key=de["theme_key"],
+                            sector=de["sector"],
+                            title=de["title"],
+                            catalyst_score=float(de["alert_meta"]["catalyst_score"]),
+                            stocks=de["alert_meta"]["stocks"],
+                            quotes=de["quotes"],
+                            runtime_cfg=runtime_cfg,
+                            daemon_mode=daemon_mode,
+                            send_fn=_send_trade_tg,
+                            trace=trace,
+                        )
+                    except Exception as tr_exc:
+                        logger.warning("%s 모의자동매매 장전 대기열 등록 스킵: %s", tag, tr_exc)
                     batch_themes.add(norm_key(de["theme_key"]))
                 state.last_digest_date = flush_now.strftime("%Y-%m-%d")
                 state.overnight_queue = []
@@ -4663,7 +4686,7 @@ def run_live(
                 "note": "",
             }
 
-            # 0) 기존 발송 알림의 +5분/+30분/당일종가/익일종가 수익률 자동 업데이트 (한도 도달 여부와 무관하게 수행)
+            # 0) 기존 발송 알림의 +5분/+30분/당일종가/익일종가 수익률 자동 업데이트 및 모의자동매매 포지션 점검
             if not dry_run:
                 try:
                     perf_updated = perf_tracker.update_pending(now=cycle_now)
@@ -4671,6 +4694,16 @@ def run_live(
                         logger.info("%s 알림 성과 자동 기록 업데이트: %d건 측정 완료", tag, perf_updated)
                 except Exception as perf_exc:
                     logger.warning("%s 알림 성과 업데이트 스킵: %s", tag, perf_exc)
+                try:
+                    auto_trader.tick_positions(
+                        now=cycle_now,
+                        runtime_cfg=runtime_cfg,
+                        daemon_mode=daemon_mode,
+                        send_fn=_send_trade_tg,
+                        trace=trace,
+                    )
+                except Exception as tr_tick_exc:
+                    logger.warning("%s 모의자동매매 포지션 점검 스킵: %s", tag, tr_tick_exc)
 
             # 0-a) 평일 07:30~07:49 장전 요약 후보 사이클당 1건씩 분산 사전 분석(Pre-warm)
             if offhours_digest_enabled and should_prewarm_premarket_digest(cycle_now, state, offhours_digest_time):
@@ -4824,6 +4857,22 @@ def run_live(
                                         stocks=list(alert_meta.get("stocks") or []),
                                         quotes=_deserialize_perf_quotes(entry.get("perf_quotes")),
                                     )
+                                    try:
+                                        auto_trader.on_alert_candidates(
+                                            alert_ts=now_d,
+                                            theme_key=tkey,
+                                            sector=str(alert_meta.get("sector") or ""),
+                                            title=title_str,
+                                            catalyst_score=float(alert_meta.get("catalyst_score") or entry.get("catalyst_score") or 0.0),
+                                            stocks=list(alert_meta.get("stocks") or []),
+                                            quotes=_deserialize_perf_quotes(entry.get("perf_quotes")),
+                                            runtime_cfg=runtime_cfg,
+                                            daemon_mode=daemon_mode,
+                                            send_fn=_send_trade_tg,
+                                            trace=trace,
+                                        )
+                                    except Exception as tr_exc:
+                                        logger.warning("%s Deferred 모의자동매매 진입 스킵: %s", tag, tr_exc)
                                     logger.info("%s Deferred 재발송 완료(Stage 2 생략, chunk>=%d): %s", tag, sent_chunks, title_str)
                             else:
                                 comps = _ensure_companies(tag)
@@ -4912,6 +4961,22 @@ def run_live(
                                             stocks=alert_meta["stocks"],
                                             quotes=s2_def["quotes"],
                                         )
+                                        try:
+                                            auto_trader.on_alert_candidates(
+                                                alert_ts=now_d,
+                                                theme_key=tkey,
+                                                sector=s2_def["sector"],
+                                                title=title_str,
+                                                catalyst_score=float(alert_meta["catalyst_score"]),
+                                                stocks=alert_meta["stocks"],
+                                                quotes=s2_def["quotes"],
+                                                runtime_cfg=runtime_cfg,
+                                                daemon_mode=daemon_mode,
+                                                send_fn=_send_trade_tg,
+                                                trace=trace,
+                                            )
+                                        except Exception as tr_exc:
+                                            logger.warning("%s Deferred 모의자동매매 진입 스킵: %s", tag, tr_exc)
                                         logger.info("%s Deferred 텔레그램 발송 완료: %s", tag, title_str)
                                 except TelegramPartialSendError as tg_exc:
                                     new_retries = retries + 1
@@ -5661,6 +5726,22 @@ def run_live(
                                         )
                                         state.save(now=cand_now)
                                         logger.info("%s 텔레그램 알림 발송 완료: %s", tag, title_str)
+                                        try:
+                                            auto_trader.on_alert_candidates(
+                                                alert_ts=cand_now,
+                                                theme_key=tkey,
+                                                sector=final_sector,
+                                                title=title_str,
+                                                catalyst_score=float(alert_meta["catalyst_score"]),
+                                                stocks=alert_meta["stocks"],
+                                                quotes=s2_res["quotes"],
+                                                runtime_cfg=runtime_cfg,
+                                                daemon_mode=daemon_mode,
+                                                send_fn=_send_trade_tg,
+                                                trace=trace,
+                                            )
+                                        except Exception as tr_exc:
+                                            logger.warning("%s 모의자동매매 진입 점검 스킵: %s", tag, tr_exc)
                                     # 발송 성공 후에만 batch_themes 등록 (실패 시 재시도 허용)
                                     batch_themes.add(tnorm)
                                     alerted_cids.add(cid)
@@ -5939,6 +6020,7 @@ def run_daemon(
             break
 
         run_inbox_only = False
+        next_trade_tick = time.monotonic() + 10.0
         while not stop_evt.is_set() and time.monotonic() < next_rss_deadline:
             if _has_inbox_files():
                 logger.info("실시간 콜백 속보 감지(data/inbox) — RSS 대기 없이 즉시 분석을 시작합니다!")
@@ -5947,6 +6029,25 @@ def run_daemon(
             if trigger_file.exists():
                 logger.info("즉시 스캔 신호 감지 — 대기를 중단하고 바로 감시를 시작합니다.")
                 break
+            if not dry_run and time.monotonic() >= next_trade_tick:
+                next_trade_tick = time.monotonic() + 10.0
+                try:
+                    import paper_trader
+
+                    daemon_trader = paper_trader.PaperAutoTrader(base_dir, Path(__file__).resolve().parent)
+                    tick_now = _now()
+                    if daemon_trader.has_active_work(tick_now):
+                        tg_tok = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+                        tg_cid = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+                        daemon_trader.tick_positions(
+                            now=tick_now,
+                            runtime_cfg=load_runtime_config(base_dir),
+                            daemon_mode=True,
+                            send_fn=(lambda m: send_telegram(tg_tok, tg_cid, m, start_chunk=0)) if (tg_tok and tg_cid) else None,
+                            trace=TraceLogger(base_dir / "trace.jsonl"),
+                        )
+                except Exception as dt_exc:
+                    logger.warning("데몬 10초 모의매매 시세 점검 스킵: %s", dt_exc)
             rem = next_rss_deadline - time.monotonic()
             stop_evt.wait(timeout=min(0.5, max(0.05, rem)))
 
