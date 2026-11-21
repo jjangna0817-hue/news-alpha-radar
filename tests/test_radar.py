@@ -2381,6 +2381,30 @@ class TestRemoteHttpsTunnelAndCookieAuth(unittest.TestCase):
 
 class TestQuotaConservationDigestResilienceAndLiquidity(unittest.TestCase):
     def test_gemini_multi_key_rotation_and_overnight_digest_trigger_batching(self) -> None:
+        # 0) Legacy 3-model .env strings auto-upgrade to 5-model defaults without manual .env edits!
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GEMINI_SCREEN_MODELS": "gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.8-flash",
+                "GEMINI_DEEP_MODELS": "gemini-3.6-flash,gemini-3.8-flash,gemini-3.5-flash-lite",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                radar.resolve_gemini_models("GEMINI_SCREEN_MODELS", radar.DEFAULT_SCREEN_MODELS, radar.LEGACY_SCREEN_MODELS),
+                ["gemini-3.5-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3.6-flash", "gemini-3.8-flash"],
+            )
+            self.assertEqual(
+                radar.resolve_gemini_models("GEMINI_DEEP_MODELS", radar.DEFAULT_DEEP_MODELS, radar.LEGACY_DEEP_MODELS),
+                ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite"],
+            )
+        # Custom user-chosen model list is still respected!
+        with mock.patch.dict(os.environ, {"GEMINI_DEEP_MODELS": "gemini-2.5-flash"}, clear=False):
+            self.assertEqual(
+                radar.resolve_gemini_models("GEMINI_DEEP_MODELS", radar.DEFAULT_DEEP_MODELS, radar.LEGACY_DEEP_MODELS),
+                ["gemini-2.5-flash"],
+            )
+
         # 1) Multi-project key parsing (GEMINI_API_KEYS + GEMINI_API_KEY deduplicated in order)
         with mock.patch.dict(os.environ, {"GEMINI_API_KEYS": "proj1_key, proj2_key", "GEMINI_API_KEY": "proj1_key"}, clear=False):
             self.assertEqual(radar.resolve_gemini_api_keys(), ["proj1_key", "proj2_key"])

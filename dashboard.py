@@ -338,11 +338,11 @@ def build_overview_payload(
 
     pt_today = radar.pt_date_str(ref)
     ai_by_model = dict((state.daily_ai_calls.get(pt_today) or {}))
-    screen_models = [
-        m.strip()
-        for m in radar._env_str("GEMINI_SCREEN_MODELS", radar.DEFAULT_SCREEN_MODELS).split(",")
-        if m.strip()
-    ]
+    screen_models = radar.resolve_gemini_models(
+        "GEMINI_SCREEN_MODELS",
+        radar.DEFAULT_SCREEN_MODELS,
+        radar.LEGACY_SCREEN_MODELS,
+    )
     primary_screen = screen_models[0] if screen_models else "gemini-3.5-flash-lite"
     primary_used = state.ai_requests_today(primary_screen, now=ref)
     rpd_limit = max(10, cfg["stage1_daily_rpd_limit"])
