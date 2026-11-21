@@ -55,8 +55,12 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
-DEFAULT_SCREEN_MODELS = "gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.8-flash"
-DEFAULT_DEEP_MODELS = "gemini-3.6-flash,gemini-3.8-flash,gemini-3.5-flash-lite"
+DEFAULT_SCREEN_MODELS = (
+    "gemini-3.5-flash-lite,gemini-2.5-flash-lite,gemini-2.5-flash,gemini-3.6-flash,gemini-3.8-flash"
+)
+DEFAULT_DEEP_MODELS = (
+    "gemini-3.6-flash,gemini-3.8-flash,gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite"
+)
 DEFAULT_SCREEN_THINKING_LEVEL = "MINIMAL"
 DEFAULT_DEEP_THINKING_LEVEL = "LOW"
 DEFAULT_THINKING_BUDGET = 1024
@@ -71,7 +75,7 @@ DEFERRED_TTL_MARKET_MIN = 60
 DEFERRED_TTL_OFFHOURS_MIN = 180
 SEND_PENDING_MAX_AGE_MIN = 15
 PENDING_TTL_MARKET_MIN = 90
-PENDING_TTL_OFFHOURS_MIN = 180
+PENDING_TTL_OFFHOURS_MIN = 360
 MAX_PUB_AGE_HOURS = 12
 RSS_DIRECT_TIMEOUT = 8
 RSS_GOOGLE_TIMEOUT = 5
@@ -93,6 +97,10 @@ DEFAULT_OFFHOURS_DIGEST_TIME = "07:50"
 DEFAULT_STOCK_DEDUP_HOURS = 24
 DEFAULT_MAX_DAILY_PER_SECTOR = 2
 DEFAULT_MAX_BULLISH_PREPRICED_PCT = 15.0
+DEFAULT_MIN_TRADING_VALUE_EOK = 5.0
+UPPER_LIMIT_LOCK_PCT = 29.2
+POSITION_CAP_TURNOVER_RATIO = 0.01
+PREMARKET_PREWARM_LEAD_MIN = 20
 ROUND_TRIP_COST_PCT = 0.23
 MAX_OVERNIGHT_QUEUE_ITEMS = 15
 OVERNIGHT_QUEUE_TTL_HOURS = 72
@@ -451,6 +459,40 @@ class StockQuote:
     volume: int
     market_status: str
     reaction_stage: str
+    trading_value: int = 0
+    prev_trading_value: int = 0
+    caution_status: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "price": int(self.price),
+            "change": int(self.change),
+            "change_pct": float(self.change_pct),
+            "volume": int(self.volume),
+            "market_status": str(self.market_status or "UNKNOWN"),
+            "reaction_stage": str(self.reaction_stage or ""),
+            "trading_value": int(self.trading_value),
+            "prev_trading_value": int(self.prev_trading_value),
+            "caution_status": str(self.caution_status or ""),
+        }
+
+    @classmethod
+    def from_dict(cls, code: str, data: dict[str, Any]) -> "StockQuote":
+        pct = float(data.get("change_pct") or 0.0)
+        vol = int(data.get("volume") or 0)
+        return cls(
+            code=str(data.get("code") or code),
+            price=int(data.get("price") or 0),
+            change=int(data.get("change") or 0),
+            change_pct=pct,
+            volume=vol,
+            market_status=str(data.get("market_status") or "UNKNOWN"),
+            reaction_stage=str(data.get("reaction_stage") or classify_stage(pct, vol)),
+            trading_value=int(data.get("trading_value") or 0),
+            prev_trading_value=int(data.get("prev_trading_value") or 0),
+            caution_status=str(data.get("caution_status") or ""),
+        )
 
 
 def strip_html(text: str) -> str:
@@ -1590,6 +1632,26 @@ def next_trading_date(d: date) -> date:
     return cur
 
 
+def should_prewarm_premarket_digest(
+    now: datetime,
+    state: StateStore,
+    digest_time: str = DEFAULT_OFFHOURS_DIGEST_TIME,
+    lead_minutes: int = PREMARKET_PREWARM_LEAD_MIN,
+) -> bool:
+    """평일 장전 요약 시각(기본 07:50) 직전 lead_minutes(기본 20분: 07:30~07:49)에 1건씩 사전 분석할지 판정."""
+    ref = StateStore._now_kst(now)
+    if ref.weekday() >= 5:
+        return False
+    if not state.overnight_queue:
+        return False
+    if state.last_digest_date == ref.strftime("%Y-%m-%d"):
+        return False
+    dh, dm = _parse_hhmm(digest_time, default=(7, 50))
+    now_min = ref.hour * 60 + ref.minute
+    target_min = dh * 60 + dm
+    return max(0, target_min - max(1, int(lead_minutes))) <= now_min < target_min
+
+
 def should_flush_premarket_digest(
     now: datetime,
     state: StateStore,
@@ -1618,6 +1680,149 @@ def _normalize_perf_direction(raw: str | None) -> str:
     if "상승" in txt or "수혜" in txt:
         return "상승수혜"
     return txt or "상승수혜"
+
+
+def _today_trading_value_krw(q: StockQuote | None) -> int:
+    if q is None:
+        return 0
+    tv = max(0, int(q.trading_value))
+    if tv == 0 and int(q.price) > 0 and int(q.volume) > 0:
+        tv = int(q.price) * int(q.volume)
+    return tv
+
+
+def effective_trading_value_krw(q: StockQuote | None) -> int:
+    """하이브리드 유효 거래대금(원): max(전일 거래대금, 당일 누적 거래대금)."""
+    if q is None:
+        return 0
+    return max(0, int(q.prev_trading_value), _today_trading_value_krw(q))
+
+
+def has_known_liquidity(q: StockQuote | None) -> bool:
+    """시세 데이터에 거래대금·거래량 정보가 실제로 존재하는지 확인 (오프라인/미확인 시 오탐 방지)."""
+    if q is None:
+        return False
+    return bool(int(q.prev_trading_value) > 0 or int(q.trading_value) > 0 or int(q.volume) > 0)
+
+
+def assess_quote_executability(q: StockQuote | None) -> tuple[bool, str]:
+    """현재 시점 실매수 체결 가능 여부와 불가/주의 사유('거래정지'|'VI발동'|'상한가잠김'|'') 반환."""
+    if q is None:
+        return True, ""
+    cs = str(q.caution_status or "").strip()
+    ms = str(q.market_status or "").strip().upper()
+    if cs == "거래정지" or any(k in ms for k in ("HALT", "SUSP", "STOP")) or "정지" in ms:
+        return False, "거래정지"
+    if cs == "VI발동" or "VI" in ms:
+        return False, "VI발동"
+    if cs == "상한가잠김" or (ms not in ("CLOSE", "CLOSED") and float(q.change_pct) >= UPPER_LIMIT_LOCK_PCT):
+        return False, "상한가잠김"
+    return True, ""
+
+
+def recommend_position_cap_krw(q: StockQuote | None, ratio: float = POSITION_CAP_TURNOVER_RATIO) -> int:
+    """유효 일일 거래대금의 일정 비율(기본 1%) 기준 슬리피지 안전 최대 진입 금액(원)."""
+    eff = effective_trading_value_krw(q)
+    if eff <= 0:
+        return 0
+    return int(eff * max(0.0005, float(ratio)))
+
+
+def format_krw_compact(amount_krw: int) -> str:
+    val = max(0, int(amount_krw))
+    if val >= 100_000_000:
+        eok = val / 100_000_000
+        return f"{eok:.1f}억" if eok < 100 else f"{round(eok):,}억"
+    if val >= 10_000:
+        return f"{max(1, round(val / 10_000)):,}만원"
+    return f"{val:,}원"
+
+
+def format_liquidity_note(q: StockQuote | None) -> str:
+    """텔레그램 종목 카드에 표시할 전일·당일 거래대금 + 1% 적정 진입 한도 + 상한가/VI/거래정지 경고 문구."""
+    if q is None:
+        return ""
+    buyable, reason = assess_quote_executability(q)
+    known = has_known_liquidity(q)
+    if not known and buyable:
+        return ""
+
+    parts: list[str] = []
+    if known:
+        prev_v = max(0, int(q.prev_trading_value))
+        today_v = _today_trading_value_krw(q)
+        ms = str(q.market_status or "").strip().upper()
+        if prev_v > 0 and today_v > 0 and ms not in ("CLOSE", "CLOSED"):
+            parts.append(f"전일 {format_krw_compact(prev_v)} · 당일 {format_krw_compact(today_v)}")
+        elif prev_v > 0:
+            parts.append(f"전일 거래대금 {format_krw_compact(prev_v)}")
+        elif today_v > 0:
+            parts.append(f"당일 거래대금 {format_krw_compact(today_v)}")
+        cap = recommend_position_cap_krw(q)
+        if cap > 0:
+            parts.append(f"1% 적정진입 ~{format_krw_compact(cap)}")
+
+    if not buyable:
+        if reason == "거래정지":
+            parts.append("⛔ 현재 매수 불가(거래정지)")
+        elif reason == "상한가잠김":
+            parts.append("🔒 현재 매수 어려움(상한가 잠김)")
+        elif reason == "VI발동":
+            parts.append("⚠️ 현재 매수 어려움(VI 발동중)")
+
+    return " | ".join(parts)
+
+
+def filter_illiquid_bullish_stocks(
+    stocks: list[dict[str, Any]],
+    quotes: dict[str, StockQuote],
+    *,
+    min_trading_value_eok: float = DEFAULT_MIN_TRADING_VALUE_EOK,
+) -> dict[str, Any]:
+    """하이브리드 유동성 하드 필터:
+    - 거래정지 상태이거나, 유동성 확인 가능한 극소형 상승수혜주 중 max(전일, 당일) 거래대금이 기준(기본 5억 원) 미만인 종목 제외.
+    - 전일 거래대금이 작았더라도 당일 수급 폭발(≥ 기준)이 확인된 초기 소형 2차 수혜주는 통과시킨다.
+    - 하락주의·옥석가리기주의 경고 종목 및 시세 미확인(volume=0 & 거래대금=0) 종목은 오탐 방지를 위해 유지한다.
+    """
+    if not stocks:
+        return {
+            "kept_stocks": [],
+            "excluded_codes": [],
+            "details": [],
+            "all_filtered": False,
+        }
+
+    min_krw = int(max(0.0, float(min_trading_value_eok)) * 100_000_000)
+    kept: list[dict[str, Any]] = []
+    excluded_codes: list[str] = []
+    details: list[str] = []
+
+    for st in stocks:
+        if _normalize_perf_direction(st.get("direction")) != "상승수혜":
+            kept.append(st)
+            continue
+        raw_c = str(st.get("code") or "").strip()
+        code = raw_c.zfill(6) if raw_c.isdigit() else raw_c
+        q = quotes.get(code)
+        _, unbuyable_reason = assess_quote_executability(q)
+        if unbuyable_reason == "거래정지":
+            excluded_codes.append(code)
+            details.append(f"{st.get('name') or code}({code} 거래정지)")
+            continue
+        if min_krw > 0 and has_known_liquidity(q):
+            eff_krw = effective_trading_value_krw(q)
+            if eff_krw < min_krw:
+                excluded_codes.append(code)
+                details.append(f"{st.get('name') or code}({code} {eff_krw / 100_000_000:.1f}억<{min_trading_value_eok:.1f}억)")
+                continue
+        kept.append(st)
+
+    return {
+        "kept_stocks": kept,
+        "excluded_codes": excluded_codes,
+        "details": details,
+        "all_filtered": bool(stocks) and not kept,
+    }
 
 
 class PerformanceTracker:
@@ -1715,6 +1920,9 @@ class PerformanceTracker:
                 q = qmap.get(code)
                 alert_price = int(q.price) if (q is not None and int(q.price) > 0) else None
                 alert_chg = float(q.change_pct) if (q is not None and alert_price is not None) else None
+                buyable, unbuyable_reason = assess_quote_executability(q)
+                eff_krw = effective_trading_value_krw(q)
+                cap_krw = recommend_position_cap_krw(q)
                 rec = {
                     "id": f"{ts_slug}_{code}_{title_digest}",
                     "alert_ts": ref.isoformat(),
@@ -1731,6 +1939,10 @@ class PerformanceTracker:
                     "revenue_link": str(stock.get("revenue_link") or ""),
                     "alert_price": alert_price,
                     "alert_change_pct": alert_chg,
+                    "buyable": bool(buyable),
+                    "unbuyable_reason": unbuyable_reason or None,
+                    "eff_trading_value_eok": round(eff_krw / 100_000_000, 2) if eff_krw > 0 else None,
+                    "position_cap_manwon": max(1, round(cap_krw / 10_000)) if cap_krw > 0 else None,
                     "target_close_date": sched["close_date"],
                     "target_next_close_date": sched["next_close_date"],
                     "price_5m": None,
@@ -1860,7 +2072,7 @@ def _median_float(vals: list[float]) -> float | None:
 
 
 def summarize_performance(records: list[dict[str, Any]], *, recent_limit: int = 50) -> dict[str, Any]:
-    """방향별(상승수혜/하락주의/옥석가리기주의) 평균·중앙값 수익률(상승수혜 왕복비용 차감 순수익 포함) 및 승률 집계."""
+    """방향별 평균·중앙값 수익률 및 실매수 가능(상한가 잠김·VI·거래정지 제외) 순수익 분리 집계."""
     directions = ("상승수혜", "하락주의", "옥석가리기주의")
     horizons = ("ret_5m", "ret_30m", "ret_close", "ret_next_close")
 
@@ -1872,9 +2084,15 @@ def summarize_performance(records: list[dict[str, Any]], *, recent_limit: int = 
     by_direction: dict[str, Any] = {}
     for d, rows in buckets.items():
         win_is_negative = d in ("하락주의", "옥석가리기주의")
+        unbuyable_total = sum(1 for r in rows if r.get("buyable") is False)
         horizon_stats: dict[str, Any] = {}
         for h in horizons:
             vals = [float(r[h]) for r in rows if r.get(h) is not None]
+            buyable_vals = [
+                float(r[h])
+                for r in rows
+                if r.get(h) is not None and r.get("buyable", True) is not False
+            ]
             if vals:
                 avg_v = round(sum(vals) / len(vals), 2)
                 med_v = _median_float(vals)
@@ -1883,11 +2101,23 @@ def summarize_performance(records: list[dict[str, Any]], *, recent_limit: int = 
                     net_avg = None
                     net_med = None
                     net_win = None
+                    buyable_cnt = None
+                    buyable_net_avg = None
+                    buyable_win = None
                 else:
                     net_avg = round(avg_v - ROUND_TRIP_COST_PCT, 2)
                     net_med = round(med_v - ROUND_TRIP_COST_PCT, 2) if med_v is not None else None
                     net_wins = sum(1 for v in vals if v > ROUND_TRIP_COST_PCT)
                     net_win = round((net_wins / len(vals)) * 100.0, 1)
+                    buyable_cnt = len(buyable_vals)
+                    if buyable_vals:
+                        b_avg = sum(buyable_vals) / len(buyable_vals)
+                        buyable_net_avg = round(b_avg - ROUND_TRIP_COST_PCT, 2)
+                        b_wins = sum(1 for v in buyable_vals if v > ROUND_TRIP_COST_PCT)
+                        buyable_win = round((b_wins / len(buyable_vals)) * 100.0, 1)
+                    else:
+                        buyable_net_avg = None
+                        buyable_win = None
                 horizon_stats[h] = {
                     "count": len(vals),
                     "avg_pct": avg_v,
@@ -1896,6 +2126,9 @@ def summarize_performance(records: list[dict[str, Any]], *, recent_limit: int = 
                     "net_avg_pct": net_avg,
                     "net_median_pct": net_med,
                     "net_win_rate_pct": net_win,
+                    "buyable_count": buyable_cnt,
+                    "buyable_net_avg_pct": buyable_net_avg,
+                    "buyable_win_rate_pct": buyable_win,
                 }
             else:
                 horizon_stats[h] = {
@@ -1906,9 +2139,13 @@ def summarize_performance(records: list[dict[str, Any]], *, recent_limit: int = 
                     "net_avg_pct": None,
                     "net_median_pct": None,
                     "net_win_rate_pct": None,
+                    "buyable_count": None if win_is_negative else 0,
+                    "buyable_net_avg_pct": None,
+                    "buyable_win_rate_pct": None,
                 }
         by_direction[d] = {
             "total": len(rows),
+            "unbuyable_total": unbuyable_total,
             "win_rule": "하락 적중(<0%)" if win_is_negative else "상승 적중(>0%)",
             **horizon_stats,
         }
@@ -1939,8 +2176,10 @@ def evaluate_stage1_trigger(
     market_window: bool,
     daily_rpd_limit: int = DEFAULT_STAGE1_DAILY_RPD_LIMIT,
     screen_model: str = "gemini-3.5-flash-lite",
+    digest_mode: bool = False,
+    digest_time: str = DEFAULT_OFFHOURS_DIGEST_TIME,
 ) -> dict[str, Any]:
-    """PR-3 2계층(H/S) Stage 1 트리거 + PT 일일 RPD 70%/80%/90% 보호 가드."""
+    """PR-3 2계층(H/S) Stage 1 트리거 + PT 일일 RPD 보호 가드 + 야간 장전요약 배치 절약 모드."""
     limit = max(10, int(daily_rpd_limit))
     used = state.ai_requests_today(screen_model, now=now)
     ratio = used / limit
@@ -1951,16 +2190,16 @@ def evaluate_stage1_trigger(
         elapsed_th = 999999.0
     elif ratio >= 0.80:
         rpd_tier = "slowdown"
-        batch_th = 12
-        elapsed_th = 15.0 if market_window else 30.0
+        batch_th = 14
+        elapsed_th = 15.0 if market_window else 45.0
     elif ratio >= 0.70:
         rpd_tier = "caution"
-        batch_th = 8
-        elapsed_th = 10.0 if market_window else 20.0
+        batch_th = 12
+        elapsed_th = 12.0 if market_window else 35.0
     else:
         rpd_tier = "normal"
-        batch_th = 6
-        elapsed_th = 6.0 if market_window else 15.0
+        batch_th = 10
+        elapsed_th = 10.0 if market_window else 30.0
 
     last_dt = parse_iso_kst(state.last_stage1_at)
     elapsed_min = max(0.0, (now - last_dt).total_seconds() / 60.0) if last_dt is not None else None
@@ -1996,30 +2235,58 @@ def evaluate_stage1_trigger(
     should_run = False
     reason = "waiting_batch_or_trigger"
 
-    if hard_hits:
-        should_run = True
-        reason = "hard_keyword"
-    elif rpd_tier == "h_only":
-        should_run = False
-        reason = "rpd_90_h_only_guard"
-    elif has_realtime_inbox:
-        should_run = True
-        reason = "realtime_callback_inbox"
-    elif best_soft_in_cluster >= 2 and rpd_tier in ("normal", "caution"):
-        should_run = True
-        reason = "soft_keywords_2plus"
-    elif has_soft_plus_multi_outlet:
-        should_run = True
-        reason = "soft_plus_multi_outlet"
-    elif max_non_pol_outlets >= 2 and rpd_tier in ("normal", "caution"):
-        should_run = True
-        reason = "multi_outlet"
-    elif len(pending_items) >= batch_th:
-        should_run = True
-        reason = "pending_batch"
-    elif elapsed_min is None or elapsed_min >= elapsed_th:
-        should_run = True
-        reason = "elapsed_time"
+    if digest_mode and not market_window:
+        # 야간·주말 장전 요약(07:50) 대기 모드에서는 즉시 발송하지 않으므로 90분/22건 단위로 조용히 묶어 평가해 할당량 절약
+        dh, dm = _parse_hhmm(digest_time, default=(7, 50))
+        target_min = dh * 60 + dm
+        now_min = now.hour * 60 + now.minute
+        in_prep_window = now.weekday() < 5 and max(0, target_min - 40) <= now_min < target_min
+        digest_batch_th = max(batch_th, 22)
+        digest_elapsed_th = max(elapsed_th, 90.0)
+        batch_th = digest_batch_th
+        elapsed_th = digest_elapsed_th
+
+        if rpd_tier == "h_only" and not hard_hits:
+            should_run = False
+            reason = "rpd_90_h_only_guard"
+        elif in_prep_window and (elapsed_min is None or elapsed_min >= 20.0):
+            should_run = True
+            reason = "premarket_digest_prep"
+        elif len(pending_items) >= digest_batch_th:
+            should_run = True
+            reason = "overnight_digest_batch"
+        elif elapsed_min is None or elapsed_min >= digest_elapsed_th:
+            should_run = True
+            reason = "overnight_digest_interval"
+        else:
+            should_run = False
+            reason = "overnight_digest_batching"
+    else:
+        soft_cooldown_ok = elapsed_min is None or elapsed_min >= 2.0
+        if hard_hits:
+            should_run = True
+            reason = "hard_keyword"
+        elif rpd_tier == "h_only":
+            should_run = False
+            reason = "rpd_90_h_only_guard"
+        elif has_realtime_inbox:
+            should_run = True
+            reason = "realtime_callback_inbox"
+        elif soft_cooldown_ok and best_soft_in_cluster >= 2 and rpd_tier in ("normal", "caution"):
+            should_run = True
+            reason = "soft_keywords_2plus"
+        elif soft_cooldown_ok and has_soft_plus_multi_outlet:
+            should_run = True
+            reason = "soft_plus_multi_outlet"
+        elif soft_cooldown_ok and max_non_pol_outlets >= 2 and rpd_tier in ("normal", "caution"):
+            should_run = True
+            reason = "multi_outlet"
+        elif len(pending_items) >= batch_th:
+            should_run = True
+            reason = "pending_batch"
+        elif elapsed_min is None or elapsed_min >= elapsed_th:
+            should_run = True
+            reason = "elapsed_time"
 
     return {
         "should_run": should_run,
@@ -2036,6 +2303,7 @@ def evaluate_stage1_trigger(
         "elapsed_min": round(elapsed_min, 1) if elapsed_min is not None else None,
         "batch_threshold": batch_th,
         "elapsed_threshold_min": elapsed_th,
+        "digest_mode": bool(digest_mode and not market_window),
     }
 
 
@@ -2562,7 +2830,111 @@ def classify_stage(pct: float, vol: int) -> str:
     return "🔵 약세/조정 구간"
 
 
-def fetch_naver_quotes(codes: list[str]) -> dict[str, StockQuote]:
+_PREV_TRADING_VALUE_CACHE: dict[tuple[str, str], int] = {}
+
+
+def _parse_trading_value_krw(raw_val: Any, price: int, vol: int) -> int:
+    """네이버 시세 JSON의 accumulatedTradingValue(원/백만원/억 단위 혼재)를 원(KRW) 단위로 안전 변환."""
+    approx = max(0, int(price)) * max(0, int(vol))
+    txt = str(raw_val or "").strip().replace(",", "").replace(" ", "")
+    parsed = 0
+    if txt:
+        try:
+            if "조" in txt:
+                num = float(re.sub(r"[^0-9\.]", "", txt.split("조", 1)[0]) or "0")
+                parsed = int(num * 1_000_000_000_000)
+            elif "억" in txt:
+                num = float(re.sub(r"[^0-9\.]", "", txt.split("억", 1)[0]) or "0")
+                parsed = int(num * 100_000_000)
+            elif "천만" in txt:
+                num = float(re.sub(r"[^0-9\.]", "", txt.split("천만", 1)[0]) or "0")
+                parsed = int(num * 10_000_000)
+            elif "백만" in txt:
+                num = float(re.sub(r"[^0-9\.]", "", txt.split("백만", 1)[0]) or "0")
+                parsed = int(num * 1_000_000)
+            elif "만" in txt:
+                num = float(re.sub(r"[^0-9\.]", "", txt.split("만", 1)[0]) or "0")
+                parsed = int(num * 10_000)
+            else:
+                raw_num = int(float(re.sub(r"[^0-9\.\-]", "", txt) or "0"))
+                if raw_num > 0:
+                    # 네이버 폴링 API가 단위 접미사 없이 백만원 단위로 내려주는 경우 보정
+                    if approx > 0 and raw_num < max(1, approx // 50_000):
+                        parsed = raw_num * 1_000_000
+                    else:
+                        parsed = raw_num
+        except ValueError:
+            parsed = 0
+    if parsed <= 0 and approx > 0:
+        return approx
+    return max(0, parsed)
+
+
+def _detect_quote_caution(row: dict[str, Any], pct: float, market_status: str) -> str:
+    ms_upper = str(market_status or "UNKNOWN").strip().upper()
+    stop_obj = row.get("tradeStopType")
+    if isinstance(stop_obj, dict):
+        stop_code = str(stop_obj.get("code") or "").strip().upper()
+        stop_text = str(stop_obj.get("text") or stop_obj.get("name") or "").strip()
+    else:
+        stop_code = str(stop_obj or "").strip().upper()
+        stop_text = ""
+
+    if (
+        any(k in ms_upper for k in ("HALT", "SUSP", "STOP"))
+        or "정지" in ms_upper
+        or "정지" in stop_text
+        or stop_code in ("2", "HALT", "SUSP", "STOP", "TRADING_HALT")
+    ):
+        return "거래정지"
+    if "VI" in ms_upper or "변동성완화" in stop_text or stop_code == "VI":
+        return "VI발동"
+    if ms_upper not in ("CLOSE", "CLOSED") and pct >= UPPER_LIMIT_LOCK_PCT:
+        return "상한가잠김"
+    return ""
+
+
+def _fetch_naver_prev_trading_value(code: str, today_ymd: str) -> int:
+    """네이버 일봉 fchart XML(최근 3거래일)에서 직전 거래일 거래대금(종가×거래량)을 조회·캐싱."""
+    cache_key = (today_ymd, code)
+    if cache_key in _PREV_TRADING_VALUE_CACHE:
+        return _PREV_TRADING_VALUE_CACHE[cache_key]
+
+    url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count=3&requestType=0"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=4) as resp:
+        raw_txt = resp.read().decode("utf-8", errors="ignore")
+
+    candles: list[tuple[str, int, int]] = []
+    for data_attr in re.findall(r'data="([^"]+)"', raw_txt):
+        parts = data_attr.split("|")
+        if len(parts) < 6:
+            continue
+        ymd = parts[0].strip()
+        try:
+            close_px = abs(int(parts[4].strip()))
+            day_vol = max(0, int(parts[5].strip()))
+        except ValueError:
+            continue
+        if len(ymd) == 8 and ymd.isdigit() and close_px > 0:
+            candles.append((ymd, close_px, day_vol))
+
+    if not candles:
+        return 0
+
+    if candles[-1][0] == today_ymd:
+        prev_row = candles[-2] if len(candles) >= 2 else None
+    else:
+        prev_row = candles[-1]
+
+    prev_val = (prev_row[1] * prev_row[2]) if prev_row is not None else 0
+    if len(_PREV_TRADING_VALUE_CACHE) > 4000:
+        _PREV_TRADING_VALUE_CACHE.clear()
+    _PREV_TRADING_VALUE_CACHE[cache_key] = prev_val
+    return prev_val
+
+
+def fetch_naver_quotes(codes: list[str], *, now: datetime | None = None) -> dict[str, StockQuote]:
     uniq = list(dict.fromkeys(c.zfill(6) for c in codes if c))
     if not uniq:
         return {}
@@ -2591,14 +2963,21 @@ def fetch_naver_quotes(codes: list[str]) -> dict[str, StockQuote]:
             pct = -abs(pct)
             chg = -abs(chg)
         vol = _int(row.get("accumulatedTradingVolume"))
+        m_status = str(row.get("marketStatus") or "UNKNOWN")
+        raw_tv = row.get("accumulatedTradingValueRaw") or row.get("accumulatedTradingValue")
+        trading_val = _parse_trading_value_krw(raw_tv, price, vol)
+        caution = _detect_quote_caution(row, pct, m_status)
         return StockQuote(
             code=code.zfill(6) if code.isdigit() else code,
             price=price,
             change=chg,
             change_pct=round(pct, 2),
             volume=vol,
-            market_status=str(row.get("marketStatus") or "UNKNOWN"),
+            market_status=m_status,
             reaction_stage=classify_stage(pct, vol),
+            trading_value=trading_val,
+            prev_trading_value=0,
+            caution_status=caution,
         )
 
     quotes: dict[str, StockQuote] = {}
@@ -2628,11 +3007,36 @@ def fetch_naver_quotes(codes: list[str]) -> dict[str, StockQuote]:
                 quotes[q.code] = q
         except Exception:
             pass
+
+    today_ymd = StateStore._now_kst(now).strftime("%Y%m%d")
+    for code, q in quotes.items():
+        if q.prev_trading_value > 0:
+            continue
+        try:
+            q.prev_trading_value = _fetch_naver_prev_trading_value(code, today_ymd)
+        except Exception:
+            pass
+
     return quotes
 
 
 class GeminiAuthError(RuntimeError):
     """GEMINI_API_KEY 누락 또는 유효하지 않은 키 오류."""
+
+
+def resolve_gemini_api_keys(raw_key: str | None = None) -> list[str]:
+    """단일 GEMINI_API_KEY 및 다중 프로젝트 GEMINI_API_KEYS(쉼표/공백 구분)를 순서 유지·중복 제거하여 반환."""
+    candidates: list[str] = []
+    if raw_key is not None:
+        candidates.extend(re.split(r"[,\s]+", raw_key.strip()))
+    else:
+        multi_env = (os.getenv("GEMINI_API_KEYS") or "").strip()
+        single_env = (os.getenv("GEMINI_API_KEY") or "").strip()
+        if multi_env:
+            candidates.extend(re.split(r"[,\s]+", multi_env))
+        if single_env:
+            candidates.extend(re.split(r"[,\s]+", single_env))
+    return list(dict.fromkeys(k.strip() for k in candidates if k and k.strip()))
 
 
 def _env_str(name: str, default: str) -> str:
@@ -2708,79 +3112,107 @@ def call_gemini(
     stage: str = "other",
     now: datetime | None = None,
 ) -> tuple[dict[str, Any], str]:
-    if not api_key:
-        raise GeminiAuthError("GEMINI_API_KEY가 비어 있습니다. GitHub Secrets에 등록하세요.")
+    keys = resolve_gemini_api_keys(api_key)
+    if not keys:
+        raise GeminiAuthError("GEMINI_API_KEY가 비어 있습니다. GitHub Secrets 또는 .env에 등록하세요.")
     if not models:
         raise RuntimeError("호출할 Gemini 모델 목록이 비어 있습니다.")
 
+    multi_key = len(keys) > 1
     last_err: Exception | None = None
+    last_auth_err: GeminiAuthError | None = None
     attempted_any = False
+
     for model in models:
         if state is not None and state.is_model_exhausted(model, now=now):
             logger.info("Gemini %s 일일 할당량 소진 서킷 브레이커 활성 — 폴백 모델로 스킵합니다.", model)
             continue
-        attempted_any = True
+
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        gen_cfg = build_gemini_generation_config(
-            model,
-            thinking_level=thinking_level,
-            thinking_budget=thinking_budget,
-        )
-        for attempt in range(2):
-            t0 = time.monotonic()
-            if state is not None:
-                state.record_ai_request(model, stage=stage, now=now)
-            body = json.dumps({
-                "systemInstruction": {"parts": [{"text": system_prompt}]},
-                "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-                "generationConfig": gen_cfg,
-            }).encode("utf-8")
-            try:
-                req = urllib.request.Request(
-                    url,
-                    data=body,
-                    headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    res = json.loads(resp.read().decode("utf-8"))
-                parts = (res.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
-                text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-                if not text:
-                    text = "".join(p.get("text", "") for p in parts)
-                elapsed = time.monotonic() - t0
-                thoughts = (res.get("usageMetadata") or {}).get("thoughtsTokenCount")
-                if thoughts is not None:
-                    logger.info("Gemini %s 응답 완료 (%.1fs, thoughts=%s)", model, elapsed, thoughts)
-                else:
-                    logger.info("Gemini %s 응답 완료 (%.1fs)", model, elapsed)
-                return extract_json(text), model
-            except urllib.error.HTTPError as exc:
-                err_txt = exc.read().decode("utf-8", errors="ignore")[:260]
-                logger.warning(
-                    "Gemini %s HTTP %d (시도 %d, %.1fs): %s",
-                    model, exc.code, attempt + 1, time.monotonic() - t0, err_txt,
-                )
-                last_err = exc
-                if exc.code == 400 and "api key" in err_txt.lower():
-                    raise GeminiAuthError(f"Gemini API 키 오류 (HTTP 400): {err_txt}") from exc
-                if exc.code == 400 and "thinking" in err_txt.lower() and "thinkingConfig" in gen_cfg and attempt == 0:
-                    logger.info("Gemini %s thinkingConfig 미지원 감지 — 기본 설정으로 재시도합니다.", model)
-                    gen_cfg = {k: v for k, v in gen_cfg.items() if k != "thinkingConfig"}
-                    continue
-                if exc.code == 429 and is_daily_quota_error(err_txt):
-                    if state is not None:
-                        state.mark_model_exhausted(model, now=now)
-                    logger.warning("Gemini %s 일일 할당량 소진 감지 — 태평양 자정까지 폴백 체인에서 제외합니다.", model)
+        for key_idx, active_key in enumerate(keys):
+            slot_id = f"{model}#k{key_idx + 1}" if multi_key else model
+            if multi_key and state is not None and state.is_model_exhausted(slot_id, now=now):
+                continue
+
+            attempted_any = True
+            gen_cfg = build_gemini_generation_config(
+                model,
+                thinking_level=thinking_level,
+                thinking_budget=thinking_budget,
+            )
+            for attempt in range(2):
+                t0 = time.monotonic()
+                if state is not None:
+                    state.record_ai_request(model, stage=stage, now=now)
+                body = json.dumps({
+                    "systemInstruction": {"parts": [{"text": system_prompt}]},
+                    "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                    "generationConfig": gen_cfg,
+                }).encode("utf-8")
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        data=body,
+                        headers={"Content-Type": "application/json", "x-goog-api-key": active_key},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        res = json.loads(resp.read().decode("utf-8"))
+                    parts = (res.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+                    text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+                    if not text:
+                        text = "".join(p.get("text", "") for p in parts)
+                    elapsed = time.monotonic() - t0
+                    thoughts = (res.get("usageMetadata") or {}).get("thoughtsTokenCount")
+                    if thoughts is not None:
+                        logger.info("Gemini %s 응답 완료 (%.1fs, thoughts=%s)", model, elapsed, thoughts)
+                    else:
+                        logger.info("Gemini %s 응답 완료 (%.1fs)", model, elapsed)
+                    return extract_json(text), model
+                except urllib.error.HTTPError as exc:
+                    err_txt = exc.read().decode("utf-8", errors="ignore")[:260]
+                    logger.warning(
+                        "Gemini %s HTTP %d (시도 %d, %.1fs): %s",
+                        slot_id, exc.code, attempt + 1, time.monotonic() - t0, err_txt,
+                    )
+                    last_err = exc
+                    if exc.code == 400 and "api key" in err_txt.lower():
+                        auth_exc = GeminiAuthError(f"Gemini API 키 오류 (HTTP 400): {err_txt}")
+                        if not multi_key:
+                            raise auth_exc from exc
+                        last_auth_err = auth_exc
+                        break
+                    if exc.code == 400 and "thinking" in err_txt.lower() and "thinkingConfig" in gen_cfg and attempt == 0:
+                        logger.info("Gemini %s thinkingConfig 미지원 감지 — 기본 설정으로 재시도합니다.", model)
+                        gen_cfg = {k: v for k, v in gen_cfg.items() if k != "thinkingConfig"}
+                        continue
+                    if exc.code == 429 and is_daily_quota_error(err_txt):
+                        if state is not None:
+                            state.mark_model_exhausted(slot_id, now=now)
+                            if multi_key and all(
+                                state.is_model_exhausted(f"{model}#k{i + 1}", now=now)
+                                for i in range(len(keys))
+                            ):
+                                state.mark_model_exhausted(model, now=now)
+                        logger.warning(
+                            "Gemini %s 일일 할당량 소진 감지 — %s",
+                            slot_id,
+                            "다음 프로젝트 API 키로 전환합니다." if (multi_key and key_idx + 1 < len(keys)) else "태평양 자정까지 폴백 체인에서 제외합니다.",
+                        )
+                        break
+                    if exc.code in (429, 503) and attempt == 0:
+                        time.sleep(3)
+                        continue
                     break
-                if exc.code in (429, 503) and attempt == 0:
-                    time.sleep(3)
-                    continue
-                break
-            except Exception as exc:
-                logger.warning("Gemini %s 오류 (%.1fs): %s", model, time.monotonic() - t0, exc)
-                last_err = exc
-                break
+                except Exception as exc:
+                    logger.warning("Gemini %s 오류 (%.1fs): %s", slot_id, time.monotonic() - t0, exc)
+                    last_err = exc
+                    break
+
+    if last_auth_err is not None and last_err is None:
+        raise last_auth_err
+    if last_auth_err is not None and isinstance(last_err, urllib.error.HTTPError) and last_err.code == 400:
+        raise last_auth_err
     if not attempted_any:
         raise RuntimeError("모든 Gemini 모델이 오늘(태평양 시간) 일일 할당량 소진 상태입니다.")
     raise RuntimeError(f"모든 Gemini 모델 호출 실패: {last_err}")
@@ -2833,13 +3265,17 @@ def format_telegram_html(
                 qtxt = f"{q.price:,}원 ({sign}{q.change_pct:.2f}%) · {q.reaction_stage}"
             else:
                 qtxt = "시세 확인중"
+            liq_note = format_liquidity_note(q)
             naver = f"https://m.stock.naver.com/domestic/stock/{code}/total"
-            lines.append(
+            stock_lines = [
                 f"{icon} <a href=\"{naver}\"><b>{esc(s['name'])}({code})</b></a> "
-                f"[{esc(s.get('order_tier', '2차 파급'))} / {esc(s.get('revenue_link', '부분연관'))}]\n"
-                f"   ├ 현재 반응: {esc(qtxt)}\n"
-                f"   └ 연결 근거: {esc(s.get('reason', ''))}"
-            )
+                f"[{esc(s.get('order_tier', '2차 파급'))} / {esc(s.get('revenue_link', '부분연관'))}]",
+                f"   ├ 현재 반응: {esc(qtxt)}",
+            ]
+            if liq_note:
+                stock_lines.append(f"   ├ 유동성·체결: {esc(liq_note)}")
+            stock_lines.append(f"   └ 연결 근거: {esc(s.get('reason', ''))}")
+            lines.append("\n".join(stock_lines))
 
     lines += [
         "",
@@ -2942,13 +3378,17 @@ def format_premarket_digest_html(
                     qtxt = f"{q.price:,}원 ({sign}{q.change_pct:.2f}%) · {q.reaction_stage}"
                 else:
                     qtxt = "장전 시세 대기"
+                liq_note = format_liquidity_note(q)
                 naver = f"https://m.stock.naver.com/domestic/stock/{code}/total"
-                lines.append(
+                stock_lines = [
                     f"{icon} <a href=\"{naver}\"><b>{esc(s['name'])}({code})</b></a> "
-                    f"[{esc(s.get('order_tier', '2차 파급'))} / {esc(s.get('revenue_link', '부분연관'))}]\n"
-                    f"   ├ 현재 반응: {esc(qtxt)}\n"
-                    f"   └ 연결 근거: {esc(s.get('reason', ''))}"
-                )
+                    f"[{esc(s.get('order_tier', '2차 파급'))} / {esc(s.get('revenue_link', '부분연관'))}]",
+                    f"   ├ 현재 반응: {esc(qtxt)}",
+                ]
+                if liq_note:
+                    stock_lines.append(f"   ├ 유동성·체결: {esc(liq_note)}")
+                stock_lines.append(f"   └ 연결 근거: {esc(s.get('reason', ''))}")
+                lines.append("\n".join(stock_lines))
         if report.get("entry_strategy"):
             lines.append(f"📘 <b>전략</b>: {esc(report['entry_strategy'])}")
         if articles:
@@ -3195,6 +3635,7 @@ def _run_stage2_pipeline(
     title_prefix: str = "",
     stock_dedup_hours: int = DEFAULT_STOCK_DEDUP_HOURS,
     recent_alerts_override: list[dict[str, Any]] | None = None,
+    min_trading_value_eok: float = DEFAULT_MIN_TRADING_VALUE_EOK,
 ) -> dict[str, Any]:
     matched = (
         list(matched_override)
@@ -3212,12 +3653,19 @@ def _run_stage2_pipeline(
         row = {k: v for k, v in m.items() if k != "_score"}
         q = quotes.get(m["code"])
         if q:
-            row["quote"] = {
+            q_info: dict[str, Any] = {
                 "price": q.price,
                 "change_pct": q.change_pct,
                 "volume": q.volume,
                 "reaction_stage": q.reaction_stage,
             }
+            eff_krw = effective_trading_value_krw(q)
+            if eff_krw > 0:
+                q_info["eff_trading_value_eok"] = round(eff_krw / 100_000_000, 2)
+            _, c_reason = assess_quote_executability(q)
+            if c_reason:
+                q_info["caution_status"] = c_reason
+            row["quote"] = q_info
         enriched.append(row)
 
     deep_raw, deep_model = call_gemini(
@@ -3275,7 +3723,12 @@ def _run_stage2_pipeline(
         now=now,
         window_hours=stock_dedup_hours,
     )
-    kept_stocks = stock_filter["kept_stocks"]
+    liquidity_filter = filter_illiquid_bullish_stocks(
+        stock_filter["kept_stocks"],
+        quotes,
+        min_trading_value_eok=min_trading_value_eok,
+    )
+    kept_stocks = liquidity_filter["kept_stocks"]
 
     deep_raw["stocks"] = kept_stocks
     deep_raw["catalyst_score"] = catalyst_score
@@ -3325,7 +3778,115 @@ def _run_stage2_pipeline(
         "quotes": quotes,
         "report": deep_raw,
         "stock_filter": stock_filter,
+        "liquidity_filter": liquidity_filter,
         "sector": sector,
+    }
+
+
+def _build_stage1_fallback_digest_entry(
+    *,
+    cluster: EventCluster,
+    cand: dict[str, Any],
+    matched: list[dict[str, Any]],
+    min_score: float,
+    now: datetime,
+    title_prefix: str = "",
+    stock_dedup_hours: int = DEFAULT_STOCK_DEDUP_HOURS,
+    recent_alerts: list[dict[str, Any]] | None = None,
+    min_trading_value_eok: float = DEFAULT_MIN_TRADING_VALUE_EOK,
+    quotes_override: dict[str, StockQuote] | None = None,
+) -> dict[str, Any]:
+    """07:50 장전 요약 시 Stage 2 모델 전원이 429/503/타임아웃으로 실패해도 야간 후보가 증발하지 않도록
+    Stage 1 분석 요약 + KRX 검증 후보 + 시세·거래대금만으로 무손실 요약 엔트리를 생성한다 (AI 호출 0회).
+    """
+    quotes = (
+        dict(quotes_override)
+        if quotes_override is not None
+        else fetch_naver_quotes([m["code"] for m in matched])
+    )
+    why = str(cand.get("why_notable") or "").strip()
+    raw_stocks = [
+        {
+            "code": m["code"],
+            "name": m["name"],
+            "direction": "하락주의" if m["order_type"] == "피해_우려" else "상승수혜",
+            "order_tier": "2차 파급(핵심)" if m["order_type"] == "2차_수혜" else "1차 직접",
+            "revenue_link": "검토필요",
+            "reason": f"{why + ' · ' if why else ''}주요제품: {str(m.get('products') or '')[:80]}",
+        }
+        for m in matched[:4]
+    ]
+    catalyst_score = float(cand.get("catalyst_score", min_score) or min_score)
+    stock_filter = filter_recently_alerted_stocks(
+        raw_stocks,
+        catalyst_score=catalyst_score,
+        recent_alerts=list(recent_alerts or []),
+        now=now,
+        window_hours=stock_dedup_hours,
+    )
+    liquidity_filter = filter_illiquid_bullish_stocks(
+        stock_filter["kept_stocks"],
+        quotes,
+        min_trading_value_eok=min_trading_value_eok,
+    )
+    kept_stocks = liquidity_filter["kept_stocks"]
+
+    eff_prefix = title_prefix or ("[후속] " if stock_filter["escalated"] else "")
+    base_title = str(cluster.headline or cand.get("theme_key") or "간밤 주요 이슈")
+    title = f"{eff_prefix}{base_title}" if (eff_prefix and not base_title.startswith(eff_prefix)) else base_title
+    summary = str(cand.get("event_summary") or cluster.headline or "")
+    strategy = (
+        f"{why} (AI 심층 모델 혼잡으로 Stage 1 핵심 요약·KRX 검증 종목 우선 전달 — 시초가 거래대금 확인)"
+        if why
+        else "AI 심층 모델 혼잡으로 Stage 1 핵심 요약·KRX 검증 종목을 우선 전달합니다. 시초가 호가와 거래대금을 확인하세요."
+    )
+    report: dict[str, Any] = {
+        "title": title,
+        "catalyst_score": catalyst_score,
+        "event_summary": summary,
+        "beneficiary_sectors": [str(k) for k in (cand.get("second_order_keywords") or [])[:3] if str(k).strip()],
+        "negative_sectors": [str(k) for k in (cand.get("negative_keywords") or [])[:2] if str(k).strip()],
+        "stocks": kept_stocks,
+        "entry_strategy": strategy,
+    }
+    sector = classify_alert_sector(
+        theme_key=str(cand.get("theme_key") or ""),
+        second_keywords=list(cand.get("second_order_keywords") or []),
+        first_keywords=list(cand.get("first_order_keywords") or []),
+        headline=cluster.headline,
+        summary=summary,
+    )
+    raw_kws = list(cand.get("first_order_keywords") or []) + list(cand.get("second_order_keywords") or [])
+    norm_kws = list(dict.fromkeys(tok for kw in raw_kws for tok in extract_normalized_tokens(str(kw))))
+    alert_meta = {
+        "tokens": top_cluster_tokens(cluster, limit=8),
+        "keywords": norm_kws,
+        "cand_codes": [m["code"] for m in matched],
+        "final_codes": [s["code"] for s in kept_stocks],
+        "catalyst_score": catalyst_score,
+        "title": title,
+        "sector": sector,
+        "stocks": [
+            {
+                "code": s["code"],
+                "name": s["name"],
+                "direction": str(s.get("direction") or ""),
+                "order_tier": str(s.get("order_tier") or ""),
+                "revenue_link": str(s.get("revenue_link") or ""),
+            }
+            for s in kept_stocks
+        ],
+    }
+    return {
+        "title": title,
+        "model": "stage1-fallback",
+        "alert_meta": alert_meta,
+        "quotes": quotes,
+        "report": report,
+        "stock_filter": stock_filter,
+        "liquidity_filter": liquidity_filter,
+        "sector": sector,
+        "is_fallback": True,
     }
 
 
@@ -3346,6 +3907,7 @@ def _build_stage2_message(
     matched_override: list[dict[str, Any]] | None = None,
     title_prefix: str = "",
     stock_dedup_hours: int = DEFAULT_STOCK_DEDUP_HOURS,
+    min_trading_value_eok: float = DEFAULT_MIN_TRADING_VALUE_EOK,
 ) -> tuple[str, str, str, dict[str, Any]]:
     res = _run_stage2_pipeline(
         api_key=api_key,
@@ -3363,6 +3925,7 @@ def _build_stage2_message(
         matched_override=matched_override,
         title_prefix=title_prefix,
         stock_dedup_hours=stock_dedup_hours,
+        min_trading_value_eok=min_trading_value_eok,
     )
     return res["msg"], res["title"], res["model"], res["alert_meta"]
 
@@ -3437,7 +4000,7 @@ def run_live(
     base_dir = data_dir if data_dir is not None else Path("data")
     runtime_cfg = load_runtime_config(base_dir)
 
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    api_key = ",".join(resolve_gemini_api_keys())
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     tg_chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     min_score = float(
@@ -3481,6 +4044,14 @@ def run_live(
             runtime_cfg["max_bullish_prepriced_pct"]
             if runtime_cfg.get("max_bullish_prepriced_pct") is not None
             else _env_float("MAX_BULLISH_PREPRICED_PCT", DEFAULT_MAX_BULLISH_PREPRICED_PCT)
+        ),
+    )
+    min_trading_value_eok = max(
+        0.0,
+        float(
+            runtime_cfg["min_trading_value_eok"]
+            if runtime_cfg.get("min_trading_value_eok") is not None
+            else _env_float("MIN_TRADING_VALUE_EOK", DEFAULT_MIN_TRADING_VALUE_EOK)
         ),
     )
     cooldown_h = max(
@@ -3575,6 +4146,7 @@ def run_live(
         "stock_dedup_hours": stock_dedup_hours,
         "max_daily_per_sector": max_daily_per_sector,
         "max_bullish_prepriced_pct": max_bullish_prepriced_pct,
+        "min_trading_value_eok": min_trading_value_eok,
     })
 
     companies: dict[str, dict[str, str]] | None = None
@@ -3627,7 +4199,7 @@ def run_live(
 
     def _serialize_perf_quotes(quotes: dict[str, StockQuote]) -> dict[str, dict[str, Any]]:
         return {
-            c: {"price": int(q.price), "change_pct": float(q.change_pct)}
+            c: q.to_dict()
             for c, q in quotes.items()
             if q and int(q.price) > 0
         }
@@ -3638,9 +4210,7 @@ def run_live(
             return out
         for c, v in raw_q.items():
             if isinstance(v, dict) and int(v.get("price") or 0) > 0:
-                price = int(v["price"])
-                pct = float(v.get("change_pct") or 0.0)
-                out[str(c)] = StockQuote(str(c), price, 0, pct, 0, "UNKNOWN", "")
+                out[str(c)] = StockQuote.from_dict(str(c), v)
         return out
 
     def _ensure_companies(tag: str) -> dict[str, dict[str, str]]:
@@ -3649,6 +4219,167 @@ def run_live(
             companies = load_krx_master(base_dir / "krx_master.json", allow_network=True)
             logger.info("%s KRX 상장사 DB 로드 완료: %d개 기업", tag, len(companies))
         return companies
+
+    def _prewarm_overnight_digest(prewarm_now: datetime, tag: str, cycle: int) -> None:
+        """장전 요약(07:50) 직전 07:30~07:49 구간에 사이클당 최대 1건씩 Stage 2를 미리 분산 계산하여
+        07:50 정각 동시 호출 폭주(503/429)를 원천 방지한다.
+        """
+        nonlocal ai_calls
+        state.prune_overnight_queue(now=prewarm_now)
+        if not state.overnight_queue:
+            return
+        state.overnight_queue.sort(
+            key=lambda d: (-float(d.get("catalyst_score", 0.0) or 0.0), str(d.get("created_at", "")))
+        )
+        warm_cap = max(1, max_offhours) + 1
+        target_entry: dict[str, Any] | None = None
+        for entry in state.overnight_queue[:warm_cap]:
+            if isinstance(entry.get("precomputed_s2"), dict):
+                continue
+            if int(entry.get("prewarm_attempts") or 0) > 0:
+                continue
+            target_entry = entry
+            break
+        if target_entry is None:
+            return
+
+        cluster = EventCluster.from_dict(target_entry.get("cluster") or {})
+        cand = dict(target_entry.get("stage1") or {})
+        tkey = str(target_entry.get("theme_key") or cluster.cluster_id)
+        comps = _ensure_companies(tag)
+        matched = match_krx_stocks(
+            comps,
+            cand.get("second_order_keywords") or [],
+            cand.get("first_order_keywords") or [],
+            cand.get("negative_keywords") or [],
+        )
+        target_entry["prewarm_attempts"] = int(target_entry.get("prewarm_attempts") or 0) + 1
+        try:
+            s2_pw = _run_stage2_pipeline(
+                api_key=api_key,
+                deep_models=deep_models,
+                deep_thinking_level=deep_thinking_level,
+                deep_thinking_budget=deep_thinking_budget,
+                deep_timeout=deep_timeout,
+                min_score=min_score,
+                companies=comps,
+                cluster=cluster,
+                cand=cand,
+                delay_note=None,
+                now=prewarm_now,
+                state=state,
+                matched_override=matched,
+                stock_dedup_hours=stock_dedup_hours,
+                min_trading_value_eok=min_trading_value_eok,
+            )
+            ai_calls += 1
+            target_entry["precomputed_s2"] = {
+                "report": s2_pw["report"],
+                "alert_meta": s2_pw["alert_meta"],
+                "sector": s2_pw["sector"],
+                "title": s2_pw["title"],
+                "model": s2_pw["model"],
+                "quotes": _serialize_perf_quotes(s2_pw["quotes"]),
+                "prewarmed_at": prewarm_now.isoformat(),
+            }
+            if not dry_run:
+                state.save(now=prewarm_now)
+            logger.info("%s 장전 요약 사전 분석(Pre-warm) 완료 (%s): %s", tag, s2_pw["model"], tkey)
+            trace.emit({
+                "ts": prewarm_now.isoformat(),
+                "type": "premarket_digest_prewarm",
+                "cycle": cycle,
+                "status": "ok",
+                "theme_key": tkey,
+                "model": s2_pw["model"],
+            })
+        except GeminiAuthError:
+            raise
+        except Exception as exc:
+            if not dry_run:
+                state.save(now=prewarm_now)
+            logger.warning("%s 장전 요약 사전 분석(Pre-warm) 실패 — 07:50 폴백 유지(%s): %s", tag, tkey, exc)
+            trace.emit({
+                "ts": prewarm_now.isoformat(),
+                "type": "premarket_digest_prewarm",
+                "cycle": cycle,
+                "status": "error",
+                "theme_key": tkey,
+                "error": str(exc)[:120],
+            })
+
+    def _restore_precomputed_s2(
+        pre_s2: dict[str, Any],
+        *,
+        cluster: EventCluster,
+        cand: dict[str, Any],
+        matched: list[dict[str, Any]],
+        title_prefix: str,
+        flush_now: datetime,
+        local_recent: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        cached_quotes = _deserialize_perf_quotes(pre_s2.get("quotes"))
+        fresh_quotes = fetch_naver_quotes([m["code"] for m in matched]) if matched else {}
+        quotes = fresh_quotes if fresh_quotes else cached_quotes
+        report = dict(pre_s2.get("report") or {})
+        raw_stocks = [dict(s) for s in (report.get("stocks") or []) if isinstance(s, dict)]
+        score_val = float(report.get("catalyst_score") or cand.get("catalyst_score") or min_score)
+        stock_filter = filter_recently_alerted_stocks(
+            raw_stocks,
+            catalyst_score=score_val,
+            recent_alerts=local_recent,
+            now=flush_now,
+            window_hours=stock_dedup_hours,
+        )
+        liquidity_filter = filter_illiquid_bullish_stocks(
+            stock_filter["kept_stocks"],
+            quotes,
+            min_trading_value_eok=min_trading_value_eok,
+        )
+        kept_stocks = liquidity_filter["kept_stocks"]
+        report["stocks"] = kept_stocks
+        eff_prefix = title_prefix or ("[후속] " if stock_filter["escalated"] else "")
+        base_title = str(pre_s2.get("title") or report.get("title") or cluster.headline)
+        title = f"{eff_prefix}{base_title}" if (eff_prefix and not base_title.startswith(eff_prefix)) else base_title
+        report["title"] = title
+        sector = str(pre_s2.get("sector") or "") or classify_alert_sector(
+            theme_key=str(cand.get("theme_key") or ""),
+            second_keywords=list(cand.get("second_order_keywords") or []),
+            first_keywords=list(cand.get("first_order_keywords") or []),
+            headline=cluster.headline,
+            summary=str(report.get("event_summary") or ""),
+        )
+        base_meta = dict(pre_s2.get("alert_meta") or {})
+        alert_meta = {
+            "tokens": list(base_meta.get("tokens") or top_cluster_tokens(cluster, limit=8)),
+            "keywords": list(base_meta.get("keywords") or []),
+            "cand_codes": [m["code"] for m in matched],
+            "final_codes": [s["code"] for s in kept_stocks],
+            "catalyst_score": score_val,
+            "title": title,
+            "sector": sector,
+            "stocks": [
+                {
+                    "code": s["code"],
+                    "name": s["name"],
+                    "direction": str(s.get("direction") or ""),
+                    "order_tier": str(s.get("order_tier") or ""),
+                    "revenue_link": str(s.get("revenue_link") or ""),
+                }
+                for s in kept_stocks
+            ],
+        }
+        return {
+            "title": title,
+            "model": str(pre_s2.get("model") or "prewarm"),
+            "alert_meta": alert_meta,
+            "quotes": quotes,
+            "report": report,
+            "stock_filter": stock_filter,
+            "liquidity_filter": liquidity_filter,
+            "sector": sector,
+            "is_fallback": False,
+        }
 
     def _flush_premarket_digest(flush_now: datetime, tag: str, cycle: int, row_summary: dict[str, Any]) -> None:
         nonlocal ai_calls, sent_this_run
@@ -3660,10 +4391,15 @@ def run_live(
             key=lambda d: (-float(d.get("catalyst_score", 0.0) or 0.0), str(d.get("created_at", ""))),
         )
         digest_limit = max(1, max_offhours)
+        max_live_s2 = digest_limit + 1
         comps = _ensure_companies(tag)
         local_recent = list(state.recent_alerts)
         local_sectors: Counter[str] = Counter()
         digest_entries: list[dict[str, Any]] = []
+        consecutive_s2_errors = 0
+        live_s2_attempts = 0
+        s2_circuit_open = False
+        fallback_count = 0
 
         for entry in queued:
             if len(digest_entries) >= digest_limit:
@@ -3726,34 +4462,93 @@ def run_live(
                 if pre_sf["all_filtered"]:
                     continue
 
-            try:
-                s2 = _run_stage2_pipeline(
-                    api_key=api_key,
-                    deep_models=deep_models,
-                    deep_thinking_level=deep_thinking_level,
-                    deep_thinking_budget=deep_thinking_budget,
-                    deep_timeout=deep_timeout,
-                    min_score=min_score,
-                    companies=comps,
+            pre_s2 = entry.get("precomputed_s2")
+            if isinstance(pre_s2, dict):
+                s2 = _restore_precomputed_s2(
+                    pre_s2,
                     cluster=cluster,
                     cand=cand,
-                    delay_note=None,
+                    matched=matched,
+                    title_prefix=title_prefix,
+                    flush_now=flush_now,
+                    local_recent=local_recent,
+                )
+            elif not s2_circuit_open and live_s2_attempts < max_live_s2:
+                live_s2_attempts += 1
+                try:
+                    s2 = _run_stage2_pipeline(
+                        api_key=api_key,
+                        deep_models=deep_models,
+                        deep_thinking_level=deep_thinking_level,
+                        deep_thinking_budget=deep_thinking_budget,
+                        deep_timeout=deep_timeout,
+                        min_score=min_score,
+                        companies=comps,
+                        cluster=cluster,
+                        cand=cand,
+                        delay_note=None,
+                        now=flush_now,
+                        state=state,
+                        matched_override=matched,
+                        title_prefix=title_prefix,
+                        stock_dedup_hours=stock_dedup_hours,
+                        recent_alerts_override=local_recent,
+                        min_trading_value_eok=min_trading_value_eok,
+                    )
+                    ai_calls += 1
+                    consecutive_s2_errors = 0
+                except GeminiAuthError:
+                    raise
+                except Exception as exc:
+                    consecutive_s2_errors += 1
+                    if consecutive_s2_errors >= 2 or "일일 할당량 소진" in str(exc):
+                        s2_circuit_open = True
+                    logger.warning(
+                        "%s 장전 요약 Stage 2 실패(%s, 연속=%d, 서킷=%s) → Stage 1+KRX 무손실 폴백 전환: %s",
+                        tag, tkey, consecutive_s2_errors, s2_circuit_open, exc,
+                    )
+                    s2 = _build_stage1_fallback_digest_entry(
+                        cluster=cluster,
+                        cand=cand,
+                        matched=matched,
+                        min_score=min_score,
+                        now=flush_now,
+                        title_prefix=title_prefix,
+                        stock_dedup_hours=stock_dedup_hours,
+                        recent_alerts=local_recent,
+                        min_trading_value_eok=min_trading_value_eok,
+                    )
+                    fallback_count += 1
+            else:
+                s2 = _build_stage1_fallback_digest_entry(
+                    cluster=cluster,
+                    cand=cand,
+                    matched=matched,
+                    min_score=min_score,
                     now=flush_now,
-                    state=state,
-                    matched_override=matched,
                     title_prefix=title_prefix,
                     stock_dedup_hours=stock_dedup_hours,
-                    recent_alerts_override=local_recent,
+                    recent_alerts=local_recent,
+                    min_trading_value_eok=min_trading_value_eok,
                 )
-                ai_calls += 1
-            except GeminiAuthError:
-                raise
-            except Exception as exc:
-                logger.warning("%s 장전 요약 Stage 2 실패 스킵(%s): %s", tag, tkey, exc)
-                continue
+                fallback_count += 1
 
             if s2["stock_filter"]["all_filtered"]:
                 logger.info("%s 장전 요약 24h 중복 종목 제외 후 남은 종목 없음 — 스킵: %s", tag, tkey)
+                continue
+            if s2["liquidity_filter"]["all_filtered"]:
+                trace.emit({
+                    "ts": flush_now.isoformat(),
+                    "type": "illiquid_skip",
+                    "cycle": cycle,
+                    "phase": "premarket_digest",
+                    "cluster_id": cluster.cluster_id,
+                    "theme_key": tkey,
+                    "catalyst_score": score_val,
+                    "min_trading_value_eok": min_trading_value_eok,
+                    "details": s2["liquidity_filter"]["details"],
+                })
+                logger.info("%s 장전 요약 유동성/거래정지 기준 미달 스킵(%s): %s", tag, ", ".join(s2["liquidity_filter"]["details"][:3]), tkey)
                 continue
 
             final_sector = s2["sector"]
@@ -3791,7 +4586,7 @@ def run_live(
             state.overnight_queue = []
             if not dry_run:
                 state.save(now=flush_now)
-            logger.info("%s 장전 요약 후보가 중복/섹터 필터 후 0건 — 발송 생략합니다.", tag)
+            logger.info("%s 장전 요약 후보가 중복/섹터/유동성 필터 후 0건 — 발송 생략합니다.", tag)
             return
 
         digest_html = format_premarket_digest_html(digest_entries, now=flush_now)
@@ -3822,7 +4617,10 @@ def run_live(
                 state.last_digest_date = flush_now.strftime("%Y-%m-%d")
                 state.overnight_queue = []
                 state.save(now=flush_now)
-                logger.info("%s 장전 요약(07:50) 텔레그램 발송 완료: %d건 묶음", tag, len(digest_entries))
+                logger.info(
+                    "%s 장전 요약(07:50) 텔레그램 발송 완료: %d건 묶음 (폴백 %d건)",
+                    tag, len(digest_entries), fallback_count,
+                )
             sent_this_run += 1
             row_summary["alerts_sent"] += 1
             trace.emit({
@@ -3830,6 +4628,7 @@ def run_live(
                 "type": "premarket_digest_sent",
                 "cycle": cycle,
                 "count": len(digest_entries),
+                "fallback_count": fallback_count,
                 "themes": [d["theme_key"] for d in digest_entries],
                 "sectors": [d["sector"] for d in digest_entries],
             })
@@ -3861,6 +4660,10 @@ def run_live(
                         logger.info("%s 알림 성과 자동 기록 업데이트: %d건 측정 완료", tag, perf_updated)
                 except Exception as perf_exc:
                     logger.warning("%s 알림 성과 업데이트 스킵: %s", tag, perf_exc)
+
+            # 0-a) 평일 07:30~07:49 장전 요약 후보 사이클당 1건씩 분산 사전 분석(Pre-warm)
+            if offhours_digest_enabled and should_prewarm_premarket_digest(cycle_now, state, offhours_digest_time):
+                _prewarm_overnight_digest(cycle_now, tag, cycle)
 
             # 0-b) 야간 후보 장전 요약(기본 평일 07:50 KST) 자동 발송
             if offhours_digest_enabled and should_flush_premarket_digest(cycle_now, state, offhours_digest_time):
@@ -4027,6 +4830,7 @@ def run_live(
                                     now=now_d,
                                     state=state,
                                     stock_dedup_hours=stock_dedup_hours,
+                                    min_trading_value_eok=min_trading_value_eok,
                                 )
                                 ai_calls += 1
                                 msg_to_send = s2_def["msg"]
@@ -4035,6 +4839,23 @@ def run_live(
                                 alert_meta = s2_def["alert_meta"]
                                 if s2_def["stock_filter"]["all_filtered"]:
                                     logger.info("%s Deferred 24h 종목 중복 제외 후 남은 종목 없음 — 폐기: %s", tag, tkey)
+                                    continue
+                                if s2_def["liquidity_filter"]["all_filtered"]:
+                                    trace.emit({
+                                        "ts": now_d.isoformat(),
+                                        "type": "illiquid_skip",
+                                        "cycle": cycle,
+                                        "phase": "deferred",
+                                        "cluster_id": cid,
+                                        "theme_key": tkey,
+                                        "catalyst_score": float(alert_meta["catalyst_score"]),
+                                        "min_trading_value_eok": min_trading_value_eok,
+                                        "details": s2_def["liquidity_filter"]["details"],
+                                    })
+                                    logger.info(
+                                        "%s Deferred 유동성/거래정지 기준 미달 폐기(%s): %s",
+                                        tag, ", ".join(s2_def["liquidity_filter"]["details"][:3]), tkey,
+                                    )
                                     continue
                                 if max_daily_per_sector > 0 and state.sector_count_today(s2_def["sector"], now=now_d) >= max_daily_per_sector:
                                     logger.info("%s Deferred 섹터 일일 한도 초과 폐기(%s): %s", tag, s2_def["sector"], tkey)
@@ -4279,6 +5100,8 @@ def run_live(
                         market_window=is_market_watch_window(fetch_now),
                         daily_rpd_limit=stage1_rpd_limit,
                         screen_model=primary_screen_model,
+                        digest_mode=_should_queue_for_digest(fetch_now),
+                        digest_time=offhours_digest_time,
                     )
                     execute_stage1 = bool(trig["should_run"] or trigger_mode != "enforce")
                     trace.emit({
@@ -4632,6 +5455,7 @@ def run_live(
                                         matched_override=matched,
                                         title_prefix=title_prefix,
                                         stock_dedup_hours=stock_dedup_hours,
+                                        min_trading_value_eok=min_trading_value_eok,
                                     )
                                     ai_calls += 1
                                     msg = s2_res["msg"]
@@ -4639,6 +5463,7 @@ def run_live(
                                     deep_model = s2_res["model"]
                                     alert_meta = s2_res["alert_meta"]
                                     stock_filter = s2_res["stock_filter"]
+                                    liquidity_filter = s2_res["liquidity_filter"]
                                     final_sector = s2_res["sector"]
                                     logger.info("%s Stage 2 심층 분석 완료 (%s): %s", tag, deep_model, title_str)
                                 except GeminiAuthError:
@@ -4700,6 +5525,30 @@ def run_live(
                                         "단기테마성 잔여 종목만 남아 차단" if stock_filter.get("only_weak_leftovers") else "남은 종목 없음",
                                         ",".join(stock_filter["excluded_codes"][:4]),
                                         tkey,
+                                    )
+                                    continue
+
+                                # 하이브리드 유동성·거래정지 필터 차단 결과 기록 및 차단
+                                if liquidity_filter["excluded_codes"]:
+                                    trace.emit({
+                                        "ts": cand_now.isoformat(),
+                                        "type": "illiquid_skip",
+                                        "cycle": cycle,
+                                        "phase": "pre_send",
+                                        "cluster_id": cid,
+                                        "theme_key": tkey,
+                                        "catalyst_score": score_val,
+                                        "min_trading_value_eok": min_trading_value_eok,
+                                        "excluded_codes": liquidity_filter["excluded_codes"],
+                                        "kept_codes": alert_meta.get("final_codes") or [],
+                                        "details": liquidity_filter["details"],
+                                        "blocked": bool(liquidity_filter["all_filtered"]),
+                                    })
+                                if liquidity_filter["all_filtered"]:
+                                    deferred_reasons[cid] = "illiquid_skip"
+                                    logger.info(
+                                        "%s 최소 거래대금(%.1f억)/거래정지 기준 미달 — 발송 생략(%s): %s",
+                                        tag, min_trading_value_eok, ", ".join(liquidity_filter["details"][:3]), tkey,
                                     )
                                     continue
 

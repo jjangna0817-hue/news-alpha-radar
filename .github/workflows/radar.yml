@@ -64,17 +64,19 @@ jobs:
       - name: Run News Alpha Radar
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GITHUB_EVENT_SCHEDULE: ${{ github.event.schedule }}
           MIN_CATALYST_SCORE: ${{ vars.MIN_CATALYST_SCORE || '7.5' }}
+          MIN_TRADING_VALUE_EOK: ${{ vars.MIN_TRADING_VALUE_EOK || '5.0' }}
           MAX_ALERTS_PER_RUN: ${{ vars.MAX_ALERTS_PER_RUN || '2' }}
           MAX_DAILY_ALERTS: ${{ vars.MAX_DAILY_ALERTS || '10' }}
           THEME_COOLDOWN_HOURS: ${{ vars.THEME_COOLDOWN_HOURS || '12' }}
           MARKET_LOOP_COUNT: ${{ vars.MARKET_LOOP_COUNT || '6' }}
           MARKET_LOOP_INTERVAL_SEC: ${{ vars.MARKET_LOOP_INTERVAL_SEC || '120' }}
-          GEMINI_SCREEN_MODELS: ${{ vars.GEMINI_SCREEN_MODELS || 'gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.8-flash' }}
-          GEMINI_DEEP_MODELS: ${{ vars.GEMINI_DEEP_MODELS || 'gemini-3.6-flash,gemini-3.8-flash,gemini-3.5-flash-lite' }}
+          GEMINI_SCREEN_MODELS: ${{ vars.GEMINI_SCREEN_MODELS || 'gemini-3.5-flash-lite,gemini-2.5-flash-lite,gemini-2.5-flash,gemini-3.6-flash,gemini-3.8-flash' }}
+          GEMINI_DEEP_MODELS: ${{ vars.GEMINI_DEEP_MODELS || 'gemini-3.6-flash,gemini-3.8-flash,gemini-2.5-flash,gemini-3.5-flash-lite,gemini-2.5-flash-lite' }}
           GEMINI_DEEP_THINKING_LEVEL: ${{ vars.GEMINI_DEEP_THINKING_LEVEL || 'LOW' }}
           GEMINI_THINKING_BUDGET: ${{ vars.GEMINI_THINKING_BUDGET || '1024' }}
           GEMINI_SCREEN_TIMEOUT: ${{ vars.GEMINI_SCREEN_TIMEOUT || '25' }}
@@ -86,7 +88,7 @@ jobs:
             python3 radar.py --probe-feeds
             exit 0
           fi
-          if [ "${{ github.event_name }}" = "schedule" ] && [ -z "$GEMINI_API_KEY" ]; then
+          if [ "${{ github.event_name }}" = "schedule" ] && [ -z "$GEMINI_API_KEY" ] && [ -z "$GEMINI_API_KEYS" ]; then
             echo "GEMINI_API_KEY Secret 등록 대기 중..."
             exit 0
           fi
