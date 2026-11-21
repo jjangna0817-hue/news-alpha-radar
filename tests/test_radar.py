@@ -1293,6 +1293,68 @@ class TestRealtimeCallbackFlashAndSelfUpdate(unittest.TestCase):
             self.assertTrue(any(r["type"] == "trigger_decision" and r["reason"] == "realtime_callback_inbox" for r in recs))
             self.assertTrue(any(r["type"] == "flash_alert_sent" for r in recs))
 
+    def test_self_update_propagates_python_bin_and_surfaces_rollback_error(self) -> None:
+        import subprocess
+        import dashboard
+
+        # 1) Updater systemd unit pins PYTHON_BIN=__PYTHON__ and update.sh enforces Python 3.11+
+        svc_txt = (REPO_DIR / "deploy" / "ubuntu" / "news-alpha-updater.service").read_text(encoding="utf-8")
+        self.assertIn("Environment=PYTHON_BIN=__PYTHON__", svc_txt)
+        upd_txt = (REPO_DIR / "deploy" / "ubuntu" / "update.sh").read_text(encoding="utf-8")
+        self.assertIn("_resolve_python_bin", upd_txt)
+        self.assertIn("sys.version_info >= (3, 11)", upd_txt)
+
+        # 2) dashboard.run_self_update passes sys.executable via PYTHON_BIN and surfaces TEST_ERROR on ROLLBACK
+        captured: dict[str, object] = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env") or {}
+            return subprocess.CompletedProcess(
+                cmd,
+                1,
+                stdout="STATUS=ROLLBACK\nPYTHON_BIN=/opt/py312/python3\nTEST_ERROR=AssertionError: boom\n",
+                stderr="",
+            )
+
+        with mock.patch.object(dashboard.subprocess, "run", side_effect=fake_run):
+            res = dashboard.run_self_update(REPO_DIR)
+
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], "ROLLBACK")
+        self.assertEqual(res["python_bin"], "/opt/py312/python3")
+        self.assertIn("AssertionError: boom", res["message"])
+        self.assertEqual(res["error"], res["message"])
+        self.assertEqual(captured["env"]["PYTHON_BIN"], sys.executable)
+
+        # 3) update.sh bash syntax & resolver picks installed systemd ExecStart even when PATH has fake old python3
+        bash_chk = subprocess.run(["bash", "-n", str(REPO_DIR / "deploy" / "ubuntu" / "update.sh")], capture_output=True, text=True)
+        self.assertEqual(bash_chk.returncode, 0, bash_chk.stderr)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            fake_bin = fake_home / "fakebin"
+            fake_bin.mkdir()
+            # Fake old python3 (exits 1 on version check like Python 3.8!)
+            fake_py = fake_bin / "python3"
+            fake_py.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+            fake_py.chmod(0o755)
+            unit_dir = fake_home / ".config" / "systemd" / "user"
+            unit_dir.mkdir(parents=True)
+            (unit_dir / "news-alpha-dashboard.service").write_text(
+                f"[Service]\nExecStart={sys.executable} -u /tmp/dashboard.py\n",
+                encoding="utf-8",
+            )
+            probe_cmd = (
+                f'HOME="{fake_home}" PATH="{fake_bin}:/usr/bin:/bin" '
+                f'bash -c \'UNIT_DIR="$HOME/.config/systemd/user"; REPO_DIR="{REPO_DIR}"; '
+                f'eval "$(sed -n "/^_is_py311_plus/,/^PYTHON_BIN=/p" "{REPO_DIR}/deploy/ubuntu/update.sh")"; '
+                f'echo "$PYTHON_BIN"\''
+            )
+            res_py = subprocess.run(["bash", "-c", probe_cmd], capture_output=True, text=True)
+            self.assertEqual(res_py.returncode, 0, res_py.stderr)
+            self.assertEqual(res_py.stdout.strip(), sys.executable)
+
 
 class TestBacktestFixesAndPerformanceTracking(unittest.TestCase):
     def test_split_alert_limits_resolution_and_legacy_max_daily_compat(self) -> None:

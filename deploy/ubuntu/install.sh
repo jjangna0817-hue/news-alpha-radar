@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-PYTHON_BIN="$(command -v python3 || true)"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
 
 if [ -z "${PYTHON_BIN}" ]; then
   echo "[오류] python3가 설치되어 있지 않습니다. 먼저 설치하세요: sudo apt update && sudo apt install -y python3"
