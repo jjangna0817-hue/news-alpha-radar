@@ -140,7 +140,7 @@ fi
 
 # systemd 유저 유닛 템플릿 최신화
 if [ -d "${UNIT_DIR}" ] && [ -n "${PYTHON_BIN}" ]; then
-  for svc in news-alpha-radar.service news-alpha-dashboard.service news-alpha-updater.service news-alpha-updater.timer news-alpha-telegram.service; do
+  for svc in news-alpha-radar.service news-alpha-dashboard.service news-alpha-updater.service news-alpha-updater.timer news-alpha-telegram.service news-alpha-tunnel.service; do
     if [ -f "${SCRIPT_DIR}/${svc}" ]; then
       sed \
         -e "s|__WORKDIR__|${REPO_DIR}|g" \
@@ -151,10 +151,21 @@ if [ -d "${UNIT_DIR}" ] && [ -n "${PYTHON_BIN}" ]; then
   systemctl --user daemon-reload || true
 fi
 
-# 서비스 재시작 (대시보드 버튼에서 호출된 경우 응답 반환 후 1초 뒤 대시보드 재시작)
+# 서비스 재시작 (터널 서비스는 URL 유지를 위해 미가동 상태이거나 터널 파일 변경 시에만 재시작)
 if command -v systemctl >/dev/null 2>&1; then
   systemctl --user is-active --quiet news-alpha-radar.service && systemctl --user restart news-alpha-radar.service || true
   systemctl --user is-active --quiet news-alpha-telegram.service && systemctl --user restart news-alpha-telegram.service || true
+
+  TUNNEL_RAW="$(grep -E '^DASHBOARD_TUNNEL_ENABLED=' "${REPO_DIR}/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d ' "\r' | tr '[:upper:]' '[:lower:]' || true)"
+  if [ "${TUNNEL_RAW}" != "0" ] && [ "${TUNNEL_RAW}" != "false" ] && [ "${TUNNEL_RAW}" != "no" ] && [ "${TUNNEL_RAW}" != "off" ]; then
+    "${PYTHON_BIN}" "${REPO_DIR}/tunnel_manager.py" --data-dir "${REPO_DIR}/data" --ensure-password >/dev/null 2>&1 || true
+    if ! systemctl --user is-active --quiet news-alpha-tunnel.service; then
+      systemctl --user enable --now news-alpha-tunnel.service || true
+    elif git diff --name-only "${BEFORE_FULL}" HEAD 2>/dev/null | grep -qE '^(tunnel_manager\.py|deploy/ubuntu/news-alpha-tunnel\.service)$'; then
+      systemctl --user restart news-alpha-tunnel.service || true
+    fi
+  fi
+
   if systemctl --user is-active --quiet news-alpha-dashboard.service; then
     if [ "${DEFER_DASHBOARD}" = "1" ]; then
       nohup bash -c 'sleep 1; systemctl --user restart news-alpha-dashboard.service' </dev/null >/dev/null 2>&1 9>&- &

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import hashlib
 import hmac
 import io
 import json
@@ -25,12 +26,14 @@ import time
 import urllib.parse
 from datetime import datetime
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import radar
 import telegram_listener
+import tunnel_manager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +45,35 @@ REPO_DIR = Path(__file__).resolve().parent
 DEFAULT_DASHBOARD_HOST = "0.0.0.0"
 DEFAULT_DASHBOARD_PORT = 8787
 MAX_REQUEST_BODY_BYTES = 64 * 1024
+SESSION_COOKIE_NAME = "nar_session"
+SESSION_TTL_SEC = 30 * 86400
+
+
+def _make_session_token(password: str, *, now_ts: int | None = None) -> str:
+    exp = int(now_ts if now_ts is not None else time.time()) + SESSION_TTL_SEC
+    sig = hmac.new(
+        password.encode("utf-8"),
+        f"nar-session-v1:{exp}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def _verify_session_token(token: str, password: str, *, now_ts: int | None = None) -> bool:
+    if not token or not password or "." not in token:
+        return False
+    exp_str, _, sig = token.partition(".")
+    if not exp_str.isdigit() or not sig:
+        return False
+    cur_ts = int(now_ts if now_ts is not None else time.time())
+    if int(exp_str) <= cur_ts:
+        return False
+    expected = hmac.new(
+        password.encode("utf-8"),
+        f"nar-session-v1:{exp_str}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(sig, expected)
 
 
 def _effective_config(data_dir: Path) -> dict[str, Any]:
@@ -78,6 +110,7 @@ def _effective_config(data_dir: Path) -> dict[str, Any]:
 
     return {
         "paused": bool(raw.get("paused", False)),
+        "tunnel_enabled": tunnel_manager.is_tunnel_enabled(data_dir),
         "instant_flash_alert": instant_flash,
         "telegram_source_channels": tg_channels,
         "min_catalyst_score": float(
@@ -281,12 +314,18 @@ def run_self_update(repo_dir: Path = REPO_DIR) -> dict[str, Any]:
     return out
 
 
-def build_overview_payload(data_dir: Path, now: datetime | None = None) -> dict[str, Any]:
+def build_overview_payload(
+    data_dir: Path,
+    now: datetime | None = None,
+    *,
+    auth_enabled: bool = False,
+) -> dict[str, Any]:
     ref = radar.StateStore._now_kst(now)
     cfg = _effective_config(data_dir)
     state = radar.StateStore(data_dir / "state.json")
     daemon_status = _read_status(data_dir, ref)
     listener_status = _read_listener_status(data_dir, ref)
+    tunnel_status = tunnel_manager.read_tunnel_status(data_dir, now=ref)
     poll_sec, window_label = radar.resolve_daemon_interval_sec(now=ref, runtime_cfg=cfg)
 
     pt_today = radar.pt_date_str(ref)
@@ -369,9 +408,11 @@ def build_overview_payload(data_dir: Path, now: datetime | None = None) -> dict[
     return {
         "now_kst": ref.isoformat(),
         "pt_date": pt_today,
+        "auth_enabled": auth_enabled,
         "git": _read_git_version(),
         "daemon": daemon_status,
         "listener": listener_status,
+        "tunnel": tunnel_status,
         "config": cfg,
         "metrics": {
             "sent_today": state.sent_today(now=ref),
@@ -433,6 +474,8 @@ def validate_and_merge_config(data_dir: Path, patch: dict[str, Any]) -> dict[str
     cur = _effective_config(data_dir)
     if "paused" in patch:
         cur["paused"] = bool(patch["paused"])
+    if "tunnel_enabled" in patch:
+        cur["tunnel_enabled"] = bool(patch["tunnel_enabled"])
     if "instant_flash_alert" in patch:
         cur["instant_flash_alert"] = bool(patch["instant_flash_alert"])
     if "telegram_source_channels" in patch:
@@ -498,6 +541,164 @@ def validate_and_merge_config(data_dir: Path, patch: dict[str, Any]) -> dict[str
         cur["enabled_feeds"] = list(dict.fromkeys(filtered))
 
     return radar.save_runtime_config(data_dir, cur)
+
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>News Alpha Radar — 보안 로그인</title>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css" />
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --surface: #ffffff;
+      --border: #e5e7eb;
+      --border-strong: #d1d5db;
+      --ink: #0f172a;
+      --ink-secondary: #475569;
+      --ink-muted: #64748b;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --red: #dc2626;
+      --red-soft: #fef2f2;
+      --sans: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+      -webkit-font-smoothing: antialiased;
+    }
+    .login-card {
+      width: 100%;
+      max-width: 390px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: 0 4px 20px rgba(15, 23, 42, 0.06);
+      padding: 28px 24px;
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 19px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    p.sub {
+      margin: 0 0 20px;
+      font-size: 13px;
+      color: var(--ink-secondary);
+      line-height: 1.5;
+    }
+    label {
+      display: block;
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--ink-secondary);
+      margin-bottom: 6px;
+    }
+    input[type="password"] {
+      width: 100%;
+      padding: 11px 12px;
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      font-family: inherit;
+      font-size: 15px;
+      color: var(--ink);
+      margin-bottom: 14px;
+    }
+    input[type="password"]:focus {
+      outline: 2px solid #eff6ff;
+      border-color: var(--accent);
+    }
+    button {
+      width: 100%;
+      padding: 11px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #ffffff;
+      font-family: inherit;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: var(--accent-hover); }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .err-box {
+      display: none;
+      margin-bottom: 12px;
+      padding: 9px 11px;
+      border-radius: 8px;
+      background: var(--red-soft);
+      border: 1px solid #fecaca;
+      color: var(--red);
+      font-size: 12.5px;
+      font-weight: 600;
+    }
+    .hint {
+      margin-top: 16px;
+      font-size: 12px;
+      color: var(--ink-muted);
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <main class="login-card">
+    <h1>News Alpha Radar</h1>
+    <p class="sub">외부·모바일 접속 보호를 위해 대시보드 비밀번호를 입력해 주세요.</p>
+    <div id="err-box" class="err-box"></div>
+    <form id="login-form">
+      <label for="pw-input">접속 비밀번호</label>
+      <input id="pw-input" name="password" type="password" autocomplete="current-password" placeholder="비밀번호 입력" required autofocus />
+      <button id="btn-login" type="submit">로그인 (이 기기에서 30일 유지)</button>
+    </form>
+    <div class="hint">
+      • 비밀번호는 텔레그램 안내 메시지 또는 우분투 <code>.env</code>의 <code>DASHBOARD_PASSWORD</code>에서 확인할 수 있습니다.<br />
+      • 1:1 텔레그램 봇 채팅에 <code>/pw</code>를 입력해도 확인할 수 있습니다.
+    </div>
+  </main>
+  <script>
+    document.getElementById("login-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById("btn-login");
+      const errBox = document.getElementById("err-box");
+      const pw = document.getElementById("pw-input").value;
+      btn.disabled = true;
+      btn.textContent = "확인 중...";
+      errBox.style.display = "none";
+      try {
+        const res = await fetch("/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Requested-With": "fetch" },
+          body: JSON.stringify({ password: pw }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || "비밀번호가 올바르지 않습니다.");
+        window.location.replace("/");
+      } catch (err) {
+        errBox.textContent = err.message;
+        errBox.style.display = "block";
+        btn.disabled = false;
+        btn.textContent = "로그인 (이 기기에서 30일 유지)";
+      }
+    });
+  </script>
+</body>
+</html>
+"""
+
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -1047,6 +1248,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <h1>News Alpha Radar</h1>
         <span id="daemon-chip" class="status-chip"><span class="status-dot"></span><span id="daemon-label">연결 중...</span></span>
         <span id="listener-chip" class="status-chip"><span class="status-dot"></span><span id="listener-label">콜백 확인 중</span></span>
+        <span id="tunnel-chip" class="status-chip" style="cursor:pointer;" title="클릭하여 외부 접속 주소 복사"><span class="status-dot"></span><span id="tunnel-label">외부접속 확인 중</span></span>
       </div>
       <div class="actions">
         <button id="btn-scan-now" class="primary" type="button">지금 즉시 스캔</button>
@@ -1054,6 +1256,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button id="btn-demo-alert" type="button">텔레그램 테스트</button>
         <button id="btn-self-update" type="button">최신 코드 업데이트</button>
         <button id="btn-refresh" type="button">새로고침</button>
+        <button id="btn-logout" type="button" style="display:none;">로그아웃</button>
       </div>
     </div>
   </header>
@@ -1246,8 +1449,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
           <div class="card">
             <div class="section-head">
-              <h2>0초 텔레그램 콜백 &amp; 백업 RSS 주기</h2>
-              <span class="muted">채널 저장 시 20초 내 리스너에 자동 반영</span>
+              <h2>외부 접속(LTE/5G) &amp; 0초 콜백 · RSS 주기</h2>
+              <span class="muted">별도 앱 설치 없이 HTTPS 보안 터널 지원</span>
+            </div>
+            <div class="field">
+              <label for="cfg-tunnel-enabled">외부 접속 보안 터널 (LTE/5G 데이터 · 외부 와이파이 접속)</label>
+              <select id="cfg-tunnel-enabled">
+                <option value="true">켜짐 — HTTPS 외부 접속 링크 발급 &amp; 텔레그램 자동 안내 (추천)</option>
+                <option value="false">꺼짐 — 집 와이파이 내부망에서만 접속</option>
+              </select>
+            </div>
+            <div class="field" style="padding:10px 12px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-subtle);">
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
+                <span style="font-size:12px; font-weight:600; color:var(--ink-secondary);">현재 외부 접속 주소</span>
+                <div style="display:flex; gap:6px;">
+                  <button id="btn-copy-tunnel" type="button" style="padding:4px 9px; font-size:12px;">주소 복사</button>
+                  <button id="btn-send-tunnel-link" type="button" style="padding:4px 9px; font-size:12px;">텔레그램으로 링크 받기</button>
+                </div>
+              </div>
+              <div id="tunnel-url-display" class="mono" style="margin-top:6px; word-break:break-all; color:var(--ink);">확인 중...</div>
             </div>
             <div class="field">
               <label for="cfg-tg-channels">구독할 텔레그램 속보 채널 (@아이디 또는 t.me 링크, 줄바꿈·쉼표 구분)</label>
@@ -1410,21 +1630,47 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     async function api(url, opts = {}) {
       const res = await fetch(url, {
-        headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+        headers: { "Content-Type": "application/json", "X-Requested-With": "fetch", ...(opts.headers || {}) },
         ...opts,
       });
+      if (res.status === 401) {
+        window.location.reload();
+        throw new Error("인증 세션이 만료되었습니다. 다시 로그인해 주세요.");
+      }
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || data.message || ("HTTP " + res.status));
       return data;
+    }
+
+    async function copyText(txt) {
+      if (!txt) return false;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(txt);
+          return true;
+        }
+      } catch (_) {}
+      const ta = document.createElement("textarea");
+      ta.value = txt;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
     }
 
     function renderOverview(data) {
       latestOverview = data;
       const d = data.daemon || {};
       const l = data.listener || {};
+      const t = data.tunnel || {};
       const g = data.git || {};
       const m = data.metrics || {};
       const cfg = data.config || {};
+
+      document.getElementById("btn-logout").style.display = data.auth_enabled ? "inline-block" : "none";
 
       const chip = document.getElementById("daemon-chip");
       const label = document.getElementById("daemon-label");
@@ -1453,6 +1699,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } else {
         lChip.className = "status-chip";
         lLabel.textContent = "콜백 미연결 (RSS 전용)";
+      }
+
+      const tChip = document.getElementById("tunnel-chip");
+      const tLabel = document.getElementById("tunnel-label");
+      const tUrlBox = document.getElementById("tunnel-url-display");
+      if (t.alive && t.state === "running" && t.url) {
+        tChip.className = "status-chip running";
+        tLabel.textContent = "외부접속 활성";
+        tChip.title = "클릭하여 복사: " + t.url;
+        tUrlBox.textContent = t.url;
+      } else if (t.alive && (t.state === "starting" || t.state === "installing")) {
+        tChip.className = "status-chip paused";
+        tLabel.textContent = "외부접속 준비 중";
+        tUrlBox.textContent = "보안 터널 연결 중... (수 초 내 발급)";
+      } else if (cfg.tunnel_enabled === false || t.state === "disabled") {
+        tChip.className = "status-chip";
+        tLabel.textContent = "외부접속 꺼짐";
+        tUrlBox.textContent = "집 와이파이 전용 모드 (설정에서 켤 수 있습니다)";
+      } else {
+        tChip.className = "status-chip";
+        tLabel.textContent = "외부접속 미연결";
+        tUrlBox.textContent = t.last_error ? ("오류: " + t.last_error) : "터널 서비스 시작 대기 중";
       }
 
       const updBtn = document.getElementById("btn-self-update");
@@ -1809,6 +2077,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById("cfg-trigger-mode").value = cfg.trigger_mode;
       document.getElementById("cfg-rpd-limit").value = cfg.stage1_daily_rpd_limit;
       document.getElementById("cfg-flash-alert").value = cfg.instant_flash_alert ? "true" : "false";
+      document.getElementById("cfg-tunnel-enabled").value = cfg.tunnel_enabled === false ? "false" : "true";
       document.getElementById("cfg-tg-channels").value = (cfg.telegram_source_channels || []).join("\\n");
       document.getElementById("cfg-int-market").value = cfg.daemon_interval_market_sec;
       document.getElementById("cfg-int-ext").value = cfg.daemon_interval_extended_sec;
@@ -1941,6 +2210,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         trigger_mode: document.getElementById("cfg-trigger-mode").value,
         stage1_daily_rpd_limit: parseInt(document.getElementById("cfg-rpd-limit").value, 10),
         instant_flash_alert: document.getElementById("cfg-flash-alert").value === "true",
+        tunnel_enabled: document.getElementById("cfg-tunnel-enabled").value === "true",
         telegram_source_channels: document.getElementById("cfg-tg-channels").value,
         daemon_interval_market_sec: parseInt(document.getElementById("cfg-int-market").value, 10),
         daemon_interval_extended_sec: parseInt(document.getElementById("cfg-int-ext").value, 10),
@@ -1955,6 +2225,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } catch (err) {
         toast("저장 실패: " + err.message);
       }
+    });
+
+    async function handleCopyTunnelUrl() {
+      const url = latestOverview && latestOverview.tunnel && latestOverview.tunnel.url;
+      if (!url) {
+        toast("아직 발급된 외부 접속 주소가 없습니다.");
+        return;
+      }
+      const ok = await copyText(url);
+      toast(ok ? ("외부 접속 주소 복사 완료: " + url) : url);
+    }
+
+    document.getElementById("tunnel-chip").addEventListener("click", handleCopyTunnelUrl);
+    document.getElementById("btn-copy-tunnel").addEventListener("click", handleCopyTunnelUrl);
+
+    document.getElementById("btn-send-tunnel-link").addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      try {
+        await api("/api/actions/send-tunnel-link", { method: "POST", body: "{}" });
+        toast("텔레그램으로 외부 접속 링크를 전송했습니다.");
+      } catch (err) {
+        toast("링크 전송 실패: " + err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    document.getElementById("btn-logout").addEventListener("click", async () => {
+      try {
+        await api("/api/auth/logout", { method: "POST", body: "{}" });
+      } catch (_) {}
+      window.location.reload();
     });
 
     document.getElementById("btn-toggle-pause").addEventListener("click", async () => {
@@ -2076,48 +2379,98 @@ def create_dashboard_server(
     host: str = DEFAULT_DASHBOARD_HOST,
     port: int = DEFAULT_DASHBOARD_PORT,
     data_dir: Path | None = None,
-    password: str = "",
+    password: str | None = "",
 ) -> ThreadingHTTPServer:
     base_dir = data_dir if data_dir is not None else Path("data")
     base_dir.mkdir(parents=True, exist_ok=True)
     scan_lock = threading.Lock()
+    env_cache: dict[str, Any] = {"mtime": None, "pw": ""}
+    env_lock = threading.Lock()
+
+    def _active_password() -> str:
+        if password is not None:
+            return password
+        env_pw = (os.getenv("DASHBOARD_PASSWORD") or "").strip()
+        env_file = REPO_DIR / ".env"
+        try:
+            st_mtime = env_file.stat().st_mtime_ns if env_file.exists() else None
+        except OSError:
+            st_mtime = None
+        with env_lock:
+            if st_mtime != env_cache["mtime"]:
+                env_cache["mtime"] = st_mtime
+                env_cache["pw"] = tunnel_manager.read_dotenv_value(env_file, "DASHBOARD_PASSWORD") if st_mtime else ""
+            file_pw = str(env_cache["pw"] or "").strip()
+        return file_pw or env_pw
 
     class DashboardHandler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
             logger.info("%s - %s", self.address_string(), fmt % args)
 
-        def _check_auth(self) -> bool:
-            if not password:
+        def _is_https_request(self) -> bool:
+            proto = (self.headers.get("X-Forwarded-Proto") or "").split(",", 1)[0].strip().lower()
+            return proto == "https"
+
+        def _is_authenticated(self) -> bool:
+            pw = _active_password()
+            if not pw:
                 return True
+
+            # 1) 세션 쿠키(nar_session) 검사 — 모바일·텔레그램 인앱 브라우저 호환
+            raw_cookie = self.headers.get("Cookie") or ""
+            if raw_cookie:
+                try:
+                    jar = SimpleCookie()
+                    jar.load(raw_cookie)
+                    if SESSION_COOKIE_NAME in jar:
+                        tok = jar[SESSION_COOKIE_NAME].value
+                        if _verify_session_token(tok, pw):
+                            return True
+                except Exception:
+                    pass
+
+            # 2) HTTP Basic Auth 검사 — curl / 자동화 스크립트 하위 호환
             hdr = self.headers.get("Authorization") or ""
-            if not hdr.startswith("Basic "):
-                self._send_unauthorized()
-                return False
-            try:
-                decoded = base64.b64decode(hdr[6:].strip()).decode("utf-8", errors="ignore")
-                _, _, supplied = decoded.partition(":")
-            except Exception:
-                self._send_unauthorized()
-                return False
-            if not hmac.compare_digest(supplied, password):
-                self._send_unauthorized()
-                return False
-            return True
+            if hdr.startswith("Basic "):
+                try:
+                    decoded = base64.b64decode(hdr[6:].strip()).decode("utf-8", errors="ignore")
+                    _, _, supplied = decoded.partition(":")
+                    if hmac.compare_digest(supplied, pw):
+                        return True
+                except Exception:
+                    return False
+
+            return False
+
+        def _check_auth(self) -> bool:
+            if self._is_authenticated():
+                return True
+            self._send_unauthorized()
+            return False
 
         def _send_unauthorized(self) -> None:
             body = json.dumps({"error": "인증이 필요합니다."}, ensure_ascii=False).encode("utf-8")
             self.send_response(HTTPStatus.UNAUTHORIZED)
-            self.send_header("WWW-Authenticate", 'Basic realm="News Alpha Radar"')
+            if (self.headers.get("X-Requested-With") or "").lower() != "fetch":
+                self.send_header("WWW-Authenticate", 'Basic realm="News Alpha Radar"')
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_json(self, payload: dict[str, Any], status: int = HTTPStatus.OK) -> None:
+        def _send_json(
+            self,
+            payload: dict[str, Any],
+            status: int = HTTPStatus.OK,
+            extra_headers: list[tuple[str, str]] | None = None,
+        ) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
+            for hk, hv in (extra_headers or []):
+                self.send_header(hk, hv)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -2142,15 +2495,24 @@ def create_dashboard_server(
             return parsed
 
         def do_GET(self) -> None:
-            if not self._check_auth():
-                return
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             qs = urllib.parse.parse_qs(parsed.query)
+
             if path in ("/", "/index.html"):
-                self._send_html(DASHBOARD_HTML)
-            elif path == "/api/overview":
-                self._send_json(build_overview_payload(base_dir))
+                if self._is_authenticated():
+                    self._send_html(DASHBOARD_HTML)
+                elif (self.headers.get("Authorization") or "").startswith("Basic "):
+                    self._send_unauthorized()
+                else:
+                    self._send_html(LOGIN_HTML)
+                return
+
+            if not self._check_auth():
+                return
+
+            if path == "/api/overview":
+                self._send_json(build_overview_payload(base_dir, auth_enabled=bool(_active_password())))
             elif path == "/api/performance":
                 try:
                     limit = int((qs.get("limit") or ["100"])[0])
@@ -2169,8 +2531,6 @@ def create_dashboard_server(
                 self._send_json({"error": "Not Found"}, HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
-            if not self._check_auth():
-                return
             path = urllib.parse.urlparse(self.path).path
             try:
                 body = self._read_json_body()
@@ -2181,11 +2541,56 @@ def create_dashboard_server(
                 self._send_json({"error": "잘못된 JSON 본문입니다."}, HTTPStatus.BAD_REQUEST)
                 return
 
+            if path == "/api/auth/login":
+                pw = _active_password()
+                if not pw:
+                    self._send_json({"ok": True})
+                    return
+                supplied = str(body.get("password") or "")
+                if not hmac.compare_digest(supplied, pw):
+                    time.sleep(0.15)
+                    self._send_json({"error": "비밀번호가 올바르지 않습니다."}, HTTPStatus.UNAUTHORIZED)
+                    return
+                token = _make_session_token(pw)
+                cookie_parts = [
+                    f"{SESSION_COOKIE_NAME}={token}",
+                    "Path=/",
+                    f"Max-Age={SESSION_TTL_SEC}",
+                    "HttpOnly",
+                    "SameSite=Lax",
+                ]
+                if self._is_https_request():
+                    cookie_parts.append("Secure")
+                self._send_json({"ok": True}, extra_headers=[("Set-Cookie", "; ".join(cookie_parts))])
+                return
+
+            if path == "/api/auth/logout":
+                clear_cookie = f"{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+                self._send_json({"ok": True}, extra_headers=[("Set-Cookie", clear_cookie)])
+                return
+
+            if not self._check_auth():
+                return
+
             if path == "/api/config":
                 try:
                     updated = validate_and_merge_config(base_dir, body)
                     self._send_json({"ok": True, "config": updated})
                 except ValueError as exc:
+                    self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+
+            if path == "/api/actions/send-tunnel-link":
+                try:
+                    sent = tunnel_manager.send_tunnel_link_telegram(base_dir, REPO_DIR)
+                    if not sent:
+                        self._send_json(
+                            {"error": "TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID가 설정되지 않았습니다."},
+                            HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    self._send_json({"ok": True})
+                except Exception as exc:
                     self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
 
@@ -2257,14 +2662,25 @@ def main() -> int:
     parser.add_argument("--data-dir", default="data")
     args = parser.parse_args()
 
-    password = os.getenv("DASHBOARD_PASSWORD", "").strip()
+    data_dir = Path(args.data_dir)
+    with contextlib.suppress(Exception):
+        tunnel_manager.bootstrap_systemd_tunnel_if_needed(
+            repo_dir=REPO_DIR,
+            python_bin=sys.executable,
+            data_dir=data_dir,
+        )
+
     server = create_dashboard_server(
         host=args.host,
         port=args.port,
-        data_dir=Path(args.data_dir),
-        password=password,
+        data_dir=data_dir,
+        password=None,
     )
-    auth_state = "활성(Basic Auth)" if password else "미설정(로컬 전용 권장)"
+    has_pw = bool(
+        (os.getenv("DASHBOARD_PASSWORD") or "").strip()
+        or tunnel_manager.read_dotenv_value(REPO_DIR / ".env", "DASHBOARD_PASSWORD")
+    )
+    auth_state = "활성(세션쿠키+Basic Auth)" if has_pw else "동적 대기(.env 설정 시 자동 활성화)"
     logger.info("News Alpha Radar 대시보드 시작: http://%s:%d (인증=%s)", args.host, args.port, auth_state)
     try:
         server.serve_forever()
