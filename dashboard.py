@@ -45,7 +45,7 @@ MAX_REQUEST_BODY_BYTES = 64 * 1024
 
 def _effective_config(data_dir: Path) -> dict[str, Any]:
     raw = radar.load_runtime_config(data_dir)
-    limits = radar.resolve_alert_limits(raw)
+    limits = radar.resolve_alert_limits(raw, daemon_mode=True)
     default_feeds = [
         f["name"]
         for f in (radar.resolve_active_feeds(None, daemon_mode=True) or radar.RSS_FEEDS)
@@ -103,6 +103,14 @@ def _effective_config(data_dir: Path) -> dict[str, Any]:
                 raw["max_daily_per_sector"]
                 if raw.get("max_daily_per_sector") is not None
                 else radar._env_int("MAX_DAILY_PER_SECTOR", radar.DEFAULT_MAX_DAILY_PER_SECTOR)
+            ),
+        ),
+        "max_bullish_prepriced_pct": max(
+            0.0,
+            float(
+                raw["max_bullish_prepriced_pct"]
+                if raw.get("max_bullish_prepriced_pct") is not None
+                else radar._env_float("MAX_BULLISH_PREPRICED_PCT", radar.DEFAULT_MAX_BULLISH_PREPRICED_PCT)
             ),
         ),
         "max_alerts_per_window": int(
@@ -441,6 +449,8 @@ def validate_and_merge_config(data_dir: Path, patch: dict[str, Any]) -> dict[str
         cur["stock_dedup_hours"] = max(0, min(168, int(patch["stock_dedup_hours"])))
     if "max_daily_per_sector" in patch:
         cur["max_daily_per_sector"] = max(0, min(20, int(patch["max_daily_per_sector"])))
+    if "max_bullish_prepriced_pct" in patch:
+        cur["max_bullish_prepriced_pct"] = round(max(0.0, min(30.0, float(patch["max_bullish_prepriced_pct"]))), 1)
     if "max_alerts_per_window" in patch:
         cur["max_alerts_per_window"] = max(1, min(10, int(patch["max_alerts_per_window"])))
     if "theme_cooldown_hours" in patch:
@@ -1158,8 +1168,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <div class="field">
                 <label for="cfg-offhours-digest">야간 후보 장전 요약 묶음 발송</label>
                 <select id="cfg-offhours-digest">
+                  <option value="true">켜짐 — 야간 후보 모아서 평일 장전 1건 요약 (권장)</option>
                   <option value="false">꺼짐 — 야간에도 한도 내 즉시 발송</option>
-                  <option value="true">켜짐 — 야간 후보 모아서 평일 장전 1건 요약</option>
                 </select>
               </div>
               <div class="field">
@@ -1187,6 +1197,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <input id="cfg-max-daily" type="number" step="1" min="1" max="80" />
               </div>
             </div>
+            <div class="field-row">
+              <div class="field">
+                <label for="cfg-max-prepriced">정규장 급등 추격 차단 기준 (%, 0=해제)</label>
+                <input id="cfg-max-prepriced" type="number" step="0.5" min="0" max="30" />
+              </div>
+              <div class="field">
+                <label for="cfg-rpd-limit">Stage 1 일일 RPD 기준 한도</label>
+                <input id="cfg-rpd-limit" type="number" step="10" min="10" max="10000" />
+              </div>
+            </div>
             <div class="field">
               <label for="cfg-dedup-mode">PR-3 유사도 중복 차단 모드</label>
               <select id="cfg-dedup-mode">
@@ -1200,10 +1220,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <option value="enforce">enforce — 속보 즉시 / 일반 기사 묶음 호출 (상시 서버 필수)</option>
                 <option value="shadow">shadow — 로그만 기록 (매번 AI 호출)</option>
               </select>
-            </div>
-            <div class="field">
-              <label for="cfg-rpd-limit">Stage 1 일일 RPD 기준 한도 (70%/80%/90% 자동 절전)</label>
-              <input id="cfg-rpd-limit" type="number" step="10" min="10" max="10000" />
             </div>
             <div class="field">
               <label for="cfg-flash-alert">2단 초고속 1보 푸시 (3초 내 1보 → 15초 뒤 2보 심층)</label>
@@ -1304,6 +1320,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <option value="flash_alert_sent">초고속 1보 푸시</option>
               <option value="premarket_digest_sent">장전 요약 발송</option>
               <option value="overnight_queued">야간 요약 대기열</option>
+              <option value="prepriced_skip">장중 급등 추격 차단</option>
               <option value="stock_dedup_decision">24h 종목 중복 판정</option>
               <option value="sector_limit_decision">섹터 일일 한도 판정</option>
               <option value="cycle_summary">사이클 요약</option>
@@ -1620,8 +1637,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       const total = perf.total_records || 0;
       const done = perf.completed_records || 0;
+      const costPct = perf.round_trip_cost_pct ?? 0.23;
       document.getElementById("perf-meta-label").textContent =
-        "총 " + total + "건 추적 (완료 " + done + "건) · 상승수혜: >0% 적중 / 하락·옥석가리기: <0% 적중";
+        "총 " + total + "건 추적 (완료 " + done + "건) · 상승수혜: >0% 적중 (순수익은 왕복비용 " + costPct + "% 차감) / 하락·옥석가리기: <0% 적중";
 
       const byDir = perf.by_direction || {};
       const dirMeta = [
@@ -1667,7 +1685,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const sub = document.createElement("div");
             sub.className = "muted";
             sub.style.fontSize = "11.5px";
-            sub.textContent = "승률 " + Number(hs.win_rate_pct || 0).toFixed(1) + "%";
+            sub.textContent = (hs.net_avg_pct !== null && hs.net_avg_pct !== undefined)
+              ? "순 " + fmtPct(hs.net_avg_pct) + " · 승률 " + Number(hs.win_rate_pct || 0).toFixed(1) + "%"
+              : "승률 " + Number(hs.win_rate_pct || 0).toFixed(1) + "%";
             cell.append(lbl, val, sub);
           } else {
             val.textContent = "-";
@@ -1767,6 +1787,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById("cfg-digest-time").value = cfg.offhours_digest_time || "07:50";
       document.getElementById("cfg-stock-dedup-hours").value = cfg.stock_dedup_hours;
       document.getElementById("cfg-max-per-sector").value = cfg.max_daily_per_sector;
+      document.getElementById("cfg-max-prepriced").value = cfg.max_bullish_prepriced_pct ?? 15;
       document.getElementById("cfg-max-daily").value = cfg.max_daily_alerts;
       document.getElementById("cfg-max-window").value = cfg.max_alerts_per_window;
       document.getElementById("cfg-cooldown").value = cfg.theme_cooldown_hours;
@@ -1839,8 +1860,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             tdDesc.textContent = "🌅 장전 요약 발송 · " + (r.count || 0) + "건 (" + (r.themes || []).join(", ") + ")";
           } else if (r.type === "overnight_queued") {
             tdDesc.textContent = "🌙 장전 요약 대기열 추가 · " + (r.theme_key || "") + " [" + (r.sector || "-") + "] (대기 " + (r.queue_size || 0) + "건)";
+          } else if (r.type === "prepriced_skip") {
+            tdDesc.textContent = "🛑 장중 급등 추격 차단 (≥+" + Number(r.max_pct || 15).toFixed(1) + "%) · " + (r.theme_key || "") + " · " + (r.details || []).join(", ");
           } else if (r.type === "stock_dedup_decision") {
-            tdDesc.textContent = "[" + r.phase + "] " + (r.theme_key || "") + " · 제외=" + (r.excluded_codes || []).join(",") + " · 유지=" + (r.kept_codes || []).join(",") + (r.blocked ? " · 차단됨" : "");
+            tdDesc.textContent = "[" + r.phase + "] " + (r.theme_key || "") + " · 제외=" + (r.excluded_codes || []).join(",") + " · 유지=" + (r.kept_codes || []).join(",") + (r.only_weak_leftovers ? " · 단기테마 잔여 차단" : (r.blocked ? " · 차단됨" : ""));
           } else if (r.type === "sector_limit_decision") {
             tdDesc.textContent = "[" + r.phase + "] " + (r.sector || "-") + " (" + r.used_today + "/" + r.limit + ") · " + (r.theme_key || "") + (r.blocked ? " · 차단됨" : "");
           } else if (r.type === "cycle_summary") {
@@ -1897,6 +1920,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         offhours_digest_time: document.getElementById("cfg-digest-time").value.trim() || "07:50",
         stock_dedup_hours: parseInt(document.getElementById("cfg-stock-dedup-hours").value, 10),
         max_daily_per_sector: parseInt(document.getElementById("cfg-max-per-sector").value, 10),
+        max_bullish_prepriced_pct: parseFloat(document.getElementById("cfg-max-prepriced").value),
         max_alerts_per_window: parseInt(document.getElementById("cfg-max-window").value, 10),
         theme_cooldown_hours: parseInt(document.getElementById("cfg-cooldown").value, 10),
         dedup_mode: document.getElementById("cfg-dedup-mode").value,

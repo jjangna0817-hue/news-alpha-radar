@@ -56,7 +56,7 @@ USER_AGENT = (
 )
 
 DEFAULT_SCREEN_MODELS = "gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.8-flash"
-DEFAULT_DEEP_MODELS = "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.8-flash"
+DEFAULT_DEEP_MODELS = "gemini-3.6-flash,gemini-3.8-flash,gemini-3.5-flash-lite"
 DEFAULT_SCREEN_THINKING_LEVEL = "MINIMAL"
 DEFAULT_DEEP_THINKING_LEVEL = "LOW"
 DEFAULT_THINKING_BUDGET = 1024
@@ -83,6 +83,7 @@ DEFAULT_DEDUP_MODE = "shadow"
 DEFAULT_TRIGGER_MODE = "shadow"
 DEFAULT_STAGE1_DAILY_RPD_LIMIT = 500
 HUB_STOCK_MIN_APPEARANCES = 3
+HUB_STOCK_MIN_SECTORS = 2
 ESCALATION_SCORE_DELTA = 1.0
 DEFAULT_MAX_DAILY_ALERTS = 10
 DEFAULT_MAX_MARKET_ALERTS = 8
@@ -91,6 +92,8 @@ DEFAULT_OFFHOURS_DIGEST_ENABLED = False
 DEFAULT_OFFHOURS_DIGEST_TIME = "07:50"
 DEFAULT_STOCK_DEDUP_HOURS = 24
 DEFAULT_MAX_DAILY_PER_SECTOR = 2
+DEFAULT_MAX_BULLISH_PREPRICED_PCT = 15.0
+ROUND_TRIP_COST_PCT = 0.23
 MAX_OVERNIGHT_QUEUE_ITEMS = 15
 OVERNIGHT_QUEUE_TTL_HOURS = 72
 PERF_MAX_DAYS = 90
@@ -124,17 +127,18 @@ PROBE_CANDIDATE_FEEDS: list[dict[str, Any]] = [
 ALL_FEEDS: list[dict[str, Any]] = RSS_FEEDS + PROBE_CANDIDATE_FEEDS
 DAEMON_DEFAULT_EXTRA_FEEDS: tuple[str, ...] = ("전자신문_속보", "뉴시스_속보")
 
-# PR-3 Stage 1 트리거 2계층 키워드 (단독/속보 및 단순 정치 용어 제외)
+# PR-3 Stage 1 트리거 2계층 키워드 (단독/속보·정치·일상 소규모 보안 노이즈 제외)
 HARD_TRIGGER_KEYWORDS: tuple[str, ...] = (
-    "해킹", "개인정보 유출", "정보유출", "랜섬웨어", "리콜", "전량 회수", "영업정지", "판매중지",
+    "대규모 해킹", "랜섬웨어", "전산 마비", "리콜", "전량 회수", "영업정지", "판매중지",
     "생산중단", "가동중단", "가동 중단", "공장 화재", "화재 발생", "폭발 사고", "관세 부과",
-    "수출통제", "수출규제", "전파탐지", "불법촬영", "콜레라", "전염병", "감염병", "방역 비상",
+    "수출통제", "수출규제", "콜레라", "전염병", "감염병", "방역 비상",
     "인수합병", "경영권 분쟁", "공개매수", "대규모 수주", "임상 성공", "임상 중단", "품목허가",
     "과징금", "시정명령", "압수수색", "부도", "회생절차", "상장폐지", "대규모 정전", "통신장애",
     "통신 마비", "공급망 마비", "해협 봉쇄", "항로 봉쇄",
 )
 
 SOFT_TRIGGER_KEYWORDS: tuple[str, ...] = (
+    "해킹", "개인정보 유출", "정보유출", "전파탐지", "불법촬영",
     "수주", "공급계약", "계약 체결", "국회 통과", "법안", "의무화", "전수조사", "규제 강화",
     "특허", "승인", "대규모 투자", "증설", "합작", "제재", "파업", "파산", "감산",
     "가격 인상", "품귀", "공급 부족", "결함", "조사 착수", "검찰 기소", "정부 대책",
@@ -332,9 +336,10 @@ DEEP_PROMPT = """당신은 한국 주식시장(코스피·코스닥)의 냉철�
 1. 할루시네이션 금지: 종목은 반드시 입력된 `verified_krx_candidates` 목록에 있는 실제 6자리 종목코드와 종목명만 선택하세요. 목록에 없는 종목코드를 절대 지어내지 마세요.
 2. 옥석 가리기:
    - 부정적 사건·사고·규제 이슈(안전사고, 공급차질, 규제 강화 등)에서는 '문제 해결·대체·정부 예산 수혜(2차)'가 진짜 주도주가 되고, '원인 기기·단순 연상 종목(1차)'은 단기 급등 후 급락하는 경우가 많습니다. 이를 명확히 구분하세요.
-   - 각 종목의 실제 `products`(주요제품)를 보고 `본업직결` / `부분연관` / `단기테마성`을 냉정하게 판정하세요.
+   - 각 종목의 실제 `products`(주요제품)를 보고 `본업직결` / `부분연관` / `단기테마성`을 냉정하게 판정하세요. `단기테마성` 종목은 `상승수혜`가 아니라 `옥석가리기주의`로 분류하세요.
 3. 선반영 반영:
-   - 입력된 `quote.change_pct`와 `quote.reaction_stage`를 반드시 확인해, 이미 +15% 이상 급등한 종목은 절대 추격 매수를 권하지 말고 눌림목·리스크 경고를 적으세요.
+   - 입력된 `quote.change_pct`와 `quote.reaction_stage`를 반드시 확인해, 이미 +15% 이상 급등한 종목은 절대 추격 매수를 권하지 말고 `옥석가리기주의`로 분류하며 눌림목·리스크 경고를 적으세요.
+   - `상승수혜`는 `본업직결` 또는 명확한 `부분연관`이면서 주가 미반영·초입 구간인 종목 위주로 엄선하세요.
 
 [출력 JSON 스키마 — 반드시 단일 JSON 객체만 반환]
 {
@@ -808,7 +813,19 @@ def _parse_bool_env(name: str) -> bool | None:
     return None
 
 
-def resolve_alert_limits(runtime_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+def offhours_session_key(now: datetime | None = None) -> str:
+    """야간·주말 한도 세션 키 (15:31~익일 07:59를 하나의 야간 세션으로 통합해 자정 전후 이중 소진 방지)."""
+    ref = StateStore._now_kst(now)
+    if (ref.hour, ref.minute) > (15, 30):
+        return (ref.date() + timedelta(days=1)).isoformat()
+    return ref.date().isoformat()
+
+
+def resolve_alert_limits(
+    runtime_cfg: dict[str, Any] | None = None,
+    *,
+    daemon_mode: bool = False,
+) -> dict[str, Any]:
     """장중/야간·주말 시간대별 알림 한도 + 기존 MAX_DAILY_ALERTS 호환 + 장전 요약 설정 계산."""
     cfg = runtime_cfg or {}
 
@@ -876,7 +893,11 @@ def resolve_alert_limits(runtime_cfg: dict[str, Any] | None = None) -> dict[str,
         digest_enabled = bool(cfg["offhours_digest_enabled"])
     else:
         env_digest = _parse_bool_env("OFFHOURS_DIGEST_ENABLED")
-        digest_enabled = env_digest if env_digest is not None else DEFAULT_OFFHOURS_DIGEST_ENABLED
+        digest_enabled = (
+            env_digest
+            if env_digest is not None
+            else (True if daemon_mode else DEFAULT_OFFHOURS_DIGEST_ENABLED)
+        )
 
     digest_time_raw = str(
         cfg.get("offhours_digest_time")
@@ -1157,7 +1178,8 @@ class StateStore:
             if eff_window == "market":
                 self.daily_market_counts[day] = self.daily_market_counts.get(day, 0) + 1
             else:
-                self.daily_offhours_counts[day] = self.daily_offhours_counts.get(day, 0) + 1
+                off_key = offhours_session_key(ref)
+                self.daily_offhours_counts[off_key] = self.daily_offhours_counts.get(off_key, 0) + 1
         if sector:
             self.record_sector_alert(sector, now=ref)
         rec: dict[str, Any] = {
@@ -1185,7 +1207,7 @@ class StateStore:
         return self.daily_market_counts.get(self._now_kst(now).strftime("%Y-%m-%d"), 0)
 
     def sent_offhours_today(self, now: datetime | None = None) -> int:
-        return self.daily_offhours_counts.get(self._now_kst(now).strftime("%Y-%m-%d"), 0)
+        return self.daily_offhours_counts.get(offhours_session_key(self._now_kst(now)), 0)
 
     def save(self, now: datetime | None = None) -> None:
         ref = self._now_kst(now)
@@ -1249,17 +1271,33 @@ def compute_hub_stocks(
     now: datetime | None = None,
     window_days: int = 7,
 ) -> set[str]:
-    """최근 7일 알림 중 3건 이상 반복 등장한 허브 종목코드를 데이터 기반으로 추출."""
+    """최근 7일 알림 중 2개 이상 서로 다른 섹터에서 3건 이상 등장한 대형 허브 종목코드만 추출.
+
+    단일 섹터(예: 사이버보안/전파보안)에서만 반복 등장한 테마주는 허브주로 면제하지 않아 중복 차단을 유지한다.
+    """
     ref = StateStore._now_kst(now)
     cutoff = ref - timedelta(days=window_days)
     counts: Counter[str] = Counter()
+    sectors_by_code: dict[str, set[str]] = {}
     for rec in recent_alerts:
         ts = parse_iso_kst(rec.get("ts"))
         if ts is not None and ts < cutoff:
             continue
+        sec = str(rec.get("sector") or "").strip() or classify_alert_sector(
+            theme_key=str(rec.get("theme_key") or ""),
+            second_keywords=list(rec.get("keywords") or []),
+            headline=str(rec.get("title") or ""),
+        )
         codes = rec.get("final_codes") or rec.get("cand_codes") or []
-        counts.update({str(c).strip() for c in codes if str(c).strip()})
-    return {code for code, cnt in counts.items() if cnt >= HUB_STOCK_MIN_APPEARANCES}
+        uniq = {str(c).strip() for c in codes if str(c).strip()}
+        counts.update(uniq)
+        for code in uniq:
+            sectors_by_code.setdefault(code, set()).add(sec)
+    return {
+        code
+        for code, cnt in counts.items()
+        if cnt >= HUB_STOCK_MIN_APPEARANCES and len(sectors_by_code.get(code, set())) >= HUB_STOCK_MIN_SECTORS
+    }
 
 
 def codes_overlap(codes_a: set[str], codes_b: set[str], hub_stocks: set[str]) -> bool:
@@ -1379,13 +1417,17 @@ def filter_recently_alerted_stocks(
     now: datetime | None = None,
     window_hours: int = DEFAULT_STOCK_DEDUP_HOURS,
 ) -> dict[str, Any]:
-    """최근 window_hours(기본 24시간) 내 이미 알림된 종목코드 제외 + ESCALATION_SCORE_DELTA 이상 시 [후속] 허용."""
+    """최근 window_hours(기본 24시간) 내 이미 알림된 종목코드 제외 + ESCALATION_SCORE_DELTA 이상 시 [후속] 허용.
+
+    핵심 주도주가 제외되고 '단기테마성' 상승수혜 잔여 종목만 남는 경우에는 노이즈 방지를 위해 전체 차단한다.
+    """
     if window_hours <= 0 or not stocks:
         return {
             "kept_stocks": list(stocks),
             "excluded_codes": [],
             "escalated_codes": [],
             "all_filtered": False,
+            "only_weak_leftovers": False,
             "escalated": False,
             "prev_scores": {},
         }
@@ -1428,14 +1470,69 @@ def filter_recently_alerted_stocks(
         else:
             excluded_codes.append(code)
 
+    def _is_weak_leftover(st: dict[str, Any]) -> bool:
+        rev = str(st.get("revenue_link") or "").strip()
+        if rev != "단기테마성":
+            return False
+        raw_dir = str(st.get("direction") or "").strip()
+        if raw_dir and _normalize_perf_direction(raw_dir) in ("하락주의", "옥석가리기주의"):
+            return False
+        return True
+
+    only_weak_leftovers = bool(excluded_codes and kept and all(_is_weak_leftover(s) for s in kept))
+    if only_weak_leftovers:
+        kept = []
+
     return {
         "kept_stocks": kept,
         "excluded_codes": excluded_codes,
         "escalated_codes": escalated_codes,
         "all_filtered": bool(stocks) and not kept,
+        "only_weak_leftovers": only_weak_leftovers,
         "escalated": bool(escalated_codes),
         "prev_scores": prev_scores,
     }
+
+
+def is_regular_trading_hours(now: datetime | None = None) -> bool:
+    """KRX 정규장 거래 시간 여부 (평일 09:00~15:30 KST)."""
+    ref = StateStore._now_kst(now)
+    if ref.weekday() >= 5:
+        return False
+    hm = (ref.hour, ref.minute)
+    return (9, 0) <= hm <= (15, 30)
+
+
+def is_all_bullish_prepriced(
+    stocks: list[dict[str, Any]],
+    quotes: dict[str, StockQuote],
+    *,
+    max_pct: float = DEFAULT_MAX_BULLISH_PREPRICED_PCT,
+) -> tuple[bool, list[str]]:
+    """장중 추격매수 차단 가드: 상승수혜 추천 종목이 1개 이상이고 전원이 이미 +max_pct% 이상 선반영이면 True.
+
+    - 순수 하락주의·옥석가리기주의 경고 알림(상승수혜 0건)은 차단하지 않는다.
+    - 상승수혜 종목 중 하나라도 미반영(< max_pct%)이거나 실시간 시세 미확인/장마감 상태면 발송을 허용한다.
+    """
+    if max_pct <= 0 or not stocks:
+        return False, []
+    bullish = [s for s in stocks if _normalize_perf_direction(s.get("direction")) == "상승수혜"]
+    if not bullish:
+        return False, []
+    details: list[str] = []
+    for st in bullish:
+        raw_c = str(st.get("code") or "").strip()
+        code = raw_c.zfill(6) if raw_c.isdigit() else raw_c
+        q = quotes.get(code)
+        if q is None or int(q.price) <= 0:
+            return False, []
+        if str(q.market_status or "").strip().upper() in ("CLOSE", "CLOSED"):
+            return False, []
+        if float(q.change_pct) < max_pct:
+            return False, []
+        details.append(f"{st.get('name') or code}({code} {q.change_pct:+.1f}%)")
+    return True, details
+
 
 
 def classify_alert_sector(
@@ -1763,7 +1860,7 @@ def _median_float(vals: list[float]) -> float | None:
 
 
 def summarize_performance(records: list[dict[str, Any]], *, recent_limit: int = 50) -> dict[str, Any]:
-    """방향별(상승수혜/하락주의/옥석가리기주의) 평균·중앙값 수익률 및 승률 집계."""
+    """방향별(상승수혜/하락주의/옥석가리기주의) 평균·중앙값 수익률(상승수혜 왕복비용 차감 순수익 포함) 및 승률 집계."""
     directions = ("상승수혜", "하락주의", "옥석가리기주의")
     horizons = ("ret_5m", "ret_30m", "ret_close", "ret_next_close")
 
@@ -1779,12 +1876,26 @@ def summarize_performance(records: list[dict[str, Any]], *, recent_limit: int = 
         for h in horizons:
             vals = [float(r[h]) for r in rows if r.get(h) is not None]
             if vals:
+                avg_v = round(sum(vals) / len(vals), 2)
+                med_v = _median_float(vals)
                 wins = sum(1 for v in vals if (v < 0.0 if win_is_negative else v > 0.0))
+                if win_is_negative:
+                    net_avg = None
+                    net_med = None
+                    net_win = None
+                else:
+                    net_avg = round(avg_v - ROUND_TRIP_COST_PCT, 2)
+                    net_med = round(med_v - ROUND_TRIP_COST_PCT, 2) if med_v is not None else None
+                    net_wins = sum(1 for v in vals if v > ROUND_TRIP_COST_PCT)
+                    net_win = round((net_wins / len(vals)) * 100.0, 1)
                 horizon_stats[h] = {
                     "count": len(vals),
-                    "avg_pct": round(sum(vals) / len(vals), 2),
-                    "median_pct": _median_float(vals),
+                    "avg_pct": avg_v,
+                    "median_pct": med_v,
                     "win_rate_pct": round((wins / len(vals)) * 100.0, 1),
+                    "net_avg_pct": net_avg,
+                    "net_median_pct": net_med,
+                    "net_win_rate_pct": net_win,
                 }
             else:
                 horizon_stats[h] = {
@@ -1792,6 +1903,9 @@ def summarize_performance(records: list[dict[str, Any]], *, recent_limit: int = 
                     "avg_pct": None,
                     "median_pct": None,
                     "win_rate_pct": None,
+                    "net_avg_pct": None,
+                    "net_median_pct": None,
+                    "net_win_rate_pct": None,
                 }
         by_direction[d] = {
             "total": len(rows),
@@ -1810,6 +1924,7 @@ def summarize_performance(records: list[dict[str, Any]], *, recent_limit: int = 
         "total_records": len(records),
         "completed_records": completed,
         "pending_records": len(records) - completed,
+        "round_trip_cost_pct": ROUND_TRIP_COST_PCT,
         "by_direction": by_direction,
         "recent_records": ordered_recent,
     }
@@ -3338,7 +3453,7 @@ def run_live(
             else _env_int("MAX_ALERTS_PER_RUN", 2)
         ),
     )
-    alert_limits = resolve_alert_limits(runtime_cfg)
+    alert_limits = resolve_alert_limits(runtime_cfg, daemon_mode=daemon_mode)
     max_market = alert_limits["max_market_alerts"]
     max_offhours = alert_limits["max_offhours_alerts"]
     max_daily = alert_limits["max_daily_alerts"]
@@ -3358,6 +3473,14 @@ def run_live(
             runtime_cfg["max_daily_per_sector"]
             if runtime_cfg.get("max_daily_per_sector") is not None
             else _env_int("MAX_DAILY_PER_SECTOR", DEFAULT_MAX_DAILY_PER_SECTOR)
+        ),
+    )
+    max_bullish_prepriced_pct = max(
+        0.0,
+        float(
+            runtime_cfg["max_bullish_prepriced_pct"]
+            if runtime_cfg.get("max_bullish_prepriced_pct") is not None
+            else _env_float("MAX_BULLISH_PREPRICED_PCT", DEFAULT_MAX_BULLISH_PREPRICED_PCT)
         ),
     )
     cooldown_h = max(
@@ -3451,6 +3574,7 @@ def run_live(
         "offhours_digest_enabled": offhours_digest_enabled,
         "stock_dedup_hours": stock_dedup_hours,
         "max_daily_per_sector": max_daily_per_sector,
+        "max_bullish_prepriced_pct": max_bullish_prepriced_pct,
     })
 
     companies: dict[str, dict[str, str]] | None = None
@@ -3915,6 +4039,29 @@ def run_live(
                                 if max_daily_per_sector > 0 and state.sector_count_today(s2_def["sector"], now=now_d) >= max_daily_per_sector:
                                     logger.info("%s Deferred 섹터 일일 한도 초과 폐기(%s): %s", tag, s2_def["sector"], tkey)
                                     continue
+                                if max_bullish_prepriced_pct > 0 and is_regular_trading_hours(now_d):
+                                    pre_hit_d, pre_det_d = is_all_bullish_prepriced(
+                                        alert_meta.get("stocks") or [],
+                                        s2_def["quotes"],
+                                        max_pct=max_bullish_prepriced_pct,
+                                    )
+                                    if pre_hit_d:
+                                        trace.emit({
+                                            "ts": now_d.isoformat(),
+                                            "type": "prepriced_skip",
+                                            "cycle": cycle,
+                                            "phase": "deferred",
+                                            "cluster_id": cid,
+                                            "theme_key": tkey,
+                                            "catalyst_score": float(alert_meta["catalyst_score"]),
+                                            "max_pct": max_bullish_prepriced_pct,
+                                            "details": pre_det_d,
+                                        })
+                                        logger.info(
+                                            "%s Deferred 장중 급등 선반영(≥+%.1f%%) 추격 차단 — 폐기(%s): %s",
+                                            tag, max_bullish_prepriced_pct, ", ".join(pre_det_d[:3]), tkey,
+                                        )
+                                        continue
                                 logger.info("%s Deferred Stage 2 재분석 완료 (%s): %s", tag, deep_model, title_str)
                                 # Stage 2 성공 후 텔레그램 전송 (실패 시 send_pending 승격)
                                 try:
@@ -4537,13 +4684,22 @@ def run_live(
                                         "excluded_codes": stock_filter["excluded_codes"],
                                         "kept_codes": alert_meta.get("final_codes") or [],
                                         "escalated_codes": stock_filter["escalated_codes"],
+                                        "only_weak_leftovers": bool(stock_filter.get("only_weak_leftovers")),
                                         "blocked": bool(stock_filter["all_filtered"]),
                                     })
                                 if stock_filter["all_filtered"]:
-                                    deferred_reasons[cid] = "stock_code_dedup_24h"
+                                    deferred_reasons[cid] = (
+                                        "stock_code_dedup_weak_leftovers"
+                                        if stock_filter.get("only_weak_leftovers")
+                                        else "stock_code_dedup_24h"
+                                    )
                                     logger.info(
-                                        "%s 최근 %d시간 기알림 종목 제외 후 남은 종목 없음 — 발송 생략(%s): %s",
-                                        tag, stock_dedup_hours, ",".join(stock_filter["excluded_codes"][:4]), tkey,
+                                        "%s 최근 %d시간 기알림 종목 제외 후 %s — 발송 생략(%s): %s",
+                                        tag,
+                                        stock_dedup_hours,
+                                        "단기테마성 잔여 종목만 남아 차단" if stock_filter.get("only_weak_leftovers") else "남은 종목 없음",
+                                        ",".join(stock_filter["excluded_codes"][:4]),
+                                        tkey,
                                     )
                                     continue
 
@@ -4600,6 +4756,32 @@ def run_live(
                                     deferred_reasons[cid] = f"dedup_pre_send:{dedup_post['reason']}"
                                     logger.info("%s 발송 직전 2차 중복 차단(%s): %s", tag, dedup_post["reason"], tkey)
                                     continue
+
+                                # 장중 급등 선반영 추격매수 차단 가드 (정규장 09:00~15:30 한정)
+                                if max_bullish_prepriced_pct > 0 and is_regular_trading_hours(cand_now):
+                                    pre_hit, pre_details = is_all_bullish_prepriced(
+                                        alert_meta.get("stocks") or [],
+                                        s2_res["quotes"],
+                                        max_pct=max_bullish_prepriced_pct,
+                                    )
+                                    if pre_hit:
+                                        trace.emit({
+                                            "ts": cand_now.isoformat(),
+                                            "type": "prepriced_skip",
+                                            "cycle": cycle,
+                                            "phase": "pre_send",
+                                            "cluster_id": cid,
+                                            "theme_key": tkey,
+                                            "catalyst_score": score_val,
+                                            "max_pct": max_bullish_prepriced_pct,
+                                            "details": pre_details,
+                                        })
+                                        deferred_reasons[cid] = "prepriced_skip"
+                                        logger.info(
+                                            "%s 장중 급등 선반영(≥+%.1f%%) 추격 차단 — 발송 생략(%s): %s",
+                                            tag, max_bullish_prepriced_pct, ", ".join(pre_details[:3]), tkey,
+                                        )
+                                        continue
 
                                 try:
                                     if dry_run:

@@ -74,7 +74,7 @@ jobs:
           MARKET_LOOP_COUNT: ${{ vars.MARKET_LOOP_COUNT || '6' }}
           MARKET_LOOP_INTERVAL_SEC: ${{ vars.MARKET_LOOP_INTERVAL_SEC || '120' }}
           GEMINI_SCREEN_MODELS: ${{ vars.GEMINI_SCREEN_MODELS || 'gemini-3.5-flash-lite,gemini-3.6-flash,gemini-3.8-flash' }}
-          GEMINI_DEEP_MODELS: ${{ vars.GEMINI_DEEP_MODELS || 'gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.8-flash' }}
+          GEMINI_DEEP_MODELS: ${{ vars.GEMINI_DEEP_MODELS || 'gemini-3.6-flash,gemini-3.8-flash,gemini-3.5-flash-lite' }}
           GEMINI_DEEP_THINKING_LEVEL: ${{ vars.GEMINI_DEEP_THINKING_LEVEL || 'LOW' }}
           GEMINI_THINKING_BUDGET: ${{ vars.GEMINI_THINKING_BUDGET || '1024' }}
           GEMINI_SCREEN_TIMEOUT: ${{ vars.GEMINI_SCREEN_TIMEOUT || '25' }}

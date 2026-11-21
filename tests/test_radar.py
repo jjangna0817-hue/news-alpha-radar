@@ -25,9 +25,10 @@ KST = radar.KST
 _APP_ENV_PREFIXES = (
     "GEMINI_", "TELEGRAM_", "DASHBOARD_", "DAEMON_", "MIN_CATALYST_",
     "MAX_ALERTS_", "MAX_DAILY_", "MAX_MARKET_", "MAX_OFFHOURS_",
-    "OFFHOURS_DIGEST_", "STOCK_DEDUP_", "THEME_COOLDOWN_", "DEDUP_MODE",
-    "TRIGGER_MODE", "STAGE1_DAILY_", "INSTANT_FLASH_", "EXTRA_RSS_",
-    "MARKET_LOOP_", "GITHUB_EVENT_SCHEDULE", "GITHUB_STEP_SUMMARY",
+    "MAX_BULLISH_PREPRICED_", "OFFHOURS_DIGEST_", "STOCK_DEDUP_",
+    "THEME_COOLDOWN_", "DEDUP_MODE", "TRIGGER_MODE", "STAGE1_DAILY_",
+    "INSTANT_FLASH_", "EXTRA_RSS_", "MARKET_LOOP_",
+    "GITHUB_EVENT_SCHEDULE", "GITHUB_STEP_SUMMARY",
 )
 _SAVED_ENV: dict[str, str] = {}
 
@@ -1385,6 +1386,7 @@ class TestBacktestFixesAndPerformanceTracking(unittest.TestCase):
             "TELEGRAM_CHAT_ID": "c",
             "MAX_MARKET_ALERTS": "8",
             "MAX_OFFHOURS_ALERTS": "2",
+            "OFFHOURS_DIGEST_ENABLED": "false",
             "MAX_ALERTS_PER_RUN": "5",
             "INSTANT_FLASH_ALERT": "false",
             "TRIGGER_MODE": "shadow",
@@ -1813,11 +1815,16 @@ class TestBacktestFixesAndPerformanceTracking(unittest.TestCase):
                     perf = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(perf["total_records"], 3)
                 self.assertEqual(perf["completed_records"], 3)
+                self.assertEqual(perf["round_trip_cost_pct"], radar.ROUND_TRIP_COST_PCT)
                 self.assertEqual(perf["by_direction"]["상승수혜"]["ret_next_close"]["avg_pct"], 8.0)
+                self.assertEqual(perf["by_direction"]["상승수혜"]["ret_next_close"]["net_avg_pct"], 7.77)
                 self.assertEqual(perf["by_direction"]["상승수혜"]["ret_next_close"]["win_rate_pct"], 100.0)
+                self.assertEqual(perf["by_direction"]["상승수혜"]["ret_next_close"]["net_win_rate_pct"], 100.0)
                 self.assertEqual(perf["by_direction"]["하락주의"]["ret_next_close"]["avg_pct"], -5.0)
+                self.assertIsNone(perf["by_direction"]["하락주의"]["ret_next_close"]["net_avg_pct"])
                 self.assertEqual(perf["by_direction"]["하락주의"]["ret_next_close"]["win_rate_pct"], 100.0)
                 self.assertEqual(perf["by_direction"]["옥석가리기주의"]["ret_next_close"]["avg_pct"], -8.0)
+                self.assertIsNone(perf["by_direction"]["옥석가리기주의"]["ret_next_close"]["net_avg_pct"])
                 self.assertEqual(perf["by_direction"]["옥석가리기주의"]["ret_next_close"]["win_rate_pct"], 100.0)
 
                 cfg_patch = json.dumps({
@@ -1827,6 +1834,7 @@ class TestBacktestFixesAndPerformanceTracking(unittest.TestCase):
                     "offhours_digest_time": "07:50",
                     "stock_dedup_hours": 24,
                     "max_daily_per_sector": 2,
+                    "max_bullish_prepriced_pct": 12.5,
                 }).encode("utf-8")
                 req_cfg = urllib.request.Request(
                     f"{base}/api/config",
@@ -1843,11 +1851,14 @@ class TestBacktestFixesAndPerformanceTracking(unittest.TestCase):
                 self.assertTrue(res_cfg["config"]["offhours_digest_enabled"])
                 self.assertEqual(res_cfg["config"]["stock_dedup_hours"], 24)
                 self.assertEqual(res_cfg["config"]["max_daily_per_sector"], 2)
+                self.assertEqual(res_cfg["config"]["max_bullish_prepriced_pct"], 12.5)
 
                 with urllib.request.urlopen(f"{base}/api/overview", timeout=5) as resp:
                     ov = json.loads(resp.read().decode("utf-8"))
                 self.assertIn("performance", ov)
                 self.assertEqual(ov["performance"]["by_direction"]["상승수혜"]["ret_close"]["avg_pct"], 4.0)
+                self.assertEqual(ov["performance"]["by_direction"]["상승수혜"]["ret_close"]["net_avg_pct"], 3.77)
+                self.assertEqual(ov["config"]["max_bullish_prepriced_pct"], 12.5)
             finally:
                 srv.shutdown()
                 srv.server_close()
@@ -1858,6 +1869,7 @@ class TestBacktestFixesAndPerformanceTracking(unittest.TestCase):
         self.assertNotIn("전파탐지기", radar.SCREENING_PROMPT)
         self.assertIn("관성적 뉴스", radar.SCREENING_PROMPT)
         self.assertIn("전 산업군", radar.SCREENING_PROMPT)
+        self.assertIn("옥석가리기주의", radar.DEEP_PROMPT)
 
         # 2) SEED_COMPANIES must be diversified across industries without keyword-stuffed promo labels
         distinct_sectors = {c["sector"] for c in radar.SEED_COMPANIES}
@@ -1889,6 +1901,203 @@ class TestBacktestFixesAndPerformanceTracking(unittest.TestCase):
             # Offline fallback (no cache, allow_network=False) falls back to SEED_COMPANIES
             fallback = radar.load_krx_master(Path(tmp) / "missing.json", allow_network=False)
             self.assertEqual(len(fallback), len(radar.SEED_COMPANIES))
+
+    def test_alpha_safety_guards_deep_models_triggers_session_hub_and_weak_leftovers(self) -> None:
+        # 1) Stage 2 deep model order puts gemini-3.8-flash BEFORE gemini-3.5-flash-lite
+        deep_order = [m.strip() for m in radar.DEFAULT_DEEP_MODELS.split(",") if m.strip()]
+        self.assertEqual(deep_order, ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"])
+
+        # 2) Routine security spam moved from HARD to SOFT triggers
+        for kw in ("해킹", "개인정보 유출", "정보유출", "전파탐지", "불법촬영"):
+            self.assertNotIn(kw, radar.HARD_TRIGGER_KEYWORDS)
+            self.assertIn(kw, radar.SOFT_TRIGGER_KEYWORDS)
+        for kw in ("대규모 해킹", "랜섬웨어", "전산 마비"):
+            self.assertIn(kw, radar.HARD_TRIGGER_KEYWORDS)
+
+        now = datetime(2026, 11, 20, 10, 0, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            st = radar.StateStore(Path(tmp) / "state.json")
+            st.last_stage1_at = (now - timedelta(minutes=1)).isoformat()
+            # Single-outlet routine privacy leak must NOT hard-trigger Stage 1 immediately
+            routine = [radar.NewsItem("소규모 온라인몰 개인정보 유출 신고 접수", "https://ex.com/r1", "연합뉴스_사회", "사회/사건", first_seen=now.isoformat())]
+            res_r = radar.evaluate_stage1_trigger(routine, radar.cluster_news_ranked(routine, now=now), st, now=now, market_window=True)
+            self.assertFalse(res_r["should_run"])
+            # Major ransomware / mass hack still hard-triggers immediately
+            major = [radar.NewsItem("주요 은행 전산 마비 대규모 해킹 확인", "https://ex.com/r2", "연합뉴스_사회", "사회/사건", first_seen=now.isoformat())]
+            res_m = radar.evaluate_stage1_trigger(major, radar.cluster_news_ranked(major, now=now), st, now=now, market_window=True)
+            self.assertTrue(res_m["should_run"])
+            self.assertEqual(res_m["reason"], "hard_keyword")
+
+            # 3) Daemon mode defaults offhours_digest_enabled=True, non-daemon defaults False
+            self.assertTrue(radar.resolve_alert_limits({}, daemon_mode=True)["offhours_digest_enabled"])
+            self.assertFalse(radar.resolve_alert_limits({}, daemon_mode=False)["offhours_digest_enabled"])
+            self.assertFalse(radar.resolve_alert_limits({"offhours_digest_enabled": False}, daemon_mode=True)["offhours_digest_enabled"])
+
+            # 4) Cross-midnight offhours session key unifies Mon 22:00 + Tue 01:00 into ONE session
+            t_mon_22 = datetime(2026, 11, 16, 22, 0, tzinfo=KST)
+            t_tue_01 = datetime(2026, 11, 17, 1, 0, tzinfo=KST)
+            t_tue_07 = datetime(2026, 11, 17, 7, 30, tzinfo=KST)
+            t_tue_16 = datetime(2026, 11, 17, 16, 0, tzinfo=KST)
+            self.assertEqual(radar.offhours_session_key(t_mon_22), "2026-11-17")
+            self.assertEqual(radar.offhours_session_key(t_tue_01), "2026-11-17")
+            self.assertEqual(radar.offhours_session_key(t_tue_07), "2026-11-17")
+            self.assertEqual(radar.offhours_session_key(t_tue_16), "2026-11-18")
+            st.mark_alerted("월요일밤1", now=t_mon_22, final_codes=["298040"], catalyst_score=8.5)
+            st.mark_alerted("화요일새벽1", now=t_tue_01, final_codes=["012450"], catalyst_score=8.5)
+            self.assertEqual(st.sent_offhours_today(now=t_tue_01), 2)
+            self.assertEqual(st.sent_offhours_today(now=t_tue_07), 2)
+            self.assertEqual(st.sent_offhours_today(now=t_tue_16), 0)
+
+        # 5) compute_hub_stocks must NOT exempt a single-sector repeater (e.g. 카티스 4x in 사이버보안)
+        recent_hub = [
+            {"ts": (now - timedelta(days=3)).isoformat(), "theme_key": "보안1", "sector": "사이버보안", "final_codes": ["140430", "005930"]},
+            {"ts": (now - timedelta(days=2)).isoformat(), "theme_key": "보안2", "sector": "사이버보안", "final_codes": ["140430"]},
+            {"ts": (now - timedelta(days=1)).isoformat(), "theme_key": "보안3", "sector": "사이버보안", "final_codes": ["140430"]},
+            {"ts": (now - timedelta(days=2)).isoformat(), "theme_key": "반도체1", "sector": "반도체·AI", "final_codes": ["005930"]},
+            {"ts": (now - timedelta(days=1)).isoformat(), "theme_key": "전력1", "sector": "전력·에너지", "final_codes": ["005930"]},
+        ]
+        hubs = radar.compute_hub_stocks(recent_hub, now=now)
+        self.assertIn("005930", hubs)       # 3 appearances across 3 distinct sectors -> true hub!
+        self.assertNotIn("140430", hubs)    # 3 appearances in ONLY 1 sector -> NOT exempted!
+
+        # 6) filter_recently_alerted_stocks weak-leftover guard
+        recent_leader = [{"ts": (now - timedelta(hours=3)).isoformat(), "theme_key": "대장주_기알림", "final_codes": ["298040"], "catalyst_score": 8.4}]
+        # Leader excluded leaving ONLY 단기테마성 상승수혜 -> blocked!
+        sf_weak = radar.filter_recently_alerted_stocks(
+            [
+                {"code": "298040", "name": "효성중공업", "direction": "상승수혜", "revenue_link": "본업직결"},
+                {"code": "999001", "name": "단기테마주", "direction": "상승수혜", "revenue_link": "단기테마성"},
+            ],
+            catalyst_score=8.5,
+            recent_alerts=recent_leader,
+            now=now,
+            window_hours=24,
+        )
+        self.assertTrue(sf_weak["only_weak_leftovers"])
+        self.assertTrue(sf_weak["all_filtered"])
+        self.assertEqual(sf_weak["kept_stocks"], [])
+
+        # Leader excluded leaving 부분연관 상승수혜 -> kept!
+        sf_solid = radar.filter_recently_alerted_stocks(
+            [
+                {"code": "298040", "name": "효성중공업", "direction": "상승수혜", "revenue_link": "본업직결"},
+                {"code": "267260", "name": "HD현대일렉트릭", "direction": "상승수혜", "revenue_link": "부분연관"},
+            ],
+            catalyst_score=8.5,
+            recent_alerts=recent_leader,
+            now=now,
+            window_hours=24,
+        )
+        self.assertFalse(sf_solid["only_weak_leftovers"])
+        self.assertFalse(sf_solid["all_filtered"])
+        self.assertEqual([s["code"] for s in sf_solid["kept_stocks"]], ["267260"])
+
+        # Leader excluded leaving 하락주의 warning -> warning preserved!
+        sf_warn = radar.filter_recently_alerted_stocks(
+            [
+                {"code": "298040", "name": "효성중공업", "direction": "상승수혜", "revenue_link": "본업직결"},
+                {"code": "011200", "name": "HMM", "direction": "하락주의", "revenue_link": "단기테마성"},
+            ],
+            catalyst_score=8.5,
+            recent_alerts=recent_leader,
+            now=now,
+            window_hours=24,
+        )
+        self.assertFalse(sf_warn["only_weak_leftovers"])
+        self.assertFalse(sf_warn["all_filtered"])
+        self.assertEqual([s["code"] for s in sf_warn["kept_stocks"]], ["011200"])
+
+    def test_intraday_prepriced_chasing_guard_unit_and_e2e(self) -> None:
+        q_spiked = radar.StockQuote("298040", 500000, 75000, 17.6, 300000, "OPEN", radar.classify_stage(17.6, 300000))
+        q_fresh = radar.StockQuote("267260", 300000, 6000, 2.0, 200000, "OPEN", radar.classify_stage(2.0, 200000))
+        q_closed = radar.StockQuote("298040", 500000, 75000, 17.6, 300000, "CLOSE", radar.classify_stage(17.6, 300000))
+
+        # All bullish picks >= +15% during OPEN -> blocked
+        hit, det = radar.is_all_bullish_prepriced(
+            [{"code": "298040", "name": "효성중공업", "direction": "상승수혜"}],
+            {"298040": q_spiked},
+            max_pct=15.0,
+        )
+        self.assertTrue(hit)
+        self.assertEqual(len(det), 1)
+
+        # Partial (one +17.6%, one +2.0%) -> allowed
+        hit_part, _ = radar.is_all_bullish_prepriced(
+            [
+                {"code": "298040", "name": "효성중공업", "direction": "상승수혜"},
+                {"code": "267260", "name": "HD현대일렉트릭", "direction": "상승수혜"},
+            ],
+            {"298040": q_spiked, "267260": q_fresh},
+            max_pct=15.0,
+        )
+        self.assertFalse(hit_part)
+
+        # Pure 하락주의 / 옥석가리기주의 warning alert -> never blocked
+        hit_warn, _ = radar.is_all_bullish_prepriced(
+            [{"code": "298040", "name": "효성중공업", "direction": "옥석가리기주의"}],
+            {"298040": q_spiked},
+            max_pct=15.0,
+        )
+        self.assertFalse(hit_warn)
+
+        # Market status CLOSE (e.g. holiday) -> never blocked by stale previous-day surge
+        hit_closed, _ = radar.is_all_bullish_prepriced(
+            [{"code": "298040", "name": "효성중공업", "direction": "상승수혜"}],
+            {"298040": q_closed},
+            max_pct=15.0,
+        )
+        self.assertFalse(hit_closed)
+
+        # Trading hours boundary: 08:15 pre-market False, 09:00~15:30 True
+        self.assertFalse(radar.is_regular_trading_hours(datetime(2026, 11, 20, 8, 15, tzinfo=KST)))
+        self.assertTrue(radar.is_regular_trading_hours(datetime(2026, 11, 20, 9, 0, tzinfo=KST)))
+        self.assertTrue(radar.is_regular_trading_hours(datetime(2026, 11, 20, 15, 30, tzinfo=KST)))
+        self.assertFalse(radar.is_regular_trading_hours(datetime(2026, 11, 20, 15, 31, tzinfo=KST)))
+
+        # E2E: at 10:15 KST regular trading hours, spiked +18.2% bullish pick is blocked with prepriced_skip trace,
+        # while at 08:15 KST pre-market it is NOT blocked!
+        comps = {c["code"]: dict(c) for c in radar.SEED_COMPANIES}
+        t_open = datetime(2026, 11, 20, 10, 15, tzinfo=KST)
+        t_pre = datetime(2026, 11, 20, 8, 15, tzinfo=KST)
+        item_open = radar.NewsItem("초고압 변압기 긴급 대규모 수주 계약", "https://ex.com/p_open", "연합뉴스_산업", "경제/산업", first_seen=t_open.isoformat())
+        item_pre = radar.NewsItem("초고압 변압기 긴급 대규모 수주 계약", "https://ex.com/p_pre", "연합뉴스_산업", "경제/산업", first_seen=t_pre.isoformat())
+
+        def fake_gemini_power(api_key, models, sp, up, **kw):
+            if sp == radar.SCREENING_PROMPT:
+                cid = json.loads(up)["clusters"][0]["cluster_id"]
+                return {"selected_events": [{"cluster_id": cid, "catalyst_score": 8.8, "theme_key": "변압기_수주", "second_order_keywords": ["전력기기"]}]}, "gemini-3.5-flash-lite"
+            return {"title": "변압기 수주 급등", "event_summary": "수주", "stocks": [{"code": "298040", "name": "효성중공업", "direction": "상승수혜"}]}, "gemini-3.6-flash"
+
+        env = {"GEMINI_API_KEY": "k", "TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c", "INSTANT_FLASH_ALERT": "false", "TRIGGER_MODE": "shadow"}
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            sent_open: list[str] = []
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.object(radar, "fetch_rss_news", return_value=[item_open]),
+                mock.patch.object(radar, "call_gemini", side_effect=fake_gemini_power),
+                mock.patch.object(radar, "load_krx_master", return_value=comps),
+                mock.patch.object(radar, "fetch_naver_quotes", return_value={"298040": q_spiked}),
+                mock.patch.object(radar, "send_telegram", side_effect=lambda t, c, m, start_chunk=0: sent_open.append(m) or 1),
+            ):
+                radar.run_live(dry_run=False, cycles=1, data_dir=tmp_dir, now_fn=lambda: t_open, daemon_mode=True)
+            self.assertEqual(len(sent_open), 0)
+            traces = [json.loads(l) for l in (tmp_dir / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertTrue(any(r["type"] == "prepriced_skip" for r in traces))
+
+        with tempfile.TemporaryDirectory() as tmp2:
+            tmp_dir2 = Path(tmp2)
+            sent_pre: list[str] = []
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.object(radar, "fetch_rss_news", return_value=[item_pre]),
+                mock.patch.object(radar, "call_gemini", side_effect=fake_gemini_power),
+                mock.patch.object(radar, "load_krx_master", return_value=comps),
+                mock.patch.object(radar, "fetch_naver_quotes", return_value={"298040": q_spiked}),
+                mock.patch.object(radar, "send_telegram", side_effect=lambda t, c, m, start_chunk=0: sent_pre.append(m) or 1),
+            ):
+                radar.run_live(dry_run=False, cycles=1, data_dir=tmp_dir2, now_fn=lambda: t_pre, daemon_mode=True)
+            self.assertEqual(len(sent_pre), 1)
 
 
 if __name__ == "__main__":
