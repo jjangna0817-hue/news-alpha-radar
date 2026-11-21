@@ -147,6 +147,14 @@ def _effective_config(data_dir: Path) -> dict[str, Any]:
                 else radar._env_float("MAX_BULLISH_PREPRICED_PCT", radar.DEFAULT_MAX_BULLISH_PREPRICED_PCT)
             ),
         ),
+        "min_trading_value_eok": max(
+            0.0,
+            float(
+                raw["min_trading_value_eok"]
+                if raw.get("min_trading_value_eok") is not None
+                else radar._env_float("MIN_TRADING_VALUE_EOK", radar.DEFAULT_MIN_TRADING_VALUE_EOK)
+            ),
+        ),
         "max_alerts_per_window": int(
             raw["max_alerts_per_window"]
             if raw.get("max_alerts_per_window") is not None
@@ -508,6 +516,8 @@ def validate_and_merge_config(data_dir: Path, patch: dict[str, Any]) -> dict[str
         cur["max_daily_per_sector"] = max(0, min(20, int(patch["max_daily_per_sector"])))
     if "max_bullish_prepriced_pct" in patch:
         cur["max_bullish_prepriced_pct"] = round(max(0.0, min(30.0, float(patch["max_bullish_prepriced_pct"]))), 1)
+    if "min_trading_value_eok" in patch:
+        cur["min_trading_value_eok"] = round(max(0.0, min(500.0, float(patch["min_trading_value_eok"]))), 1)
     if "max_alerts_per_window" in patch:
         cur["max_alerts_per_window"] = max(1, min(10, int(patch["max_alerts_per_window"])))
     if "theme_cooldown_hours" in patch:
@@ -1420,9 +1430,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <input id="cfg-max-prepriced" type="number" step="0.5" min="0" max="30" />
               </div>
               <div class="field">
-                <label for="cfg-rpd-limit">Stage 1 일일 RPD 기준 한도</label>
-                <input id="cfg-rpd-limit" type="number" step="10" min="10" max="10000" />
+                <label for="cfg-min-trading-val">최소 거래대금 기준 (억 원, 0=해제)</label>
+                <input id="cfg-min-trading-val" type="number" step="0.5" min="0" max="500" />
               </div>
+            </div>
+            <div class="field">
+              <label for="cfg-rpd-limit">Stage 1 일일 RPD 기준 한도</label>
+              <input id="cfg-rpd-limit" type="number" step="10" min="10" max="10000" />
             </div>
             <div class="field">
               <label for="cfg-dedup-mode">PR-3 유사도 중복 차단 모드</label>
@@ -1553,7 +1567,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <option value="all">전체 이벤트</option>
               <option value="flash_alert_sent">초고속 1보 푸시</option>
               <option value="premarket_digest_sent">장전 요약 발송</option>
+              <option value="premarket_digest_prewarm">장전 요약 사전분석</option>
               <option value="overnight_queued">야간 요약 대기열</option>
+              <option value="illiquid_skip">유동성 미달 차단</option>
               <option value="prepriced_skip">장중 급등 추격 차단</option>
               <option value="stock_dedup_decision">24h 종목 중복 판정</option>
               <option value="sector_limit_decision">섹터 일일 한도 판정</option>
@@ -1948,7 +1964,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         ttl.textContent = titleText;
         const cntBadge = document.createElement("span");
         cntBadge.className = "badge " + badgeCls;
-        cntBadge.textContent = (info.total || 0) + "건";
+        cntBadge.textContent = (info.total || 0) + "건" + (info.unbuyable_total ? " (체결제한 " + info.unbuyable_total + ")" : "");
         head.append(ttl, cntBadge);
         card.appendChild(head);
 
@@ -1967,9 +1983,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const sub = document.createElement("div");
             sub.className = "muted";
             sub.style.fontSize = "11.5px";
-            sub.textContent = (hs.net_avg_pct !== null && hs.net_avg_pct !== undefined)
-              ? "순 " + fmtPct(hs.net_avg_pct) + " · 승률 " + Number(hs.win_rate_pct || 0).toFixed(1) + "%"
-              : "승률 " + Number(hs.win_rate_pct || 0).toFixed(1) + "%";
+            if (hs.net_avg_pct !== null && hs.net_avg_pct !== undefined) {
+              const buyTxt = (info.unbuyable_total && hs.buyable_net_avg_pct !== null && hs.buyable_net_avg_pct !== undefined)
+                ? " · 실체결순 " + fmtPct(hs.buyable_net_avg_pct)
+                : "";
+              sub.textContent = "순 " + fmtPct(hs.net_avg_pct) + buyTxt + " · 승률 " + Number(hs.win_rate_pct || 0).toFixed(1) + "%";
+            } else {
+              sub.textContent = "승률 " + Number(hs.win_rate_pct || 0).toFixed(1) + "%";
+            }
             cell.append(lbl, val, sub);
           } else {
             val.textContent = "-";
@@ -2016,6 +2037,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         const tdPx = document.createElement("td");
         tdPx.textContent = r.alert_price ? Number(r.alert_price).toLocaleString("ko-KR") + "원" : "-";
+        if (r.buyable === false) {
+          const ub = document.createElement("span");
+          ub.className = "badge warn";
+          ub.style.marginLeft = "6px";
+          ub.textContent = r.unbuyable_reason || "매수제한";
+          tdPx.appendChild(ub);
+        }
 
         const td5 = document.createElement("td");
         td5.appendChild(makePctSpan(r.ret_5m));
@@ -2070,6 +2098,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById("cfg-stock-dedup-hours").value = cfg.stock_dedup_hours;
       document.getElementById("cfg-max-per-sector").value = cfg.max_daily_per_sector;
       document.getElementById("cfg-max-prepriced").value = cfg.max_bullish_prepriced_pct ?? 15;
+      document.getElementById("cfg-min-trading-val").value = cfg.min_trading_value_eok ?? 5;
       document.getElementById("cfg-max-daily").value = cfg.max_daily_alerts;
       document.getElementById("cfg-max-window").value = cfg.max_alerts_per_window;
       document.getElementById("cfg-cooldown").value = cfg.theme_cooldown_hours;
@@ -2140,9 +2169,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (r.type === "flash_alert_sent") {
             tdDesc.textContent = "⚡ 1보 속보 발송 · " + (r.headline || r.theme_key || "") + " (촉매 " + Number(r.catalyst_score || 0).toFixed(1) + ")";
           } else if (r.type === "premarket_digest_sent") {
-            tdDesc.textContent = "🌅 장전 요약 발송 · " + (r.count || 0) + "건 (" + (r.themes || []).join(", ") + ")";
+            tdDesc.textContent = "🌅 장전 요약 발송 · " + (r.count || 0) + "건 (" + (r.themes || []).join(", ") + ")" + (r.fallback_count ? " · Stage1 폴백 " + r.fallback_count + "건" : "");
+          } else if (r.type === "premarket_digest_prewarm") {
+            tdDesc.textContent = "🔥 장전 요약 사전분석(" + (r.status || "-") + ") · " + (r.theme_key || "") + (r.model ? " · " + r.model : "") + (r.error ? " · " + r.error : "");
           } else if (r.type === "overnight_queued") {
             tdDesc.textContent = "🌙 장전 요약 대기열 추가 · " + (r.theme_key || "") + " [" + (r.sector || "-") + "] (대기 " + (r.queue_size || 0) + "건)";
+          } else if (r.type === "illiquid_skip") {
+            tdDesc.textContent = "💧 유동성/거래정지 필터 차단 (<" + Number(r.min_trading_value_eok || 5).toFixed(1) + "억) · " + (r.theme_key || "") + " · " + (r.details || []).join(", ");
           } else if (r.type === "prepriced_skip") {
             tdDesc.textContent = "🛑 장중 급등 추격 차단 (≥+" + Number(r.max_pct || 15).toFixed(1) + "%) · " + (r.theme_key || "") + " · " + (r.details || []).join(", ");
           } else if (r.type === "stock_dedup_decision") {
@@ -2204,6 +2237,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         stock_dedup_hours: parseInt(document.getElementById("cfg-stock-dedup-hours").value, 10),
         max_daily_per_sector: parseInt(document.getElementById("cfg-max-per-sector").value, 10),
         max_bullish_prepriced_pct: parseFloat(document.getElementById("cfg-max-prepriced").value),
+        min_trading_value_eok: parseFloat(document.getElementById("cfg-min-trading-val").value),
         max_alerts_per_window: parseInt(document.getElementById("cfg-max-window").value, 10),
         theme_cooldown_hours: parseInt(document.getElementById("cfg-cooldown").value, 10),
         dedup_mode: document.getElementById("cfg-dedup-mode").value,

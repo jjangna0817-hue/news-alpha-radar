@@ -24,7 +24,7 @@ KST = radar.KST
 
 _APP_ENV_PREFIXES = (
     "GEMINI_", "TELEGRAM_", "DASHBOARD_", "DAEMON_", "MIN_CATALYST_",
-    "MAX_ALERTS_", "MAX_DAILY_", "MAX_MARKET_", "MAX_OFFHOURS_",
+    "MIN_TRADING_VALUE_", "MAX_ALERTS_", "MAX_DAILY_", "MAX_MARKET_", "MAX_OFFHOURS_",
     "MAX_BULLISH_PREPRICED_", "OFFHOURS_DIGEST_", "STOCK_DEDUP_",
     "THEME_COOLDOWN_", "DEDUP_MODE", "TRIGGER_MODE", "STAGE1_DAILY_",
     "INSTANT_FLASH_", "EXTRA_RSS_", "MARKET_LOOP_",
@@ -1965,9 +1965,29 @@ class TestBacktestFixesAndPerformanceTracking(unittest.TestCase):
             self.assertEqual(len(fallback), len(radar.SEED_COMPANIES))
 
     def test_alpha_safety_guards_deep_models_triggers_session_hub_and_weak_leftovers(self) -> None:
-        # 1) Stage 2 deep model order puts gemini-3.8-flash BEFORE gemini-3.5-flash-lite
+        # 1) Stage 2 deep model order puts full flash models BEFORE flash-lite fallbacks across 3.x & 2.5 RPD buckets
         deep_order = [m.strip() for m in radar.DEFAULT_DEEP_MODELS.split(",") if m.strip()]
-        self.assertEqual(deep_order, ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"])
+        self.assertEqual(
+            deep_order,
+            [
+                "gemini-3.6-flash",
+                "gemini-3.8-flash",
+                "gemini-2.5-flash",
+                "gemini-3.5-flash-lite",
+                "gemini-2.5-flash-lite",
+            ],
+        )
+        screen_order = [m.strip() for m in radar.DEFAULT_SCREEN_MODELS.split(",") if m.strip()]
+        self.assertEqual(
+            screen_order,
+            [
+                "gemini-3.5-flash-lite",
+                "gemini-2.5-flash-lite",
+                "gemini-2.5-flash",
+                "gemini-3.6-flash",
+                "gemini-3.8-flash",
+            ],
+        )
 
         # 2) Routine security spam moved from HARD to SOFT triggers
         for kw in ("해킹", "개인정보 유출", "정보유출", "전파탐지", "불법촬영"):
@@ -2354,6 +2374,423 @@ class TestRemoteHttpsTunnelAndCookieAuth(unittest.TestCase):
                 )
                 with urllib.request.urlopen(out_req, timeout=5) as resp:
                     self.assertIn("Max-Age=0", resp.headers.get("Set-Cookie") or "")
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+
+class TestQuotaConservationDigestResilienceAndLiquidity(unittest.TestCase):
+    def test_gemini_multi_key_rotation_and_overnight_digest_trigger_batching(self) -> None:
+        # 1) Multi-project key parsing (GEMINI_API_KEYS + GEMINI_API_KEY deduplicated in order)
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEYS": "proj1_key, proj2_key", "GEMINI_API_KEY": "proj1_key"}, clear=False):
+            self.assertEqual(radar.resolve_gemini_api_keys(), ["proj1_key", "proj2_key"])
+
+        # 2) Daily RPD exhaustion on proj1_key rotates to proj2_key on the SAME top model!
+        now = datetime(2026, 11, 20, 10, 30, tzinfo=KST)
+        seen_keys: list[tuple[str, str]] = []
+
+        def fake_urlopen(req, timeout=0):
+            hdr_key = req.headers.get("X-goog-api-key") or req.headers.get("x-goog-api-key") or ""
+            model_used = "gemini-3.6-flash" if "gemini-3.6-flash" in req.full_url else "other"
+            seen_keys.append((model_used, hdr_key))
+            if hdr_key == "proj1_key":
+                err_body = io.BytesIO(b'{"error": {"code": 429, "message": "Quota exceeded for metric: GenerateRequestsPerDayPerProjectPerModel"}}')
+                raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, err_body)
+            return _FakeResponse({"candidates": [{"content": {"parts": [{"text": '{"ok": true}'}]}}]})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            st = radar.StateStore(Path(tmp) / "state.json")
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                out, used_model = radar.call_gemini(
+                    "proj1_key,proj2_key",
+                    ["gemini-3.6-flash", "gemini-2.5-flash"],
+                    "sys",
+                    "usr",
+                    state=st,
+                    stage="stage2",
+                    now=now,
+                )
+            self.assertEqual(out, {"ok": True})
+            self.assertEqual(used_model, "gemini-3.6-flash")
+            self.assertEqual(seen_keys, [("gemini-3.6-flash", "proj1_key"), ("gemini-3.6-flash", "proj2_key")])
+            self.assertTrue(st.is_model_exhausted("gemini-3.6-flash#k1", now=now))
+            self.assertFalse(st.is_model_exhausted("gemini-3.6-flash", now=now))
+
+            # Next call skips exhausted proj1_key directly and uses proj2_key immediately!
+            seen_keys.clear()
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                radar.call_gemini("proj1_key,proj2_key", ["gemini-3.6-flash"], "sys", "usr", state=st, stage="stage2", now=now)
+            self.assertEqual(seen_keys, [("gemini-3.6-flash", "proj2_key")])
+
+            # 3) Overnight digest_mode=True batches quietly for 90 min even when multi-outlet / callback items arrive
+            t_night = datetime(2026, 11, 19, 23, 30, tzinfo=KST)
+            st.last_stage1_at = (t_night - timedelta(minutes=25)).isoformat()
+            night_multi = [
+                radar.NewsItem("반도체 패키징 증설 대규모 투자 추진", "https://ex.com/nm1", "연합뉴스_산업", "경제/산업", priority=0, first_seen=t_night.isoformat()),
+                radar.NewsItem("반도체 패키징 증설 대규모 투자 가속", "https://ex.com/nm2", "매일경제_경제", "경제/산업", first_seen=t_night.isoformat()),
+            ]
+            ranked_nm = radar.cluster_news_ranked(night_multi, now=t_night)
+            trig_wait = radar.evaluate_stage1_trigger(
+                night_multi, ranked_nm, st, now=t_night, market_window=False, digest_mode=True, digest_time="07:50"
+            )
+            self.assertFalse(trig_wait["should_run"])
+            self.assertEqual(trig_wait["reason"], "overnight_digest_batching")
+
+            # After 95 minutes -> runs overnight_digest_interval
+            st.last_stage1_at = (t_night - timedelta(minutes=95)).isoformat()
+            trig_interval = radar.evaluate_stage1_trigger(
+                night_multi, ranked_nm, st, now=t_night, market_window=False, digest_mode=True, digest_time="07:50"
+            )
+            self.assertTrue(trig_interval["should_run"])
+            self.assertEqual(trig_interval["reason"], "overnight_digest_interval")
+
+            # Weekday 07:20 KST (30 min before 07:50 digest, last S1 35 min ago) -> premarket_digest_prep flush!
+            t_prep = datetime(2026, 11, 20, 7, 20, tzinfo=KST)
+            st.last_stage1_at = (t_prep - timedelta(minutes=35)).isoformat()
+            trig_prep = radar.evaluate_stage1_trigger(
+                night_multi[:1], radar.cluster_news_ranked(night_multi[:1], now=t_prep), st,
+                now=t_prep, market_window=False, digest_mode=True, digest_time="07:50",
+            )
+            self.assertTrue(trig_prep["should_run"])
+            self.assertEqual(trig_prep["reason"], "premarket_digest_prep")
+
+            # Market 60s poll soft cooldown: elapsed 1m waits, elapsed 2m runs, hard keyword runs at 30s
+            t_mkt = datetime(2026, 11, 20, 10, 0, tzinfo=KST)
+            st.last_stage1_at = (t_mkt - timedelta(minutes=1)).isoformat()
+            soft2 = [radar.NewsItem("반도체 특허 승인 공급계약 추진", "https://ex.com/s2", "연합뉴스_산업", "경제/산업", first_seen=t_mkt.isoformat())]
+            self.assertFalse(
+                radar.evaluate_stage1_trigger(soft2, radar.cluster_news_ranked(soft2, now=t_mkt), st, now=t_mkt, market_window=True)["should_run"]
+            )
+            st.last_stage1_at = (t_mkt - timedelta(minutes=2)).isoformat()
+            self.assertTrue(
+                radar.evaluate_stage1_trigger(soft2, radar.cluster_news_ranked(soft2, now=t_mkt), st, now=t_mkt, market_window=True)["should_run"]
+            )
+
+    def test_premarket_digest_0730_prewarm_and_0750_stage2_outage_lossless_fallback(self) -> None:
+        comps = {c["code"]: dict(c) for c in radar.SEED_COMPANIES}
+
+        def fake_quotes(codes):
+            return {
+                c: radar.StockQuote(
+                    c, 50000, 500, 1.0, 20000, "CLOSE",
+                    radar.classify_stage(1.0, 20000),
+                    trading_value=0, prev_trading_value=1_500_000_000,
+                )
+                for c in codes
+            }
+
+        # Scenario A: 07:35 & 07:40 staggered pre-warming computes 1 item per cycle -> 07:50 needs ZERO Gemini calls!
+        with tempfile.TemporaryDirectory() as tmp_a:
+            dir_a = Path(tmp_a)
+            t_0735 = datetime(2026, 11, 20, 7, 35, tzinfo=KST)
+            t_0740 = datetime(2026, 11, 20, 7, 40, tzinfo=KST)
+            t_0750 = datetime(2026, 11, 20, 7, 50, tzinfo=KST)
+
+            st_a = radar.StateStore(dir_a / "state.json")
+            for idx, (tk, kw, hl, sc) in enumerate([
+                ("정전_변압기", "전력기기", "대규모 정전 초고압 변압기 긴급 발주", 9.2),
+                ("위성_발사체", "우주항공", "방산 위성 발사체 대규모 수주 확정", 8.8),
+            ]):
+                cl = radar.EventCluster(
+                    f"pw{idx}", hl, "속보",
+                    [radar.NewsItem(hl, f"https://ex.com/pw{idx}", "연합뉴스_최신", "속보", first_seen=t_0735.isoformat())],
+                )
+                st_a.enqueue_overnight(
+                    {
+                        "cluster": cl.to_dict(),
+                        "stage1": {"cluster_id": cl.cluster_id, "catalyst_score": sc, "theme_key": tk, "event_summary": hl, "second_order_keywords": [kw]},
+                        "theme_key": tk,
+                        "sector": "전력·에너지" if idx == 0 else "방산·우주항공",
+                        "catalyst_score": sc,
+                        "first_seen": t_0735.isoformat(),
+                        "created_at": t_0735.isoformat(),
+                    },
+                    now=t_0735,
+                )
+            st_a.save(now=t_0735)
+
+            s2_prewarm_calls = [0]
+            sent_a: list[str] = []
+
+            def fake_gemini_prewarm(api_key, models, sp, up, **kw):
+                s2_prewarm_calls[0] += 1
+                h = json.loads(up)["event_cluster"]["headline"]
+                if "정전" in h:
+                    return {"title": "사전분석 변압기 수혜", "event_summary": h, "stocks": [{"code": "298040", "name": "효성중공업", "direction": "상승수혜"}]}, "gemini-3.6-flash"
+                return {"title": "사전분석 우주항공 수혜", "event_summary": h, "stocks": [{"code": "012450", "name": "한화에어로스페이스", "direction": "상승수혜"}]}, "gemini-3.6-flash"
+
+            env_a = {"GEMINI_API_KEY": "k", "TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c", "MAX_OFFHOURS_ALERTS": "2", "OFFHOURS_DIGEST_ENABLED": "true"}
+            with (
+                mock.patch.dict(os.environ, env_a, clear=False),
+                mock.patch.object(radar, "fetch_rss_news", return_value=[]),
+                mock.patch.object(radar, "load_krx_master", return_value=comps),
+                mock.patch.object(radar, "fetch_naver_quotes", side_effect=fake_quotes),
+                mock.patch.object(radar, "send_telegram", side_effect=lambda t, c, m, start_chunk=0: sent_a.append(m) or 1),
+            ):
+                with mock.patch.object(radar, "call_gemini", side_effect=fake_gemini_prewarm):
+                    radar.run_live(dry_run=False, cycles=1, data_dir=dir_a, now_fn=lambda: t_0735, daemon_mode=True)
+                    self.assertEqual(s2_prewarm_calls[0], 1)  # Staggered: only 1 item per cycle!
+                    radar.run_live(dry_run=False, cycles=1, data_dir=dir_a, now_fn=lambda: t_0740, daemon_mode=True)
+                    self.assertEqual(s2_prewarm_calls[0], 2)
+
+                # At 07:50, even if Gemini is completely unreachable, precomputed_s2 serves the full digest with 0 live calls!
+                with mock.patch.object(radar, "call_gemini", side_effect=AssertionError("07:50 must not call Gemini when prewarmed")):
+                    radar.run_live(dry_run=False, cycles=1, data_dir=dir_a, now_fn=lambda: t_0750, daemon_mode=True)
+
+            self.assertEqual(len(sent_a), 1)
+            self.assertIn("사전분석 변압기 수혜", sent_a[0])
+            self.assertIn("사전분석 우주항공 수혜", sent_a[0])
+            self.assertIn("전일 거래대금 15.0억", sent_a[0])
+
+        # Scenario B: 12 un-warmed overnight items queued + 100% Stage 2 503/429 outage at 07:50
+        # -> Circuit breaker stops after 2 Stage 2 errors AND Stage 1+KRX lossless fallback STILL sends digest!
+        with tempfile.TemporaryDirectory() as tmp_b:
+            dir_b = Path(tmp_b)
+            t_0750 = datetime(2026, 11, 20, 7, 50, tzinfo=KST)
+            st_b = radar.StateStore(dir_b / "state.json")
+            kw_cycle = ["전력기기", "우주항공", "감염병", "조선해운", "로봇", "수자원"]
+            for i in range(12):
+                kw = kw_cycle[i % len(kw_cycle)]
+                hl = f"야간 대형 촉매 이슈 {i + 1}호 ({kw})"
+                cl = radar.EventCluster(
+                    f"outage_{i}", hl, "속보",
+                    [radar.NewsItem(hl, f"https://ex.com/out{i}", "연합뉴스_최신", "속보", first_seen=(t_0750 - timedelta(hours=3)).isoformat())],
+                )
+                st_b.enqueue_overnight(
+                    {
+                        "cluster": cl.to_dict(),
+                        "stage1": {
+                            "cluster_id": cl.cluster_id,
+                            "catalyst_score": round(9.5 - i * 0.1, 1),
+                            "theme_key": f"야간이슈_{i}_{kw}",
+                            "event_summary": f"{hl} 요약",
+                            "why_notable": f"{kw} 밸류체인 2차 수혜",
+                            "second_order_keywords": [kw],
+                        },
+                        "theme_key": f"야간이슈_{i}_{kw}",
+                        "sector": f"섹터_{i}",
+                        "catalyst_score": round(9.5 - i * 0.1, 1),
+                        "first_seen": (t_0750 - timedelta(hours=3)).isoformat(),
+                        "created_at": (t_0750 - timedelta(hours=3)).isoformat(),
+                    },
+                    now=t_0750 - timedelta(hours=1),
+                )
+            st_b.save(now=t_0750 - timedelta(hours=1))
+            self.assertEqual(len(st_b.overnight_queue), 12)
+
+            s2_fail_calls = [0]
+            sent_b: list[str] = []
+
+            def always_503(*args, **kwargs):
+                s2_fail_calls[0] += 1
+                raise RuntimeError("HTTP 503 Service Unavailable / 429 Resource Exhausted")
+
+            env_b = {
+                "GEMINI_API_KEY": "k",
+                "TELEGRAM_BOT_TOKEN": "t",
+                "TELEGRAM_CHAT_ID": "c",
+                "MAX_OFFHOURS_ALERTS": "3",
+                "MAX_DAILY_PER_SECTOR": "0",
+                "OFFHOURS_DIGEST_ENABLED": "true",
+            }
+            with (
+                mock.patch.dict(os.environ, env_b, clear=False),
+                mock.patch.object(radar, "fetch_rss_news", return_value=[]),
+                mock.patch.object(radar, "load_krx_master", return_value=comps),
+                mock.patch.object(radar, "fetch_naver_quotes", side_effect=fake_quotes),
+                mock.patch.object(radar, "call_gemini", side_effect=always_503),
+                mock.patch.object(radar, "send_telegram", side_effect=lambda t, c, m, start_chunk=0: sent_b.append(m) or 1),
+            ):
+                radar.run_live(dry_run=False, cycles=1, data_dir=dir_b, now_fn=lambda: t_0750, daemon_mode=True)
+
+            # Circuit breaker tripped at 2 errors (NOT 12!), and digest WAS sent via stage1-fallback!
+            self.assertEqual(s2_fail_calls[0], 2)
+            self.assertEqual(len(sent_b), 1)
+            self.assertIn("[장전 요약] 간밤 핵심 2차 파급 이슈 (3건)", sent_b[0])
+            self.assertIn("stage1-fallback", sent_b[0])
+            self.assertIn("효성중공업", sent_b[0])
+
+            traces_b = [json.loads(l) for l in (dir_b / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+            digest_ev = next(r for r in traces_b if r["type"] == "premarket_digest_sent")
+            self.assertEqual(digest_ev["count"], 3)
+            self.assertEqual(digest_ev["fallback_count"], 3)
+
+    def test_hybrid_liquidity_filter_naver_fchart_and_buyable_performance_split(self) -> None:
+        import threading as _th
+        import dashboard
+
+        # 1) fetch_naver_quotes parses accumulatedTradingValue ("1,200백만"), upper-limit/halt caution, and fchart prior-day turnover
+        radar._PREV_TRADING_VALUE_CACHE.clear()
+        t_open = datetime(2026, 11, 20, 9, 20, tzinfo=KST)
+
+        def fake_naver_http(req, timeout=0):
+            url = req.full_url
+            if "polling.finance.naver.com" in url:
+                return _FakeResponse({
+                    "datas": [
+                        {
+                            "itemCode": "446840",
+                            "closePrice": "13,000",
+                            "compareToPreviousClosePrice": "3,000",
+                            "fluctuationsRatio": "29.95",
+                            "compareToPreviousPrice": {"code": "1"},
+                            "accumulatedTradingVolume": "92,300",
+                            "accumulatedTradingValue": "1,200백만",
+                            "marketStatus": "OPEN",
+                        },
+                        {
+                            "itemCode": "140430",
+                            "closePrice": "2,500",
+                            "compareToPreviousClosePrice": "0",
+                            "fluctuationsRatio": "0.00",
+                            "accumulatedTradingVolume": "0",
+                            "marketStatus": "HALT",
+                        },
+                    ]
+                })
+            if "fchart.stock.naver.com" in url and "symbol=446840" in url:
+                xml_bytes = (
+                    b'<?xml version="1.0" encoding="EUC-KR" ?><protocol><chartdata>'
+                    b'<item data="20261119|10000|10200|9800|10000|85000" />'
+                    b'<item data="20261120|13000|13000|13000|13000|92300" />'
+                    b'</chartdata></protocol>'
+                )
+
+                class _RawResp:
+                    def read(self):
+                        return xml_bytes
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *a):
+                        return None
+
+                return _RawResp()
+            raise urllib.error.URLError("no mock")
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_naver_http):
+            qmap = radar.fetch_naver_quotes(["446840", "140430"], now=t_open)
+
+        q_446840 = qmap["446840"]
+        self.assertEqual(q_446840.trading_value, 1_200_000_000)       # 12.0억
+        self.assertEqual(q_446840.prev_trading_value, 850_000_000)    # 8.5억 (from 20261119 close*vol)
+        self.assertEqual(q_446840.caution_status, "상한가잠김")
+        self.assertEqual(radar.assess_quote_executability(q_446840), (False, "상한가잠김"))
+        self.assertEqual(radar.recommend_position_cap_krw(q_446840), 12_000_000)  # 1% of max(8.5억, 12.0억) = 1,200만원
+        note = radar.format_liquidity_note(q_446840)
+        self.assertIn("전일 8.5억 · 당일 12.0억", note)
+        self.assertIn("1% 적정진입 ~1,200만원", note)
+        self.assertIn("현재 매수 어려움(상한가 잠김)", note)
+
+        q_140430 = qmap["140430"]
+        self.assertEqual(radar.assess_quote_executability(q_140430), (False, "거래정지"))
+
+        # 2) Hybrid liquidity filter: <5억 micro-cap & halted excluded, today-surging small-cap (>=5억) & warnings & unknown quotes kept!
+        quotes_mix = {
+            "000001": radar.StockQuote("000001", 2000, 50, 2.5, 20000, "OPEN", "", trading_value=80_000_000, prev_trading_value=50_000_000),      # max 0.8억 -> drop
+            "000002": radar.StockQuote("000002", 8000, 400, 5.2, 80000, "OPEN", "", trading_value=640_000_000, prev_trading_value=170_000_000),   # prev 1.7억, today 6.4억 -> KEEP!
+            "140430": q_140430,                                                                                                                   # halted -> drop
+            "000003": radar.StockQuote("000003", 3000, -100, -3.2, 10000, "OPEN", "", trading_value=30_000_000, prev_trading_value=40_000_000),   # 하락주의 warning -> KEEP!
+            "000004": radar.StockQuote("000004", 10000, 0, 0.0, 0, "CLOSE", ""),                                                                  # unknown liquidity -> KEEP!
+        }
+        lf = radar.filter_illiquid_bullish_stocks(
+            [
+                {"code": "000001", "name": "극소형주", "direction": "상승수혜"},
+                {"code": "000002", "name": "수급폭발소형주", "direction": "상승수혜"},
+                {"code": "140430", "name": "정지종목", "direction": "상승수혜"},
+                {"code": "000003", "name": "소형피해주", "direction": "하락주의"},
+                {"code": "000004", "name": "시세미확인주", "direction": "상승수혜"},
+            ],
+            quotes_mix,
+            min_trading_value_eok=5.0,
+        )
+        self.assertEqual([s["code"] for s in lf["kept_stocks"]], ["000002", "000003", "000004"])
+        self.assertEqual(lf["excluded_codes"], ["000001", "140430"])
+        self.assertFalse(lf["all_filtered"])
+
+        # 3) E2E run_live blocks alert when all bullish candidates fail 5억 liquidity filter (emits illiquid_skip)
+        comps = {c["code"]: dict(c) for c in radar.SEED_COMPANIES}
+        item_ill = radar.NewsItem("AI 안경 부정행위 적발 전파탐지 의무화", "https://ex.com/ill1", "연합뉴스_사회", "사회/사건", first_seen=t_open.isoformat())
+
+        def fake_gemini_ill(api_key, models, sp, up, **kw):
+            if sp == radar.SCREENING_PROMPT:
+                cid = json.loads(up)["clusters"][0]["cluster_id"]
+                return {"selected_events": [{"cluster_id": cid, "catalyst_score": 8.6, "theme_key": "전파탐지_극소형", "second_order_keywords": ["전파탐지"]}]}, "gemini-3.5-flash-lite"
+            return {"title": "전파탐지 테마", "event_summary": "요약", "stocks": [{"code": "446840", "name": "지슨", "direction": "상승수혜"}]}, "gemini-3.6-flash"
+
+        q_tiny = {"446840": radar.StockQuote("446840", 5000, 100, 2.0, 10000, "OPEN", "🟢 미반영/초입 구간", trading_value=50_000_000, prev_trading_value=170_000_000)}
+        with tempfile.TemporaryDirectory() as tmp_e2e:
+            dir_e2e = Path(tmp_e2e)
+            sent_ill: list[str] = []
+            env_ill = {
+                "GEMINI_API_KEY": "k",
+                "TELEGRAM_BOT_TOKEN": "t",
+                "TELEGRAM_CHAT_ID": "c",
+                "MIN_TRADING_VALUE_EOK": "5.0",
+                "INSTANT_FLASH_ALERT": "false",
+                "TRIGGER_MODE": "shadow",
+            }
+            with (
+                mock.patch.dict(os.environ, env_ill, clear=False),
+                mock.patch.object(radar, "fetch_rss_news", return_value=[item_ill]),
+                mock.patch.object(radar, "call_gemini", side_effect=fake_gemini_ill),
+                mock.patch.object(radar, "load_krx_master", return_value=comps),
+                mock.patch.object(radar, "fetch_naver_quotes", return_value=q_tiny),
+                mock.patch.object(radar, "send_telegram", side_effect=lambda t, c, m, start_chunk=0: sent_ill.append(m) or 1),
+            ):
+                radar.run_live(dry_run=False, cycles=1, data_dir=dir_e2e, now_fn=lambda: t_open, daemon_mode=True)
+
+            self.assertEqual(len(sent_ill), 0)
+            tr_ill = [json.loads(l) for l in (dir_e2e / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertTrue(any(r["type"] == "illiquid_skip" and r["blocked"] for r in tr_ill))
+
+            # 4) PerformanceTracker separates unbuyable upper-limit lock from realistic buyable_net_avg_pct + Dashboard config API
+            pt = radar.PerformanceTracker(dir_e2e / "performance.jsonl")
+            pt.record_alert(
+                alert_ts=datetime(2026, 11, 20, 8, 20, tzinfo=KST),
+                theme_key="보안_이슈",
+                sector="전파·물리보안",
+                title="보안 수혜",
+                catalyst_score=8.9,
+                window="market",
+                stocks=[
+                    {"code": "446840", "name": "지슨", "direction": "상승수혜"},
+                    {"code": "263860", "name": "지니언스", "direction": "상승수혜"},
+                ],
+                quotes={
+                    "446840": q_446840,  # +29.95% OPEN -> buyable=False (상한가잠김), price=13000
+                    "263860": radar.StockQuote("263860", 10000, 200, 2.0, 150000, "OPEN", "", trading_value=1_500_000_000, prev_trading_value=2_000_000_000),
+                },
+            )
+            pt.update_pending(
+                now=datetime(2026, 11, 20, 15, 35, tzinfo=KST),
+                fetch_quotes_fn=lambda codes: {
+                    "446840": radar.StockQuote("446840", 18200, 0, 0.0, 100000, "CLOSE", ""),   # +40.00% (unbuyable mirage!)
+                    "263860": radar.StockQuote("263860", 10623, 0, 0.0, 200000, "CLOSE", ""),   # +6.23% (realistically buyable!)
+                },
+            )
+            summary = radar.summarize_performance(pt.load_records())
+            bull = summary["by_direction"]["상승수혜"]
+            self.assertEqual(bull["total"], 2)
+            self.assertEqual(bull["unbuyable_total"], 1)
+            self.assertAlmostEqual(bull["ret_close"]["net_avg_pct"], 22.89, places=1)        # ((40 + 6.23)/2) - 0.23
+            self.assertEqual(bull["ret_close"]["buyable_count"], 1)
+            self.assertAlmostEqual(bull["ret_close"]["buyable_net_avg_pct"], 6.00, places=2)  # 6.23 - 0.23!
+
+            # Verify Dashboard /api/config round-trips min_trading_value_eok
+            srv = dashboard.create_dashboard_server("127.0.0.1", 0, data_dir=dir_e2e, password="")
+            port = srv.server_address[1]
+            t = _th.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            try:
+                req_cfg = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/config",
+                    data=json.dumps({"min_trading_value_eok": 7.5}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req_cfg, timeout=5) as resp:
+                    saved_cfg = json.loads(resp.read().decode("utf-8"))["config"]
+                self.assertEqual(saved_cfg["min_trading_value_eok"], 7.5)
             finally:
                 srv.shutdown()
                 srv.server_close()
