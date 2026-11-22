@@ -153,7 +153,9 @@ fi
 
 # 서비스 재시작 (터널 서비스는 URL 유지를 위해 미가동 상태이거나 터널 파일 변경 시에만 재시작)
 if command -v systemctl >/dev/null 2>&1; then
-  systemctl --user is-active --quiet news-alpha-radar.service && systemctl --user restart news-alpha-radar.service || true
+  if systemctl --user is-active --quiet news-alpha-radar.service || systemctl --user is-enabled --quiet news-alpha-radar.service 2>/dev/null; then
+    systemctl --user restart news-alpha-radar.service || true
+  fi
   systemctl --user is-active --quiet news-alpha-telegram.service && systemctl --user restart news-alpha-telegram.service || true
 
   TUNNEL_RAW="$(grep -E '^DASHBOARD_TUNNEL_ENABLED=' "${REPO_DIR}/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d ' "\r' | tr '[:upper:]' '[:lower:]' || true)"
@@ -166,7 +168,7 @@ if command -v systemctl >/dev/null 2>&1; then
     fi
   fi
 
-  if systemctl --user is-active --quiet news-alpha-dashboard.service; then
+  if systemctl --user is-active --quiet news-alpha-dashboard.service || systemctl --user is-enabled --quiet news-alpha-dashboard.service 2>/dev/null; then
     if [ "${DEFER_DASHBOARD}" = "1" ]; then
       nohup bash -c 'sleep 1; systemctl --user restart news-alpha-dashboard.service' </dev/null >/dev/null 2>&1 9>&- &
     else
