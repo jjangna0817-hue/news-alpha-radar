@@ -2265,6 +2265,85 @@ class TestRemoteHttpsTunnelAndCookieAuth(unittest.TestCase):
                 self.assertEqual(len(sent_msgs), 2)
                 self.assertNotIn(pw1, sent_msgs[1])
 
+    def test_tunnel_health_probe_and_telegram_self_heal_reconnect(self) -> None:
+        import threading as _th
+        import tunnel_manager
+
+        # 1) Public URL probe distinguishes healthy 200/401 from dead Cloudflare 530 (Error 1033) / 502 / NXDOMAIN
+        with mock.patch("urllib.request.urlopen", return_value=_FakeResponse({"ok": True}, status=200)):
+            self.assertEqual(
+                tunnel_manager.probe_tunnel_public_url("https://live-radar.trycloudflare.com"),
+                (True, "HTTP 200"),
+            )
+
+        err_401 = urllib.error.HTTPError("https://live-radar.trycloudflare.com/", 401, "Unauthorized", {}, io.BytesIO(b""))
+        with mock.patch("urllib.request.urlopen", side_effect=err_401):
+            self.assertEqual(
+                tunnel_manager.probe_tunnel_public_url("https://live-radar.trycloudflare.com"),
+                (True, "HTTP 401"),
+            )
+
+        err_530 = urllib.error.HTTPError("https://dead-radar.trycloudflare.com/", 530, "Error 1033", {}, io.BytesIO(b"1033"))
+        with mock.patch("urllib.request.urlopen", side_effect=err_530):
+            self.assertEqual(
+                tunnel_manager.probe_tunnel_public_url("https://dead-radar.trycloudflare.com"),
+                (False, "HTTP 530"),
+            )
+
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Name or service not known")):
+            ok_dns, detail_dns = tunnel_manager.probe_tunnel_public_url("https://nx-radar.trycloudflare.com")
+            self.assertFalse(ok_dns)
+            self.assertIn("Name or service not known", detail_dns)
+
+        # 2) When user types '대시보드' and current URL returns HTTP 530 (expired tunnel), responder triggers reconnect_evt!
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            data_dir = tmp_dir / "data"
+            (tmp_dir / ".env").write_text("TELEGRAM_BOT_TOKEN=tok1\nTELEGRAM_CHAT_ID=777\n", encoding="utf-8")
+            tunnel_manager.write_tunnel_status(
+                data_dir,
+                {
+                    "pid": 333,
+                    "state": "running",
+                    "url": "https://expired-radar.trycloudflare.com",
+                    "heartbeat_at": datetime.now(KST).isoformat(),
+                },
+            )
+            stop_evt = _th.Event()
+            reconnect_evt = _th.Event()
+            sent_replies: list[str] = []
+            calls = {"n": 0}
+
+            def fake_tg_updates(req, timeout=0):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return _FakeResponse({"ok": True, "result": []})
+                if calls["n"] == 2:
+                    stop_evt.set()
+                    return _FakeResponse(
+                        {
+                            "ok": True,
+                            "result": [
+                                {
+                                    "update_id": 10,
+                                    "message": {"chat": {"id": 777, "type": "private"}, "text": "대시보드"},
+                                }
+                            ],
+                        }
+                    )
+                return _FakeResponse({"ok": True, "result": []})
+
+            with (
+                mock.patch("urllib.request.urlopen", side_effect=fake_tg_updates),
+                mock.patch.object(tunnel_manager, "probe_tunnel_public_url", return_value=(False, "HTTP 530")),
+                mock.patch.object(radar, "send_telegram", side_effect=lambda t, c, m, start_chunk=0: sent_replies.append(m) or 1),
+            ):
+                tunnel_manager._bot_command_responder_loop(stop_evt, data_dir, tmp_dir, reconnect_evt=reconnect_evt)
+
+            self.assertTrue(reconnect_evt.is_set())
+            self.assertEqual(len(sent_replies), 1)
+            self.assertIn("새 보안 링크를 발급", sent_replies[0])
+
     def test_dashboard_cookie_login_logout_and_tunnel_actions(self) -> None:
         import threading as _th
         import dashboard

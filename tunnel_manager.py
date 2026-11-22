@@ -49,10 +49,14 @@ TRYCLOUDFLARE_URL_RE = re.compile(
     re.IGNORECASE,
 )
 PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
-NOTIFY_MIN_INTERVAL_SEC = 180
+NOTIFY_MIN_INTERVAL_SEC = 30
 HEARTBEAT_INTERVAL_SEC = 20
+STARTUP_URL_TIMEOUT_SEC = 45.0
+HEALTH_CHECK_EVERY_N_HEARTBEATS = 3
+MAX_CONSECUTIVE_URL_FAILURES = 3
 
 LINK_COMMANDS = frozenset({"/link", "/url", "/dashboard", "/대시보드", "대시보드", "링크", "접속주소"})
+RECONNECT_COMMANDS = frozenset({"/reconnect", "/reissue", "재연결", "새링크", "링크재발급"})
 PW_COMMANDS = frozenset({"/pw", "/password", "비밀번호"})
 
 
@@ -315,6 +319,38 @@ def read_tunnel_status(data_dir: Path, now: datetime | None = None) -> dict[str,
     return st
 
 
+def probe_local_target(target_url: str, *, timeout: float = 3.0) -> bool:
+    """로컬 대시보드(127.0.0.1:8787)가 실제 응답하는지 프록시 우회로 점검."""
+    url = f"{target_url.rstrip('/')}/"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(url, headers={"User-Agent": radar.USER_AGENT})
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return int(getattr(resp, "status", 200)) < 500
+    except urllib.error.HTTPError as exc:
+        return int(exc.code) in (401, 403)
+    except Exception:
+        return False
+
+
+def probe_tunnel_public_url(url: str, *, timeout: float = 6.0) -> tuple[bool, str]:
+    """발급된 trycloudflare.com 외부 HTTPS 주소가 실제로 살아 있는지 점검 (HTTP 530 Error 1033·502·NXDOMAIN 감지)."""
+    if not url:
+        return False, "empty_url"
+    check_url = f"{url.rstrip('/')}/"
+    req = urllib.request.Request(check_url, headers={"User-Agent": radar.USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            code = int(getattr(resp, "status", 200))
+            return (code < 500), f"HTTP {code}"
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403, 429):
+            return True, f"HTTP {exc.code}"
+        return False, f"HTTP {exc.code}"
+    except Exception as exc:
+        return False, str(exc)[:100]
+
+
 def format_tunnel_telegram_html(
     url: str,
     *,
@@ -338,7 +374,7 @@ def format_tunnel_telegram_html(
         lines.append("🔐 비밀번호: <code>.env</code>에 설정된 <code>DASHBOARD_PASSWORD</code> (1회 로그인 시 30일 유지)")
     if lan_ip and lan_ip != "127.0.0.1":
         lines.append(f"🏠 집 와이파이 내부 주소: <code>http://{html.escape(lan_ip)}:{port}</code>")
-    lines.append("💡 <i>언제든 이 채팅창에</i> <code>대시보드</code> <i>또는</i> <code>/link</code><i>를 입력하면 현재 링크를 다시 보내드립니다.</i>")
+    lines.append("💡 <i>채팅창에</i> <code>대시보드</code><i>(현재 링크 확인) 또는</i> <code>재연결</code><i>(새 링크 즉시 발급)을 입력해 보세요.</i>")
     return "\n".join(lines)
 
 
@@ -440,8 +476,10 @@ def _bot_command_responder_loop(
     stop_evt: threading.Event,
     data_dir: Path,
     repo_dir: Path,
+    *,
+    reconnect_evt: threading.Event | None = None,
 ) -> None:
-    """텔레그램 봇 채팅에 `대시보드` / `/link` (또는 1:1 채팅에서 `/pw`) 입력 시 즉시 응답."""
+    """텔레그램 봇 채팅에 `대시보드` / `재연결` (또는 1:1 채팅에서 `/pw`) 입력 시 즉시 응답."""
     env_path = repo_dir / ".env"
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or read_dotenv_value(env_path, "TELEGRAM_BOT_TOKEN")).strip()
     target_chat = (os.getenv("TELEGRAM_CHAT_ID") or read_dotenv_value(env_path, "TELEGRAM_CHAT_ID")).strip()
@@ -494,15 +532,39 @@ def _bot_command_responder_loop(
                 if not text:
                     continue
                 first_tok = text.split()[0].split("@")[0].strip().lower()
-                if first_tok in LINK_COMMANDS:
+                if first_tok in RECONNECT_COMMANDS:
+                    if not is_tunnel_enabled(data_dir):
+                        radar.send_telegram(token, target_chat, "⏸ 현재 외부 접속 터널이 꺼져 있습니다. 집 와이파이 대시보드 설정에서 켤 수 있습니다.")
+                    else:
+                        if reconnect_evt is not None:
+                            reconnect_evt.set()
+                        radar.send_telegram(
+                            token,
+                            target_chat,
+                            "🔄 외부 접속 보안 터널을 새로 연결합니다. 약 5~10초 뒤 새 접속 링크를 보내드립니다!",
+                        )
+                elif first_tok in LINK_COMMANDS:
                     st = read_tunnel_status(data_dir)
                     live_url = str(st.get("url") or "").strip()
                     if st.get("alive") and live_url:
-                        send_tunnel_link_telegram(data_dir, repo_dir, url_override=live_url, include_generated_password=False)
+                        ok_pub, detail = probe_tunnel_public_url(live_url, timeout=5.0)
+                        if ok_pub:
+                            send_tunnel_link_telegram(data_dir, repo_dir, url_override=live_url, include_generated_password=False)
+                        else:
+                            if reconnect_evt is not None:
+                                reconnect_evt.set()
+                            radar.send_telegram(
+                                token,
+                                target_chat,
+                                f"🔄 기존 외부 접속 링크가 만료되었거나 응답하지 않아({html.escape(detail)}) "
+                                "지금 즉시 새 보안 링크를 발급하고 있습니다. 약 5~10초만 기다려 주세요!",
+                            )
                     elif not is_tunnel_enabled(data_dir):
                         radar.send_telegram(token, target_chat, "⏸ 현재 외부 접속 터널이 꺼져 있습니다. 집 와이파이 대시보드 설정에서 켤 수 있습니다.")
                     else:
-                        radar.send_telegram(token, target_chat, "⏳ 외부 접속 보안 터널을 연결하고 있습니다. 5~10초 뒤 다시 입력해 주세요.")
+                        if reconnect_evt is not None:
+                            reconnect_evt.set()
+                        radar.send_telegram(token, target_chat, "⏳ 외부 접속 보안 터널을 새로 연결하고 있습니다. 5~10초 뒤 새 링크를 보내드립니다.")
                 elif first_tok in PW_COMMANDS and str(chat.get("type") or "") == "private":
                     pw = (read_dotenv_value(env_path, "DASHBOARD_PASSWORD") or os.getenv("DASHBOARD_PASSWORD") or "").strip()
                     if pw:
@@ -516,6 +578,24 @@ def _bot_command_responder_loop(
             stop_evt.wait(5.0)
 
 
+def _revive_local_dashboard_if_systemd() -> None:
+    """로컬 대시보드(127.0.0.1:8787) 무응답 시 우분투 systemd user 환경이면 자동 재기동 시도."""
+    if sys.platform != "linux" or not shutil.which("systemctl"):
+        return
+    dash_unit = Path.home() / ".config" / "systemd" / "user" / "news-alpha-dashboard.service"
+    if not dash_unit.exists():
+        return
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "restart", "news-alpha-dashboard.service"],
+            check=False,
+            timeout=10,
+        )
+        logger.info("로컬 대시보드 무응답 감지 — news-alpha-dashboard.service 자동 재기동 시도")
+    except Exception:
+        pass
+
+
 def run_tunnel_supervisor(
     *,
     data_dir: Path,
@@ -523,8 +603,9 @@ def run_tunnel_supervisor(
     port: int | None = None,
     stop_event: threading.Event | None = None,
 ) -> None:
-    """cloudflared Quick Tunnel 상시 실행·감시 및 텔레그램 주소 자동 안내 루프."""
+    """cloudflared Quick Tunnel 상시 실행·자가치유 감시 및 텔레그램 주소 자동 안내 루프."""
     stop_evt = stop_event if stop_event is not None else threading.Event()
+    reconnect_evt = threading.Event()
     proc_holder: dict[str, subprocess.Popen[str] | None] = {"proc": None}
 
     if stop_event is None and threading.current_thread() is threading.main_thread():
@@ -547,6 +628,7 @@ def run_tunnel_supervisor(
     responder = threading.Thread(
         target=_bot_command_responder_loop,
         args=(stop_evt, data_dir, repo_dir),
+        kwargs={"reconnect_evt": reconnect_evt},
         daemon=True,
     )
     responder.start()
@@ -555,6 +637,7 @@ def run_tunnel_supervisor(
     last_notify_mono = 0.0
 
     while not stop_evt.is_set():
+        reconnect_evt.clear()
         if not is_tunnel_enabled(data_dir):
             write_tunnel_status(
                 data_dir,
@@ -612,6 +695,10 @@ def run_tunnel_supervisor(
         current_url: str | None = None
         last_err_line: str | None = None
         url_lock = threading.Lock()
+        notify_lock = threading.Lock()
+        forced_reconnect = False
+        heartbeat_ticks = 0
+        consecutive_url_failures = 0
 
         write_tunnel_status(
             data_dir,
@@ -626,7 +713,16 @@ def run_tunnel_supervisor(
             },
         )
 
-        cmd = [str(cf_bin), "tunnel", "--no-autoupdate", "--url", target_url]
+        # 가정용 공유기(KT/SKB/LGU+) 야간 UDP(QUIC) 세션 끊김으로 인한 Error 1033 방지를 위해 TCP 기반 http2 기본 사용
+        cf_proto = (
+            os.getenv("CLOUDFLARED_PROTOCOL")
+            or read_dotenv_value(env_path, "CLOUDFLARED_PROTOCOL")
+            or "http2"
+        ).strip().lower()
+        if cf_proto not in ("http2", "quic", "auto"):
+            cf_proto = "http2"
+
+        cmd = [str(cf_bin), "tunnel", "--no-autoupdate", "--protocol", cf_proto, "--url", target_url]
         logger.info("Cloudflare 보안 터널 시작: %s", " ".join(cmd))
         try:
             proc = subprocess.Popen(
@@ -655,8 +751,35 @@ def run_tunnel_supervisor(
             backoff_sec = min(60.0, backoff_sec * 2)
             continue
 
+        def _try_notify_new_url(target_u: str) -> None:
+            nonlocal last_notify_mono
+            with notify_lock:
+                tstate = _load_tunnel_state(data_dir)
+                prev_url = str(tstate.get("last_notified_url") or "")
+                has_pending_pw = bool(tstate.get("pending_initial_password"))
+                if target_u == prev_url and not has_pending_pw:
+                    return
+                now_m = time.monotonic()
+                if (
+                    not has_pending_pw
+                    and last_notify_mono > 0.0
+                    and (now_m - last_notify_mono) < NOTIFY_MIN_INTERVAL_SEC
+                ):
+                    return
+                try:
+                    if send_tunnel_link_telegram(
+                        data_dir,
+                        repo_dir,
+                        url_override=target_u,
+                        include_generated_password=True,
+                    ):
+                        last_notify_mono = time.monotonic()
+                        logger.info("텔레그램으로 외부 접속 HTTPS 링크를 발송했습니다: %s", target_u)
+                except Exception as tg_exc:
+                    logger.warning("터널 링크 텔레그램 발송 실패(다음 주기에 자동 재시도): %s", tg_exc)
+
         def _reader() -> None:
-            nonlocal current_url, last_err_line, last_notify_mono
+            nonlocal current_url, last_err_line
             assert proc.stdout is not None
             for line in proc.stdout:
                 s = line.strip()
@@ -680,28 +803,9 @@ def run_tunnel_supervisor(
                             "last_error": None,
                         },
                     )
-                    # DNS 전파 대기(3초) 후 텔레그램 알림 발송
+                    # DNS 전파 대기(3초) 후 텔레그램 알림 발송 (실패/쿨다운 시 메인 루프에서 자동 재시도 보장)
                     if not stop_evt.wait(3.0) and proc.poll() is None:
-                        tstate = _load_tunnel_state(data_dir)
-                        prev_url = str(tstate.get("last_notified_url") or "")
-                        has_pending_pw = bool(tstate.get("pending_initial_password"))
-                        now_m = time.monotonic()
-                        if found != prev_url and (
-                            has_pending_pw
-                            or last_notify_mono == 0.0
-                            or (now_m - last_notify_mono) >= NOTIFY_MIN_INTERVAL_SEC
-                        ):
-                            try:
-                                if send_tunnel_link_telegram(
-                                    data_dir,
-                                    repo_dir,
-                                    url_override=found,
-                                    include_generated_password=True,
-                                ):
-                                    last_notify_mono = now_m
-                                    logger.info("텔레그램으로 외부 접속 HTTPS 링크를 발송했습니다.")
-                            except Exception as tg_exc:
-                                logger.warning("터널 링크 텔레그램 발송 실패: %s", tg_exc)
+                        _try_notify_new_url(found)
                 elif "ERR " in s or "error" in s.lower():
                     last_err_line = s[:180]
 
@@ -713,8 +817,52 @@ def run_tunnel_supervisor(
                 logger.info("설정에서 외부 접속 터널이 비활성화되어 터널을 중지합니다.")
                 proc.terminate()
                 break
+            if reconnect_evt.is_set():
+                reconnect_evt.clear()
+                forced_reconnect = True
+                logger.info("재연결 요청 수신 — 새 외부 접속 주소를 발급하기 위해 터널을 재시작합니다.")
+                proc.terminate()
+                break
+
             with url_lock:
                 u = current_url
+            uptime_sec = time.monotonic() - started_mono
+
+            # 주소 발급 지연(45초 초과) 시 멈춘 cloudflared를 재시작
+            if u is None and uptime_sec >= STARTUP_URL_TIMEOUT_SEC:
+                forced_reconnect = True
+                logger.warning("터널 시작 후 %.0f초 동안 URL 미발급 — 터널 프로세스를 재시작합니다.", uptime_sec)
+                proc.terminate()
+                break
+
+            # 새 URL이 발급되었는데 일시적 네트워크 끊김/쿨다운으로 아직 텔레그램 발송이 안 된 경우 자동 재전송
+            if u is not None and uptime_sec >= 5.0:
+                _try_notify_new_url(u)
+
+            # 약 60초마다 로컬 대시보드 생존 확인 + 외부 HTTPS 주소 실제 접속 가능 여부(Error 1033 등) 자가점검
+            heartbeat_ticks += 1
+            if u is not None and uptime_sec >= 45.0 and (heartbeat_ticks % HEALTH_CHECK_EVERY_N_HEARTBEATS == 0):
+                if not probe_local_target(target_url):
+                    _revive_local_dashboard_if_systemd()
+                else:
+                    ok_pub, pub_detail = probe_tunnel_public_url(u)
+                    if ok_pub:
+                        consecutive_url_failures = 0
+                    else:
+                        consecutive_url_failures += 1
+                        logger.warning(
+                            "외부 접속 터널 응답 이상 감지(%d/%d): %s (%s)",
+                            consecutive_url_failures,
+                            MAX_CONSECUTIVE_URL_FAILURES,
+                            u,
+                            pub_detail,
+                        )
+                        if consecutive_url_failures >= MAX_CONSECUTIVE_URL_FAILURES:
+                            forced_reconnect = True
+                            logger.warning("외부 접속 터널 만료/끊김 확정 — 새 주소로 자동 재발급합니다.")
+                            proc.terminate()
+                            break
+
             write_tunnel_status(
                 data_dir,
                 {
@@ -728,7 +876,11 @@ def run_tunnel_supervisor(
                     "last_error": None if u else last_err_line,
                 },
             )
-            stop_evt.wait(HEARTBEAT_INTERVAL_SEC)
+            # 1초 단위로 대기하여 텔레그램 '재연결' 명령에 즉각 반응
+            waited = 0.0
+            while waited < HEARTBEAT_INTERVAL_SEC and not stop_evt.is_set() and not reconnect_evt.is_set() and proc.poll() is None:
+                stop_evt.wait(1.0)
+                waited += 1.0
 
         if proc.poll() is None:
             proc.terminate()
@@ -741,6 +893,11 @@ def run_tunnel_supervisor(
 
         if stop_evt.is_set():
             break
+
+        if forced_reconnect:
+            backoff_sec = 3.0
+            stop_evt.wait(1.0)
+            continue
 
         ran_sec = time.monotonic() - started_mono
         if ran_sec >= 60.0:
