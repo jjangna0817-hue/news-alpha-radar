@@ -214,10 +214,21 @@ def _infer_skip_reason(
     if tv is not None and float(tv) < min_tv:
         return f"유동성 미달({float(tv):.1f}억 < {min_tv:.1f}억)"
 
+    open_str = str(at_cfg.get("autotrade_open_entry_time") or "09:08")
+    cutoff_str = str(at_cfg.get("autotrade_entry_cutoff_time") or "14:00")
+    alert_dt = radar.parse_iso_kst(rec.get("alert_ts"))
+    if alert_dt is not None and alert_dt.weekday() < 5:
+        ch, cm = radar._parse_hhmm(cutoff_str, default=(14, 0))
+        now_min = alert_dt.hour * 60 + alert_dt.minute
+        if (ch * 60 + cm) < now_min <= (15 * 60 + 30):
+            return f"오후 진입마감 이후({cutoff_str}~)"
+
     win = str(rec.get("window") or "")
     if win == "offhours":
-        return "장전/야간 알림(09:01 시초가 과열 또는 한도 스킵)"
-    return "동시보유 한도·당일 중복·시간외 스킵"
+        return f"장전/야간 알림({open_str} 시초가 과열 또는 한도 스킵)"
+    if "확산" in tier:
+        return "대리확산주 차단·동시보유 한도·당일 중복 스킵"
+    return "동시보유 한도·당일 중복·선도주 과열 스킵"
 
 
 def _summarize_traces_for_date(data_dir: Path, target_date: str) -> dict[str, Any]:
@@ -234,9 +245,13 @@ def _summarize_traces_for_date(data_dir: Path, target_date: str) -> dict[str, An
         "illiquid_samples": [],
         "prepriced_blocked": 0,
         "prepriced_samples": [],
+        "caution_only_blocked": 0,
+        "caution_only_samples": [],
         "stock_dedup_blocked": 0,
         "sector_limit_blocked": 0,
         "dedup_blocked": 0,
+        "substitute_buy_blocked": 0,
+        "cutoff_buy_blocked": 0,
         "paper_buys": 0,
         "paper_sells": 0,
         "kis_errors": 0,
@@ -281,6 +296,12 @@ def _summarize_traces_for_date(data_dir: Path, target_date: str) -> dict[str, An
                 summary["prepriced_samples"].append(
                     f"{ev.get('theme_key') or ''}: {', '.join((ev.get('details') or [])[:2])}"
                 )
+        elif etype == "caution_only_skip":
+            summary["caution_only_blocked"] += 1
+            if len(summary["caution_only_samples"]) < 5:
+                summary["caution_only_samples"].append(
+                    f"{ev.get('theme_key') or ''}: {', '.join((ev.get('details') or [])[:2])}"
+                )
         elif etype == "stock_dedup_decision" and ev.get("blocked"):
             summary["stock_dedup_blocked"] += 1
         elif etype == "sector_limit_decision" and ev.get("blocked"):
@@ -293,6 +314,10 @@ def _summarize_traces_for_date(data_dir: Path, target_date: str) -> dict[str, An
                 summary["paper_buys"] += 1
             elif act == "sell":
                 summary["paper_sells"] += 1
+            elif act == "skip_substitute":
+                summary["substitute_buy_blocked"] += 1
+            elif act == "skip_cutoff":
+                summary["cutoff_buy_blocked"] += 1
             elif "error" in act:
                 summary["kis_errors"] += 1
 
@@ -550,6 +575,8 @@ def build_analytics_bundle(
             "autotrade_take_profit_pct": at_cfg["autotrade_take_profit_pct"],
             "autotrade_trailing_stop_pct": at_cfg["autotrade_trailing_stop_pct"],
             "autotrade_stop_loss_pct": at_cfg["autotrade_stop_loss_pct"],
+            "autotrade_open_entry_time": at_cfg["autotrade_open_entry_time"],
+            "autotrade_entry_cutoff_time": at_cfg["autotrade_entry_cutoff_time"],
             "autotrade_eod_exit_enabled": at_cfg["autotrade_eod_exit_enabled"],
             "autotrade_eod_exit_time": at_cfg["autotrade_eod_exit_time"],
         },
@@ -576,7 +603,7 @@ def format_ai_feedback_markdown(bundle: dict[str, Any]) -> str:
         f"- **총 평가자산**: {int(acc.get('total_equity_krw') or 0):,}원 ({_f_pct(acc.get('total_pnl_pct'))}, 누적 실현 {int(acc.get('cumulative_realized_pnl_krw') or 0):+,}원)",
         f"- **당일 청산 성적**: {ts.get('closed_count', 0)}건 ({ts.get('wins', 0)}승 {ts.get('losses', 0)}패) | 당일 순손익 **{int(ts.get('realized_net_pnl_krw') or 0):+,}원** (평균 {_f_pct(ts.get('avg_net_pnl_pct'))})",
         f"- **보유 중 최고점 대비 반납폭**: 평균 고점 {_f_pct(ts.get('avg_peak_ret_pct'))} / 평균 반납 -{(ts.get('avg_missed_from_peak_pct') or 0.0):.2f}%p",
-        f"- **현재 적용 규칙**: 주문 {int(cfg.get('autotrade_order_amount_krw') or 0)//10000}만원 · 진입 [{cfg.get('autotrade_min_change_pct')}% ~ +{cfg.get('autotrade_max_change_pct')}%] · 익절 +{cfg.get('autotrade_take_profit_pct')}%(트레일링 -{cfg.get('autotrade_trailing_stop_pct')}%) · 손절 -{cfg.get('autotrade_stop_loss_pct')}% · 유동성 ≥{cfg.get('min_trading_value_eok')}억",
+        f"- **현재 적용 규칙**: 주문 {int(cfg.get('autotrade_order_amount_krw') or 0)//10000}만원 · 진입창 {cfg.get('autotrade_open_entry_time') or '09:08'}~{cfg.get('autotrade_entry_cutoff_time') or '14:00'} [{cfg.get('autotrade_min_change_pct')}% ~ +{cfg.get('autotrade_max_change_pct')}%] · 익절 +{cfg.get('autotrade_take_profit_pct')}%(트레일링 -{cfg.get('autotrade_trailing_stop_pct')}%) · 손절 -{cfg.get('autotrade_stop_loss_pct')}% · 유동성 ≥{cfg.get('min_trading_value_eok')}억",
         "",
         "## 2. 당일 청산 내역 (`paper_trades.jsonl`)",
     ]
@@ -629,7 +656,7 @@ def format_ai_feedback_markdown(bundle: dict[str, Any]) -> str:
         "",
         "## 4. 당일 필터 차단 통계 (`trace.jsonl`)",
         f"- 수집 기사 {fn.get('fresh_articles', 0)}건 / 평가 클러스터 {fn.get('clusters_evaluated', 0)}건 / 발송 알림 {fn.get('alerts_sent_in_cycles', 0)}건",
-        f"- 유동성 미달 차단 {fn.get('illiquid_blocked', 0)}건 · 급등 추격 차단 {fn.get('prepriced_blocked', 0)}건 · 24h 종목중복 {fn.get('stock_dedup_blocked', 0)}건 · 섹터한도 {fn.get('sector_limit_blocked', 0)}건",
+        f"- 옥석가리기 노이즈 차단 {fn.get('caution_only_blocked', 0)}건 · 대리소외주 매수 차단 {fn.get('substitute_buy_blocked', 0)}건 · 유동성 미달 {fn.get('illiquid_blocked', 0)}건 · 급등 추격 {fn.get('prepriced_blocked', 0)}건 · 24h 종목중복 {fn.get('stock_dedup_blocked', 0)}건 · 섹터한도 {fn.get('sector_limit_blocked', 0)}건",
     ])
 
     by_c = bundle.get("by_commit") or {}
@@ -694,7 +721,7 @@ def format_daily_telegram_summary_html(
         "",
         "<b>[알림 전체 vs 자동매수 대조]</b>",
         f"• 오늘 알림 종목 {vs.get('today_alert_stocks_total', 0)}건 중 매수 종가평균 <b>{_f_pct(vs.get('traded_alert_avg_close_ret_pct'))}</b> / 미진입 상승후보 종가평균 <b>{_f_pct(vs.get('skipped_buyable_bullish_avg_close_ret_pct'))}</b>",
-        f"• 필터 차단: 유동성 {fn.get('illiquid_blocked', 0)}건 · 급등추격 {fn.get('prepriced_blocked', 0)}건 · 중복/섹터 {int(fn.get('stock_dedup_blocked') or 0) + int(fn.get('sector_limit_blocked') or 0)}건",
+        f"• 필터 차단: 옥석노이즈 {fn.get('caution_only_blocked', 0)}건 · 대리소외주 {fn.get('substitute_buy_blocked', 0)}건 · 유동성 {fn.get('illiquid_blocked', 0)}건 · 급등추격 {fn.get('prepriced_blocked', 0)}건 · 중복/섹터 {int(fn.get('stock_dedup_blocked') or 0) + int(fn.get('sector_limit_blocked') or 0)}건",
     ])
 
     if sync_status is not None:
