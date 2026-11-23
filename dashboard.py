@@ -33,6 +33,7 @@ from typing import Any
 
 import paper_trader
 import radar
+import report_sync
 import telegram_listener
 import tunnel_manager
 
@@ -417,7 +418,9 @@ def build_overview_payload(
 
     perf_records = radar.PerformanceTracker(data_dir / "performance.jsonl").load_records()
     perf_summary = radar.summarize_performance(perf_records, recent_limit=50)
-    autotrade_summary = paper_trader.PaperAutoTrader(data_dir, REPO_DIR).build_overview(now=ref, runtime_cfg=cfg)
+    autotrade_summary = paper_trader.PaperAutoTrader(
+        data_dir, radar.resolve_repo_dir_for_data(data_dir)
+    ).build_overview(now=ref, runtime_cfg=cfg)
     today_str = ref.strftime("%Y-%m-%d")
 
     return {
@@ -1375,11 +1378,49 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <h2 id="at-broker-label">내장 실전형 가상 모의계좌</h2>
           </div>
           <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button id="btn-at-copy-report" class="primary" type="button">📋 AI 분석용 리포트 복사</button>
             <button id="btn-at-close-all" type="button">보유 종목 전량 청산</button>
             <button id="btn-at-reset" type="button">모의계좌 초기화</button>
           </div>
         </div>
         <div id="at-broker-sub" class="muted">별도 가입 없이 1,000만 원 가상 모의계좌로 즉시 작동 중 · .env에 한국투자증권 모의투자 키(KIS_APP_KEY 등)를 넣으면 공식 모의계좌로 자동 전환됩니다.</div>
+      </div>
+
+      <div id="at-report-preview-card" class="card" style="margin-bottom: 16px; display: none;">
+        <div class="section-head">
+          <h2>AI 피드백용 통합 성적표 (그대로 복사해 채팅창에 붙여넣기)</h2>
+          <button id="btn-at-close-preview" type="button">닫기</button>
+        </div>
+        <textarea id="at-report-textarea" readonly class="mono" style="width:100%; min-height:210px; padding:10px; border:1px solid var(--border); border-radius:8px; background:var(--surface-subtle); font-size:12px;"></textarea>
+      </div>
+
+      <div class="card" style="margin-bottom: 16px;">
+        <form id="gh-sync-form">
+          <div class="section-head" style="margin-bottom: 6px;">
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <span id="at-gh-badge" class="badge warn">토큰 1회 등록 대기</span>
+              <h2>☁️ 비공개 GitHub 성적표 자동 백업 (복붙 0번 모드)</h2>
+            </div>
+            <button id="btn-at-sync-gh" type="button">지금 수동 백업</button>
+          </div>
+          <div id="at-gh-sub" class="muted" style="margin-bottom: 10px;">
+            최초 1회만 토큰을 저장해 두면 매일 15:35 장 마감 및 매매 체결 시 비공개 저장소(<code>jjangna0817-hue/news-alpha-radar-logs</code>)에 자동 백업되어, 채팅창에서 <b>"오늘꺼 봐줘"</b> 한 마디로 즉시 분석받을 수 있습니다.
+            (<a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer" class="stock-link">GitHub 토큰 발급 바로가기</a>: Repository access → <code>news-alpha-radar-logs</code> 선택 → Permissions → Contents: Read and write)
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="at-gh-repo">비공개 백업 저장소 (아이디/저장소명)</label>
+              <input id="at-gh-repo" type="text" placeholder="jjangna0817-hue/news-alpha-radar-logs" />
+            </div>
+            <div class="field">
+              <label for="at-gh-token">GitHub 토큰 (최초 1회 입력 · 서버 .env에 0600 보안 저장)</label>
+              <input id="at-gh-token" type="password" autocomplete="off" placeholder="github_pat_... 또는 ghp_... 붙여넣기" />
+            </div>
+          </div>
+          <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:8px;">
+            <button id="btn-at-save-gh" class="primary" type="submit">연결 저장 &amp; 지금 즉시 업로드</button>
+          </div>
+        </form>
       </div>
 
       <div class="kpi-grid" style="margin-bottom: 16px;">
@@ -2203,6 +2244,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
       }
 
+      const rs = at.report_sync || {};
+      const ghBadge = document.getElementById("at-gh-badge");
+      const syncBtn = document.getElementById("btn-at-sync-gh");
+      if (rs.github_configured) {
+        if (rs.last_sync_error) {
+          ghBadge.textContent = "업로드 오류 확인";
+          ghBadge.className = "badge err";
+          ghBadge.title = rs.last_sync_error;
+        } else {
+          ghBadge.textContent = rs.last_synced_at ? ("자동 백업 연결됨 · 최근 " + fmtTime(rs.last_synced_at)) : "자동 백업 연결됨";
+          ghBadge.className = "badge ok";
+        }
+        syncBtn.disabled = false;
+      } else {
+        ghBadge.textContent = "토큰 1회 등록 대기";
+        ghBadge.className = "badge warn";
+        syncBtn.disabled = true;
+      }
+      const repoInput = document.getElementById("at-gh-repo");
+      if (document.activeElement !== repoInput && !repoInput.dataset.dirty) {
+        repoInput.value = rs.github_repo || "jjangna0817-hue/news-alpha-radar-logs";
+      }
+      const tokInput = document.getElementById("at-gh-token");
+      if (rs.github_configured && !tokInput.value) {
+        tokInput.placeholder = "저장됨 (" + (rs.github_token_masked || "****") + ") — 변경 시에만 새로 입력";
+      }
+
       if (!autotradeDirty) {
         document.getElementById("at-cfg-enabled").value = (cfg.autotrade_enabled ?? enabled) ? "true" : "false";
         document.getElementById("at-cfg-second-only").value = (cfg.autotrade_only_second_order ?? acfg.autotrade_only_second_order ?? true) ? "true" : "false";
@@ -2725,6 +2793,73 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     });
 
+    document.getElementById("btn-at-copy-report").addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      try {
+        const res = await api("/api/autotrade/report");
+        const md = res.markdown || "";
+        const card = document.getElementById("at-report-preview-card");
+        const ta = document.getElementById("at-report-textarea");
+        ta.value = md;
+        card.style.display = "block";
+        const ok = await copyText(md);
+        toast(ok ? "오늘의 통합 성적표를 복사했습니다! 채팅창에 그대로 붙여넣으세요." : "아래 상자 내용을 복사해 채팅창에 붙여넣으세요.");
+      } catch (err) {
+        toast("리포트 생성 실패: " + err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    document.getElementById("btn-at-close-preview").addEventListener("click", () => {
+      document.getElementById("at-report-preview-card").style.display = "none";
+    });
+
+    document.getElementById("at-gh-repo").addEventListener("input", (ev) => {
+      ev.currentTarget.dataset.dirty = "1";
+    });
+
+    document.getElementById("gh-sync-form").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const btn = document.getElementById("btn-at-save-gh");
+      const repoVal = document.getElementById("at-gh-repo").value.trim() || "jjangna0817-hue/news-alpha-radar-logs";
+      const tokVal = document.getElementById("at-gh-token").value.trim();
+      btn.disabled = true;
+      btn.textContent = "연결 및 업로드 중...";
+      try {
+        const res = await api("/api/actions/autotrade/github-config", {
+          method: "POST",
+          body: JSON.stringify({ repo: repoVal, token: tokVal }),
+        });
+        document.getElementById("at-gh-token").value = "";
+        delete document.getElementById("at-gh-repo").dataset.dirty;
+        toast("비공개 GitHub 연결 및 오늘 성적표 업로드 완료! (" + (res.repo || repoVal) + ")");
+        loadOverview();
+      } catch (err) {
+        toast("GitHub 연동 실패: " + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "연결 저장 & 지금 즉시 업로드";
+      }
+    });
+
+    document.getElementById("btn-at-sync-gh").addEventListener("click", async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      btn.textContent = "업로드 중...";
+      try {
+        const res = await api("/api/actions/autotrade/sync-github", { method: "POST", body: "{}" });
+        toast("비공개 GitHub 성적표 백업 완료 (" + (res.repo || "") + ")");
+        loadOverview();
+      } catch (err) {
+        toast("백업 실패: " + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "지금 수동 백업";
+      }
+    });
+
     document.getElementById("config-form").addEventListener("input", () => { formDirty = true; });
     document.getElementById("config-form").addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -2928,6 +3063,7 @@ def create_dashboard_server(
 ) -> ThreadingHTTPServer:
     base_dir = data_dir if data_dir is not None else Path("data")
     base_dir.mkdir(parents=True, exist_ok=True)
+    eff_repo = radar.resolve_repo_dir_for_data(base_dir)
     scan_lock = threading.Lock()
     env_cache: dict[str, Any] = {"mtime": None, "pw": ""}
     env_lock = threading.Lock()
@@ -3060,9 +3196,21 @@ def create_dashboard_server(
                 self._send_json(build_overview_payload(base_dir, auth_enabled=bool(_active_password())))
             elif path == "/api/autotrade":
                 self._send_json(
-                    paper_trader.PaperAutoTrader(base_dir, REPO_DIR).build_overview(
+                    paper_trader.PaperAutoTrader(base_dir, eff_repo).build_overview(
                         runtime_cfg=_effective_config(base_dir)
                     )
+                )
+            elif path == "/api/autotrade/report":
+                req_date = str((qs.get("date") or [""])[0]).strip() or None
+                bundle = report_sync.build_analytics_bundle(base_dir, eff_repo, target_date=req_date)
+                md = report_sync.format_ai_feedback_markdown(bundle)
+                self._send_json(
+                    {
+                        "ok": True,
+                        "target_date": bundle.get("target_date"),
+                        "markdown": md,
+                        "bundle": bundle,
+                    }
                 )
             elif path == "/api/performance":
                 try:
@@ -3136,7 +3284,7 @@ def create_dashboard_server(
                 if not code:
                     self._send_json({"error": "청산할 종목코드(또는 ALL)가 필요합니다."}, HTTPStatus.BAD_REQUEST)
                     return
-                trader = paper_trader.PaperAutoTrader(base_dir, REPO_DIR)
+                trader = paper_trader.PaperAutoTrader(base_dir, eff_repo)
                 tg_tok = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
                 tg_cid = os.getenv("TELEGRAM_CHAT_ID", "").strip()
                 send_fn = (
@@ -3162,7 +3310,7 @@ def create_dashboard_server(
                 return
 
             if path == "/api/actions/autotrade/reset":
-                trader = paper_trader.PaperAutoTrader(base_dir, REPO_DIR)
+                trader = paper_trader.PaperAutoTrader(base_dir, eff_repo)
                 raw_cap = body.get("initial_capital_krw")
                 cap_int = int(raw_cap) if raw_cap is not None else None
                 trader.reset_account(initial_capital_krw=cap_int)
@@ -3172,6 +3320,33 @@ def create_dashboard_server(
                         "autotrade": trader.build_overview(runtime_cfg=_effective_config(base_dir)),
                     }
                 )
+                return
+
+            if path == "/api/actions/autotrade/github-config":
+                raw_repo = str(body.get("repo") or "").strip() or None
+                raw_tok = str(body.get("token") or "").strip() or None
+                try:
+                    saved = report_sync.save_github_sync_settings(eff_repo / ".env", token=raw_tok, repo=raw_repo)
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    return
+                if not saved["configured"]:
+                    self._send_json({"error": "GitHub 토큰을 입력해 주세요."}, HTTPStatus.BAD_REQUEST)
+                    return
+                sync_res = report_sync.sync_report_to_github(base_dir, eff_repo)
+                if not sync_res.get("ok"):
+                    self._send_json({"error": sync_res.get("error") or "GitHub 업로드 검증에 실패했습니다."}, HTTPStatus.BAD_REQUEST)
+                    return
+                self._send_json(sync_res)
+                return
+
+            if path == "/api/actions/autotrade/sync-github":
+                req_date = str(body.get("date") or "").strip() or None
+                sync_res = report_sync.sync_report_to_github(base_dir, eff_repo, target_date=req_date)
+                if not sync_res.get("ok"):
+                    self._send_json({"error": sync_res.get("error") or "GitHub 백업에 실패했습니다."}, HTTPStatus.BAD_REQUEST)
+                    return
+                self._send_json(sync_res)
                 return
 
             if path == "/api/actions/send-tunnel-link":
