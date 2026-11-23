@@ -160,6 +160,8 @@ def _effective_config(data_dir: Path) -> dict[str, Any]:
         "autotrade_take_profit_pct": float(at_cfg["autotrade_take_profit_pct"]),
         "autotrade_trailing_stop_pct": float(at_cfg["autotrade_trailing_stop_pct"]),
         "autotrade_stop_loss_pct": float(at_cfg["autotrade_stop_loss_pct"]),
+        "autotrade_open_entry_time": str(at_cfg["autotrade_open_entry_time"]),
+        "autotrade_entry_cutoff_time": str(at_cfg["autotrade_entry_cutoff_time"]),
         "autotrade_eod_exit_enabled": bool(at_cfg["autotrade_eod_exit_enabled"]),
         "autotrade_eod_exit_time": str(at_cfg["autotrade_eod_exit_time"]),
         "max_alerts_per_window": int(
@@ -552,6 +554,15 @@ def validate_and_merge_config(data_dir: Path, patch: dict[str, Any]) -> dict[str
         cur["autotrade_trailing_stop_pct"] = round(min(15.0, abs(float(patch["autotrade_trailing_stop_pct"]))), 1)
     if "autotrade_stop_loss_pct" in patch:
         cur["autotrade_stop_loss_pct"] = round(max(0.5, min(20.0, abs(float(patch["autotrade_stop_loss_pct"])))), 1)
+    if "autotrade_open_entry_time" in patch:
+        oh, om = radar._parse_hhmm(str(patch["autotrade_open_entry_time"]), default=(9, 8))
+        open_m = max(9 * 60, min(14 * 60, oh * 60 + om))
+        cur["autotrade_open_entry_time"] = f"{open_m // 60:02d}:{open_m % 60:02d}"
+    if "autotrade_entry_cutoff_time" in patch:
+        ch, cm = radar._parse_hhmm(str(patch["autotrade_entry_cutoff_time"]), default=(14, 0))
+        oh2, om2 = radar._parse_hhmm(str(cur.get("autotrade_open_entry_time") or "09:08"), default=(9, 8))
+        cut_m = max(oh2 * 60 + om2 + 10, min(15 * 60 + 15, ch * 60 + cm))
+        cur["autotrade_entry_cutoff_time"] = f"{cut_m // 60:02d}:{cut_m % 60:02d}"
     if "autotrade_eod_exit_enabled" in patch:
         cur["autotrade_eod_exit_enabled"] = bool(patch["autotrade_eod_exit_enabled"])
     if "autotrade_eod_exit_time" in patch:
@@ -1405,7 +1416,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
           <div id="at-gh-sub" class="muted" style="margin-bottom: 10px;">
             최초 1회만 토큰을 저장해 두면 매일 15:35 장 마감 및 매매 체결 시 비공개 저장소(<code>jjangna0817-hue/news-alpha-radar-logs</code>)에 자동 백업되어, 채팅창에서 <b>"오늘꺼 봐줘"</b> 한 마디로 즉시 분석받을 수 있습니다.
-            (<a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer" class="stock-link">GitHub 토큰 발급 바로가기</a>: Repository access → <code>news-alpha-radar-logs</code> 선택 → Permissions → Contents: Read and write)
+            (<a href="https://github.com/settings/tokens/new?description=news-alpha-radar-logs&amp;scopes=repo" target="_blank" rel="noopener noreferrer" class="stock-link">GitHub 토큰 원클릭 발급 바로가기</a>: 권한이 미리 체크되어 있으니 하단 <code>Generate token</code>만 누른 뒤 복사하세요)
           </div>
           <div class="field-row">
             <div class="field">
@@ -1414,7 +1425,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
             <div class="field">
               <label for="at-gh-token">GitHub 토큰 (최초 1회 입력 · 서버 .env에 0600 보안 저장)</label>
-              <input id="at-gh-token" type="password" autocomplete="off" placeholder="github_pat_... 또는 ghp_... 붙여넣기" />
+              <input id="at-gh-token" type="password" autocomplete="off" placeholder="ghp_... 또는 github_pat_... 붙여넣기" />
             </div>
           </div>
           <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:8px;">
@@ -1472,8 +1483,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       <div id="at-pending-card" class="card" style="margin-bottom: 16px; display: none;">
         <div class="section-head">
-          <h2>장전 후보 09:01 시초 진입 대기열</h2>
-          <span class="muted">개장 직후 시초가가 허용 등락률 범위일 때만 진입 (갭상승 과열 종목은 자동 취소)</span>
+          <h2>장전·시초 후보 진입 대기열 (09:08 안정화 후 점검)</h2>
+          <span class="muted">장초반 투매·오버슈팅 진정 후 허용 등락률 범위일 때만 진입 (과열·급락 종목 자동 취소)</span>
         </div>
         <div id="at-pending-body"></div>
       </div>
@@ -1482,7 +1493,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <form id="autotrade-form">
           <div class="section-head">
             <h2>모의 자동매매 진입·청산 규칙</h2>
-            <span class="muted">1차 공시·단말기 추격 종목 제외 · 하루 거래대금 1% 이내 자동 제한</span>
+            <span class="muted">1차 공시·단말기 추격 및 대리 소외주(확산주) 자동 배제 · 하루 거래대금 1% 이내 제한</span>
           </div>
           <div class="field-row">
             <div class="field">
@@ -1495,7 +1506,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="field">
               <label for="at-cfg-second-only">진입 종목 성격 필터</label>
               <select id="at-cfg-second-only">
-                <option value="true">2차 파급 전용 — 1차 직접·단기테마 배제 (권장)</option>
+                <option value="true">2차 파급 전용 — 1차 직접·단기테마·대리확산 배제 (권장)</option>
                 <option value="false">상승수혜 전체 허용 — 단기테마성만 배제</option>
               </select>
             </div>
@@ -1508,6 +1519,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="field">
               <label for="at-cfg-max-pos">최대 동시 보유 종목 수</label>
               <input id="at-cfg-max-pos" type="number" step="1" min="1" max="15" />
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="at-cfg-open-time">시초 진입 시작 시각 (KST — 개장 직후 혼란 회피)</label>
+              <input id="at-cfg-open-time" type="text" placeholder="09:08" />
+            </div>
+            <div class="field">
+              <label for="at-cfg-cutoff-time">오후 신규 매수 마감 시각 (KST — 장마감 임박 진입 차단)</label>
+              <input id="at-cfg-cutoff-time" type="text" placeholder="14:00" />
             </div>
           </div>
           <div class="field-row">
@@ -1811,7 +1832,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div style="display:flex; gap:8px; align-items:center;">
             <select id="trace-filter" style="padding:6px 10px; border:1px solid var(--border-strong); border-radius:8px; font-size:12.5px;">
               <option value="all">전체 이벤트</option>
-              <option value="paper_trade_event">모의 자동매매 체결</option>
+              <option value="paper_trade_event">모의 자동매매 체결·차단</option>
+              <option value="caution_only_skip">옥석가리기 노이즈 차단</option>
               <option value="flash_alert_sent">초고속 1보 푸시</option>
               <option value="premarket_digest_sent">장전 요약 발송</option>
               <option value="premarket_digest_prewarm">장전 요약 사전분석</option>
@@ -2277,6 +2299,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const ordKrw = cfg.autotrade_order_amount_krw ?? acfg.autotrade_order_amount_krw ?? 1000000;
         document.getElementById("at-cfg-order-manwon").value = Math.max(10, Math.round(Number(ordKrw) / 10000));
         document.getElementById("at-cfg-max-pos").value = cfg.autotrade_max_positions ?? acfg.autotrade_max_positions ?? 4;
+        document.getElementById("at-cfg-open-time").value = cfg.autotrade_open_entry_time || acfg.autotrade_open_entry_time || "09:08";
+        document.getElementById("at-cfg-cutoff-time").value = cfg.autotrade_entry_cutoff_time || acfg.autotrade_entry_cutoff_time || "14:00";
         document.getElementById("at-cfg-min-chg").value = cfg.autotrade_min_change_pct ?? acfg.autotrade_min_change_pct ?? -2.0;
         document.getElementById("at-cfg-max-chg").value = cfg.autotrade_max_change_pct ?? acfg.autotrade_max_change_pct ?? 4.0;
         document.getElementById("at-cfg-tp").value = cfg.autotrade_take_profit_pct ?? acfg.autotrade_take_profit_pct ?? 5.0;
@@ -2668,9 +2692,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               tdDesc.textContent = "🤖📈 모의매수 체결 · " + (r.name || r.code) + "(" + r.code + ") " + r.qty + "주 @ " + fmtKrw(r.fill_price) + " (진입 " + fmtPct(r.entry_change_pct) + " · " + (r.theme_key || "") + ")";
             } else if (r.action === "sell") {
               tdDesc.textContent = "🤖💰 모의매도 청산(" + (r.exit_reason || "-") + ") · " + (r.name || r.code) + "(" + r.code + ") " + r.qty + "주 · " + fmtKrw(r.buy_price) + "→" + fmtKrw(r.sell_price) + " (" + fmtSignedKrw(r.net_pnl_krw) + ", " + fmtPct(r.net_pnl_pct) + ")";
+            } else if (r.action === "skip_substitute") {
+              tdDesc.textContent = "🛡️ 대리 소외주 매수 차단 · " + (r.name || r.code) + "(" + r.code + ") · " + (r.reason || "");
+            } else if (r.action === "skip_cutoff") {
+              tdDesc.textContent = "⏰ 오후 진입마감(" + (r.cutoff_time || "14:00") + ") 이후 신규매수 생략 · " + (r.name || r.code) + "(" + (r.theme_key || "") + ")";
             } else {
               tdDesc.textContent = "⚠️ KIS 모의주문 오류(" + (r.action || "-") + ") · " + (r.name || r.code || "") + " · " + (r.error || "");
             }
+          } else if (r.type === "caution_only_skip") {
+            tdDesc.textContent = "🧹 옥석가리기 노이즈 차단 (상승·하락 0건) · " + (r.theme_key || "") + " · " + (r.details || []).join(", ");
           } else if (r.type === "flash_alert_sent") {
             tdDesc.textContent = "⚡ 1보 속보 발송 · " + (r.headline || r.theme_key || "") + " (촉매 " + Number(r.catalyst_score || 0).toFixed(1) + ")";
           } else if (r.type === "premarket_digest_sent") {
@@ -2728,6 +2758,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         autotrade_only_second_order: document.getElementById("at-cfg-second-only").value === "true",
         autotrade_order_amount_krw: Math.round((isNaN(manwon) ? 100 : manwon) * 10000),
         autotrade_max_positions: parseInt(document.getElementById("at-cfg-max-pos").value, 10),
+        autotrade_open_entry_time: document.getElementById("at-cfg-open-time").value.trim() || "09:08",
+        autotrade_entry_cutoff_time: document.getElementById("at-cfg-cutoff-time").value.trim() || "14:00",
         autotrade_min_change_pct: parseFloat(document.getElementById("at-cfg-min-chg").value),
         autotrade_max_change_pct: parseFloat(document.getElementById("at-cfg-max-chg").value),
         autotrade_take_profit_pct: parseFloat(document.getElementById("at-cfg-tp").value),

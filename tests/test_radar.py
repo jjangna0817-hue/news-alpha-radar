@@ -2994,7 +2994,8 @@ class TestPaperAutoTraderAndKISVTS(unittest.TestCase):
         import paper_trader
 
         t_digest = datetime(2026, 11, 20, 7, 50, tzinfo=KST)
-        t_open = datetime(2026, 11, 20, 9, 2, tzinfo=KST)
+        t_whipsaw = datetime(2026, 11, 20, 9, 2, tzinfo=KST)
+        t_open = datetime(2026, 11, 20, 9, 9, tzinfo=KST)
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
@@ -3025,13 +3026,23 @@ class TestPaperAutoTraderAndKISVTS(unittest.TestCase):
             )
             self.assertEqual(q1["action"], "queued_for_open")  # type: ignore[index]
             self.assertEqual(q2["action"], "queued_for_open")  # type: ignore[index]
-            self.assertEqual(len(sent_tg), 0)  # No premature buy before 09:01!
+            self.assertEqual(len(sent_tg), 0)
 
-            # At 09:02: 267260 opens calmly (+1.8%, 50억) -> BOUGHT; 446840 gaps up (+12.5%) -> CANCELLED!
             open_quotes = {
                 "267260": radar.StockQuote("267260", 50000, 900, 1.8, 100000, "OPEN", "", trading_value=5_000_000_000),
                 "446840": radar.StockQuote("446840", 11250, 1250, 12.5, 100000, "OPEN", "", trading_value=1_500_000_000),
             }
+            # At 09:02 (opening-bell chaos before 09:08): waits in queue without premature execution!
+            early_res = trader.tick_positions(
+                now=t_whipsaw,
+                daemon_mode=True,
+                fetch_quotes_fn=lambda codes: {c: open_quotes[c] for c in codes if c in open_quotes},
+                send_fn=sent_tg.append,
+            )
+            self.assertEqual(early_res, {"bought": 0, "sold": 0})
+            self.assertEqual(len(trader.build_overview(now=t_whipsaw)["pending_open_entries"]), 2)
+
+            # At 09:09 (>= 09:08 stabilized): 267260 (+1.8%, 50억) -> BOUGHT; 446840 (+12.5%) -> CANCELLED!
             tick_res = trader.tick_positions(
                 now=t_open,
                 daemon_mode=True,
@@ -3554,7 +3565,261 @@ class TestReportSyncAndFullSetFeedbackLoop(unittest.TestCase):
                 srv.server_close()
 
 
+class TestStructuralGuardsNov23Fixes(unittest.TestCase):
+    def test_blocks_substitute_diffusion_laggard_when_core_overheated_but_allows_second_order_vs_first_order(self) -> None:
+        import paper_trader
+        import report_sync
+
+        t_mid = datetime(2026, 11, 24, 10, 45, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trace = radar.TraceLogger(tmp_dir / "trace.jsonl")
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+
+            # 1) Exact reproduction of 2026-11-23 한한령_해제_수혜:
+            #    4 core 2nd-order stocks already surged +6% ~ +10%, peripheral 5th stock (확산) is -1.30%.
+            #    Must NOT buy the peripheral substitute laggard!
+            stocks_hanhan = [
+                {"code": "123690", "name": "한국화장품", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                {"code": "253450", "name": "스튜디오드래곤", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                {"code": "104620", "name": "노랑풍선", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                {"code": "035760", "name": "CJ ENM", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                {"code": "003350", "name": "한국화장품제조", "direction": "상승수혜", "order_tier": "2차 파급(확산)", "revenue_link": "본업직결"},
+            ]
+            quotes_hanhan = {
+                "123690": radar.StockQuote("123690", 11000, 990, 9.91, 800000, "OPEN", "", trading_value=12_000_000_000),
+                "253450": radar.StockQuote("253450", 48000, 4400, 10.05, 500000, "OPEN", "", trading_value=25_000_000_000),
+                "104620": radar.StockQuote("104620", 6500, 380, 6.11, 700000, "OPEN", "", trading_value=9_000_000_000),
+                "035760": radar.StockQuote("035760", 62000, 3900, 6.75, 400000, "OPEN", "", trading_value=18_000_000_000),
+                "003350": radar.StockQuote("003350", 54200, -710, -1.30, 120000, "OPEN", "", trading_value=6_500_000_000),
+            }
+            with mock.patch.object(report_sync, "try_background_github_sync"):
+                res_blocked = trader.on_alert_candidates(
+                    alert_ts=t_mid,
+                    theme_key="한한령_해제_수혜",
+                    sector="화장품·소비재",
+                    title="한한령 해제 기대감 → K-뷰티·콘텐츠 2차 수혜",
+                    catalyst_score=8.7,
+                    stocks=stocks_hanhan,
+                    quotes=quotes_hanhan,
+                    daemon_mode=True,
+                    trace=trace,
+                )
+            self.assertIsNone(res_blocked)
+            self.assertEqual(trader.load_account(t_mid)["positions"], {})
+
+            funnel = report_sync._summarize_traces_for_date(tmp_dir, "2026-11-24")
+            self.assertEqual(funnel["substitute_buy_blocked"], 1)
+
+            # 2) Conversely, when 1차 직접 (삼성SDI +12%) surges while 2차 파급(핵심) (원익IPS +1.2%) is still calm,
+            #    buying the 2차 파급(핵심) supplier MUST succeed!
+            with mock.patch.object(report_sync, "try_background_github_sync"):
+                res_ok = trader.on_alert_candidates(
+                    alert_ts=t_mid + timedelta(minutes=5),
+                    theme_key="반도체_대규모투자",
+                    sector="반도체·소부장",
+                    title="대형 칩메이커 라인 증설 → 전공정 장비 수혜",
+                    catalyst_score=8.8,
+                    stocks=[
+                        {"code": "006400", "name": "삼성SDI", "direction": "상승수혜", "order_tier": "1차 직접", "revenue_link": "본업직결"},
+                        {"code": "240810", "name": "원익IPS", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                    ],
+                    quotes={
+                        "006400": radar.StockQuote("006400", 300000, 32000, 12.0, 500000, "OPEN", "", trading_value=80_000_000_000),
+                        "240810": radar.StockQuote("240810", 30000, 350, 1.2, 300000, "OPEN", "", trading_value=9_000_000_000),
+                    },
+                    daemon_mode=True,
+                    trace=trace,
+                )
+            self.assertIsNotNone(res_ok)
+            assert res_ok is not None
+            self.assertEqual(res_ok["position"]["code"], "240810")
+
+    def test_entry_window_0908_to_1400_queues_early_and_skips_afternoon_while_keeping_exits(self) -> None:
+        import paper_trader
+        import report_sync
+
+        t_903 = datetime(2026, 11, 24, 9, 3, tzinfo=KST)
+        t_1015 = datetime(2026, 11, 24, 10, 15, tzinfo=KST)
+        t_1417 = datetime(2026, 11, 24, 14, 17, tzinfo=KST)
+        t_1515 = datetime(2026, 11, 24, 15, 15, tzinfo=KST)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trace = radar.TraceLogger(tmp_dir / "trace.jsonl")
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+
+            with mock.patch.object(report_sync, "try_background_github_sync"):
+                # 1) Alert at 09:03 (< 09:08) queues for 09:08 stabilization instead of buying opening whipsaw
+                r_early = trader.on_alert_candidates(
+                    alert_ts=t_903,
+                    theme_key="보안_이슈",
+                    sector="사이버보안",
+                    title="개장 직후 보안 속보",
+                    catalyst_score=8.5,
+                    stocks=[{"code": "263860", "name": "지니언스", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                    quotes={"263860": radar.StockQuote("263860", 18000, 180, 1.0, 100000, "OPEN", "", trading_value=3_000_000_000)},
+                    daemon_mode=True,
+                    trace=trace,
+                )
+                self.assertIsNotNone(r_early)
+                assert r_early is not None
+                self.assertEqual(r_early["action"], "queued_for_open")
+
+                # 2) Alert at 10:15 (inside 09:08 ~ 14:00) buys immediately
+                r_mid = trader.on_alert_candidates(
+                    alert_ts=t_1015,
+                    theme_key="로봇_자동화",
+                    sector="로봇·자동화",
+                    title="공장 자동화 도입 확대",
+                    catalyst_score=8.6,
+                    stocks=[{"code": "348340", "name": "뉴로메카", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                    quotes={"348340": radar.StockQuote("348340", 25000, 400, 1.6, 200000, "OPEN", "", trading_value=6_000_000_000)},
+                    daemon_mode=True,
+                    trace=trace,
+                )
+                self.assertIsNotNone(r_mid)
+                assert r_mid is not None
+                self.assertEqual(r_mid["action"], "bought")
+
+                # 3) Alert at 14:17 (> 14:00 cutoff) skips new buy (reproducing 아이티센글로벌 late-entry fix)
+                r_late = trader.on_alert_candidates(
+                    alert_ts=t_1417,
+                    theme_key="스테이블코인_이슈",
+                    sector="금융·핀테크",
+                    title="오후 늦은 스테이블코인 기사",
+                    catalyst_score=8.4,
+                    stocks=[{"code": "124500", "name": "아이티센글로벌", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                    quotes={"124500": radar.StockQuote("124500", 10000, 150, 1.5, 300000, "OPEN", "", trading_value=5_000_000_000)},
+                    daemon_mode=True,
+                    trace=trace,
+                )
+                self.assertIsNone(r_late)
+                self.assertNotIn("124500", trader.load_account(t_1417)["positions"])
+
+                # 4) Exit monitoring remains active after 14:00 -> liquidates 348340 at 15:15 EOD!
+                r_eod = trader.tick_positions(
+                    now=t_1515,
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda codes: {"348340": radar.StockQuote("348340", 25600, 1000, 4.0, 300000, "OPEN", "", trading_value=8_000_000_000)},
+                    trace=trace,
+                )
+                self.assertEqual(r_eod, {"bought": 0, "sold": 1})
+
+            funnel = report_sync._summarize_traces_for_date(tmp_dir, "2026-11-24")
+            self.assertEqual(funnel["cutoff_buy_blocked"], 1)
+
+    def test_caution_only_noise_alert_blocked_while_bearish_risk_warning_sent(self) -> None:
+        import report_sync
+
+        # Unit check on helper
+        self.assertEqual(
+            radar.is_caution_only_alert(
+                [{"code": "042700", "name": "한미반도체", "direction": "옥석가리기주의"}]
+            )[0],
+            True,
+        )
+        self.assertEqual(
+            radar.is_caution_only_alert(
+                [{"code": "005930", "name": "삼성전자", "direction": "하락주의"}]
+            )[0],
+            False,
+        )
+
+        # E2E run_live check: caution-only alert is dropped, bearish risk alert IS delivered!
+        t_live = datetime(2026, 11, 24, 10, 20, tzinfo=KST)
+        comps = {c["code"]: dict(c) for c in radar.SEED_COMPANIES}
+        items = [
+            radar.NewsItem(
+                "코스닥 액티브 ETF 순자산 1조 돌파… 자금 유입",
+                "https://ex.com/etf_noise_1",
+                "한국경제_증권",
+                "증권",
+                first_seen=t_live.isoformat(),
+            ),
+            radar.NewsItem(
+                "미 반도체 관세 전격 인상 충격… 메모리 수출 비상",
+                "https://ex.com/semi_crash_1",
+                "연합뉴스_경제",
+                "경제",
+                first_seen=t_live.isoformat(),
+            ),
+        ]
+
+        def fake_gemini(api_key, models, sp, up, **kw):
+            payload = json.loads(up)
+            if sp == radar.SCREENING_PROMPT:
+                evs = []
+                for c in payload["clusters"]:
+                    if "ETF" in c["headline"]:
+                        evs.append({
+                            "cluster_id": c["cluster_id"],
+                            "catalyst_score": 8.3,
+                            "theme_key": "액티브ETF_노이즈",
+                            "second_order_keywords": ["사이버보안"],
+                        })
+                    else:
+                        evs.append({
+                            "cluster_id": c["cluster_id"],
+                            "catalyst_score": 8.8,
+                            "theme_key": "반도체관세_충격",
+                            "negative_keywords": ["반도체"],
+                        })
+                return {"selected_events": evs}, "gemini-3.5-flash-lite"
+
+            if "ETF" in json.dumps(payload, ensure_ascii=False):
+                return {
+                    "title": "코스닥 액티브 ETF 자금 유입 점검",
+                    "event_summary": "단순 지수 자금 유입으로 개별 기업 직접 수혜 미미",
+                    "stocks": [
+                        {"code": "263860", "name": "지니언스", "direction": "옥석가리기주의", "order_tier": "단순연관", "revenue_link": "단기테마성"},
+                    ],
+                }, "gemini-3.6-flash"
+            return {
+                "title": "미 반도체 관세 전격 인상 → 대형 메모리 단기 하방 주의",
+                "event_summary": "대미 반도체 관세 인상으로 수출 채산성 악화 우려",
+                "stocks": [
+                    {"code": "005930", "name": "삼성전자", "direction": "하락주의", "order_tier": "1차 직접(역풍)", "revenue_link": "본업직결"},
+                ],
+            }, "gemini-3.6-flash"
+
+        q_map = {
+            "005930": radar.StockQuote("005930", 68000, -1400, -2.0, 900000, "OPEN", "", trading_value=90_000_000_000),
+            "263860": radar.StockQuote("263860", 12000, 100, 0.8, 150000, "OPEN", "", trading_value=2_000_000_000),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            sent_msgs: list[str] = []
+            env = {
+                "GEMINI_API_KEY": "k",
+                "TELEGRAM_BOT_TOKEN": "t",
+                "TELEGRAM_CHAT_ID": "c",
+                "INSTANT_FLASH_ALERT": "false",
+                "AUTOTRADE_ENABLED": "false",
+                "TRIGGER_MODE": "shadow",
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.object(radar, "fetch_rss_news", return_value=items),
+                mock.patch.object(radar, "call_gemini", side_effect=fake_gemini),
+                mock.patch.object(radar, "load_krx_master", return_value=comps),
+                mock.patch.object(radar, "fetch_naver_quotes", return_value=q_map),
+                mock.patch.object(radar, "send_telegram", side_effect=lambda t, c, m, start_chunk=0: sent_msgs.append(m) or 1),
+            ):
+                radar.run_live(dry_run=False, cycles=1, data_dir=tmp_dir, now_fn=lambda: t_live, daemon_mode=True)
+
+            # Only the genuine 하락주의 warning is sent; the 옥석가리기주의-only ETF noise alert was blocked!
+            self.assertEqual(len(sent_msgs), 1)
+            self.assertIn("미 반도체 관세 전격 인상", sent_msgs[0])
+            self.assertNotIn("액티브 ETF", sent_msgs[0])
+
+            funnel = report_sync._summarize_traces_for_date(tmp_dir, "2026-11-24")
+            self.assertEqual(funnel["caution_only_blocked"], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 

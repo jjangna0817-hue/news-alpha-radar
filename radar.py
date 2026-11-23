@@ -1632,6 +1632,27 @@ def is_all_bullish_prepriced(
     return True, details
 
 
+def is_caution_only_alert(stocks: list[dict[str, Any]]) -> tuple[bool, list[str]]:
+    """실질 수혜·피해 종목 부재 노이즈 차단 가드:
+    Stage 2 분석 및 중복·유동성 필터 이후 남은 종목 중 '상승수혜'도 0건이고 '하락주의'도 0건
+    (즉 전원 '옥석가리기주의' 또는 빈 목록)이면 발송 가치가 없으므로 True를 반환한다.
+    - 순수 '하락주의' 리스크 경고 알림(하락주의 ≥ 1건)은 정상 발송을 유지한다.
+    """
+    if not stocks:
+        return True, []
+    actionable = [
+        s for s in stocks
+        if _normalize_perf_direction(s.get("direction")) in ("상승수혜", "하락주의")
+    ]
+    if actionable:
+        return False, []
+    details = [
+        f"{s.get('name') or s.get('code')}({s.get('code')} {_normalize_perf_direction(s.get('direction'))})"
+        for s in stocks
+    ]
+    return True, details
+
+
 
 def classify_alert_sector(
     *,
@@ -4625,6 +4646,21 @@ def run_live(
                 logger.info("%s 장전 요약 유동성/거래정지 기준 미달 스킵(%s): %s", tag, ", ".join(s2["liquidity_filter"]["details"][:3]), tkey)
                 continue
 
+            caut_only_p, caut_det_p = is_caution_only_alert(s2["alert_meta"].get("stocks") or [])
+            if caut_only_p:
+                trace.emit({
+                    "ts": flush_now.isoformat(),
+                    "type": "caution_only_skip",
+                    "cycle": cycle,
+                    "phase": "premarket_digest",
+                    "cluster_id": cluster.cluster_id,
+                    "theme_key": tkey,
+                    "catalyst_score": score_val,
+                    "details": caut_det_p,
+                })
+                logger.info("%s 장전 요약 실질 수혜·피해 종목 없음(전원 옥석가리기주의) 스킵: %s", tag, tkey)
+                continue
+
             final_sector = s2["sector"]
             if max_daily_per_sector > 0 and (
                 state.sector_count_today(final_sector, now=flush_now) + local_sectors[final_sector]
@@ -4983,6 +5019,23 @@ def run_live(
                                     logger.info(
                                         "%s Deferred 유동성/거래정지 기준 미달 폐기(%s): %s",
                                         tag, ", ".join(s2_def["liquidity_filter"]["details"][:3]), tkey,
+                                    )
+                                    continue
+                                caut_only_d, caut_det_d = is_caution_only_alert(alert_meta.get("stocks") or [])
+                                if caut_only_d:
+                                    trace.emit({
+                                        "ts": now_d.isoformat(),
+                                        "type": "caution_only_skip",
+                                        "cycle": cycle,
+                                        "phase": "deferred",
+                                        "cluster_id": cid,
+                                        "theme_key": tkey,
+                                        "catalyst_score": float(alert_meta["catalyst_score"]),
+                                        "details": caut_det_d,
+                                    })
+                                    logger.info(
+                                        "%s Deferred 실질 수혜·피해 종목 없음(전원 옥석가리기주의) 폐기: %s",
+                                        tag, tkey,
                                     )
                                     continue
                                 if max_daily_per_sector > 0 and state.sector_count_today(s2_def["sector"], now=now_d) >= max_daily_per_sector:
@@ -5693,6 +5746,26 @@ def run_live(
                                     logger.info(
                                         "%s 최소 거래대금(%.1f억)/거래정지 기준 미달 — 발송 생략(%s): %s",
                                         tag, min_trading_value_eok, ", ".join(liquidity_filter["details"][:3]), tkey,
+                                    )
+                                    continue
+
+                                # 실질 수혜·피해 종목 부재(상승수혜 0건 & 하락주의 0건 = 전원 옥석가리기주의) 노이즈 차단
+                                caut_only, caut_details = is_caution_only_alert(alert_meta.get("stocks") or [])
+                                if caut_only:
+                                    trace.emit({
+                                        "ts": cand_now.isoformat(),
+                                        "type": "caution_only_skip",
+                                        "cycle": cycle,
+                                        "phase": "pre_send",
+                                        "cluster_id": cid,
+                                        "theme_key": tkey,
+                                        "catalyst_score": score_val,
+                                        "details": caut_details,
+                                    })
+                                    deferred_reasons[cid] = "caution_only_skip"
+                                    logger.info(
+                                        "%s 실질 수혜·피해 종목 없음(전원 옥석가리기주의) — 발송 생략(%s): %s",
+                                        tag, ", ".join(caut_details[:3]), tkey,
                                     )
                                     continue
 

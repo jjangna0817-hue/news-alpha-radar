@@ -46,6 +46,8 @@ DEFAULT_ENTRY_MAX_CHANGE_PCT = 4.0
 DEFAULT_TAKE_PROFIT_PCT = 5.0
 DEFAULT_TRAILING_STOP_PCT = 2.0
 DEFAULT_STOP_LOSS_PCT = 3.0
+DEFAULT_OPEN_ENTRY_TIME = "09:08"
+DEFAULT_ENTRY_CUTOFF_TIME = "14:00"
 DEFAULT_EOD_EXIT_ENABLED = True
 DEFAULT_EOD_EXIT_TIME = "15:15"
 DEFAULT_DAILY_MAX_LOSS_PCT = 3.0
@@ -193,6 +195,19 @@ def resolve_autotrade_config(
         eod_env = (os.getenv("AUTOTRADE_EOD_EXIT_ENABLED") or "true").strip().lower()
         eod_enabled = eod_env not in ("0", "false", "no", "off")
 
+    oh, om = radar._parse_hhmm(
+        str(cfg.get("autotrade_open_entry_time") or radar._env_str("AUTOTRADE_OPEN_ENTRY_TIME", DEFAULT_OPEN_ENTRY_TIME)),
+        default=(9, 8),
+    )
+    ch, cm = radar._parse_hhmm(
+        str(cfg.get("autotrade_entry_cutoff_time") or radar._env_str("AUTOTRADE_ENTRY_CUTOFF_TIME", DEFAULT_ENTRY_CUTOFF_TIME)),
+        default=(14, 0),
+    )
+    open_min = max(9 * 60, min(14 * 60, oh * 60 + om))
+    cutoff_min = max(open_min + 10, min(15 * 60 + 15, ch * 60 + cm))
+    oh, om = divmod(open_min, 60)
+    ch, cm = divmod(cutoff_min, 60)
+
     eh, em = radar._parse_hhmm(
         str(cfg.get("autotrade_eod_exit_time") or radar._env_str("AUTOTRADE_EOD_EXIT_TIME", DEFAULT_EOD_EXIT_TIME)),
         default=(15, 15),
@@ -264,6 +279,8 @@ def resolve_autotrade_config(
         "autotrade_take_profit_pct": round(max(0.5, min(30.0, tp_pct)), 1),
         "autotrade_trailing_stop_pct": round(min(15.0, trail_pct), 1),
         "autotrade_stop_loss_pct": round(max(0.5, min(20.0, sl_pct)), 1),
+        "autotrade_open_entry_time": f"{oh:02d}:{om:02d}",
+        "autotrade_entry_cutoff_time": f"{ch:02d}:{cm:02d}",
         "autotrade_eod_exit_enabled": eod_enabled,
         "autotrade_eod_exit_time": f"{eh:02d}:{em:02d}",
         "autotrade_daily_max_loss_pct": DEFAULT_DAILY_MAX_LOSS_PCT,
@@ -418,6 +435,65 @@ def is_second_order_candidate(stock: dict[str, Any]) -> bool:
     return True
 
 
+def check_substitute_laggard_guard(
+    candidate: dict[str, Any],
+    ranked_candidates: list[dict[str, Any]],
+    quotes: dict[str, radar.StockQuote],
+    *,
+    max_change_pct: float = DEFAULT_ENTRY_MAX_CHANGE_PCT,
+) -> tuple[bool, str]:
+    """대리 소외주(확산·주변주) 추격 진입 차단 가드:
+    1) 동일 알림 내 '핵심' 2차 후보가 1개 이상 존재하는데 모두 진입 불가였을 때,
+       후순위 '확산' 주변주를 대리 매수하지 않는다.
+    2) 동일 알림 내 2차 파급 선도주가 이미 진입 상한(> max_change_pct)을 돌파했거나 상한가 잠김일 때,
+       비핵심 주변주('확산'·일반 '2차') 대리 진입 및 역행 하락(< 0%) 소외주 진입을 차단한다.
+    - '1차 직접' 종목만 급등하고 '2차 파급(핵심)'이 미반영인 구간은 본 봇의 핵심 알파 구간이므로 허용한다.
+    """
+    cand_code = str(candidate.get("code") or "").strip().zfill(6)
+    tier = str(candidate.get("order_tier") or "").strip()
+    is_core = "핵심" in tier
+    is_diffusion = "확산" in tier
+    has_any_core = any(
+        "핵심" in str(s.get("order_tier") or "") and is_second_order_candidate(s)
+        for s in ranked_candidates
+    )
+
+    if is_diffusion and has_any_core:
+        return True, f"핵심후보 미체결 시 확산주 대리매수 금지({tier})"
+
+    overheated_peers: list[str] = []
+    overheated_core_peers: list[str] = []
+    for peer in ranked_candidates:
+        p_code = str(peer.get("code") or "").strip().zfill(6)
+        if not p_code or p_code == cand_code:
+            continue
+        if not is_second_order_candidate(peer):
+            continue
+        qp = quotes.get(p_code)
+        if qp is None or int(qp.price) <= 0:
+            continue
+        if str(qp.market_status or "").strip().upper() in ("CLOSE", "CLOSED"):
+            continue
+        _, p_unbuyable = radar.assess_quote_executability(qp)
+        if float(qp.change_pct) > float(max_change_pct) or p_unbuyable == "상한가잠김":
+            label = f"{peer.get('name') or p_code}({qp.change_pct:+.1f}%)"
+            overheated_peers.append(label)
+            if "핵심" in str(peer.get("order_tier") or ""):
+                overheated_core_peers.append(label)
+
+    if not is_core and overheated_core_peers:
+        return True, f"핵심 선도주 이미 급등({', '.join(overheated_core_peers[:2])}) — 후순위 대리매수 금지"
+    if is_diffusion and overheated_peers:
+        return True, f"2차 선도주 이미 급등({', '.join(overheated_peers[:2])}) — 확산주 대리매수 금지"
+
+    q_cand = quotes.get(cand_code)
+    if overheated_peers and q_cand is not None and int(q_cand.price) > 0:
+        if str(q_cand.market_status or "").strip().upper() not in ("CLOSE", "CLOSED") and float(q_cand.change_pct) < 0.0:
+            return True, f"동일테마 선도주 급등({', '.join(overheated_peers[:2])}) 중 역행 약세({q_cand.change_pct:+.2f}%) 소외주 진입 금지"
+
+    return False, ""
+
+
 class PaperAutoTrader:
     """내장 가상 모의계좌 + 한국투자증권 공식 모의투자(VTS) 자동매매 매니저."""
 
@@ -559,24 +635,39 @@ class PaperAutoTrader:
         return eligible
 
     @staticmethod
-    def _is_entry_hours(now_dt: datetime, eod_exit_time: str, eod_enabled: bool) -> bool:
+    def _is_entry_hours(
+        now_dt: datetime,
+        eod_exit_time: str,
+        eod_enabled: bool,
+        *,
+        open_entry_time: str = DEFAULT_OPEN_ENTRY_TIME,
+        entry_cutoff_time: str = DEFAULT_ENTRY_CUTOFF_TIME,
+    ) -> bool:
         if now_dt.weekday() >= 5:
             return False
         now_min = now_dt.hour * 60 + now_dt.minute
-        open_entry_min = 9 * 60 + 1  # 09:01 KST (동시호가 직후 1분 안정화 후 진입)
+        oh, om = radar._parse_hhmm(open_entry_time, default=(9, 8))
+        open_entry_min = max(9 * 60, oh * 60 + om)
+        ch, cm = radar._parse_hhmm(entry_cutoff_time, default=(14, 0))
+        cutoff_min = ch * 60 + cm
         if eod_enabled:
             eh, em = radar._parse_hhmm(eod_exit_time, default=(15, 15))
-            cutoff_min = max(open_entry_min + 5, eh * 60 + em - 10)
-        else:
-            cutoff_min = 15 * 60 + 15
+            cutoff_min = min(cutoff_min, eh * 60 + em - 15)
+        cutoff_min = max(open_entry_min + 5, cutoff_min)
         return open_entry_min <= now_min <= cutoff_min
 
     @staticmethod
-    def _is_premarket_queue_hours(now_dt: datetime) -> bool:
+    def _is_premarket_queue_hours(
+        now_dt: datetime,
+        *,
+        open_entry_time: str = DEFAULT_OPEN_ENTRY_TIME,
+    ) -> bool:
         if now_dt.weekday() >= 5:
             return False
         now_min = now_dt.hour * 60 + now_dt.minute
-        return (7 * 60) <= now_min <= (9 * 60)
+        oh, om = radar._parse_hhmm(open_entry_time, default=(9, 8))
+        open_entry_min = max(9 * 60 + 1, oh * 60 + om)
+        return (7 * 60) <= now_min < open_entry_min
 
     def _daily_loss_circuit_tripped(
         self,
@@ -897,12 +988,40 @@ class PaperAutoTrader:
                 logger.info("[모의자동매매] 일일 손실 한도(-%.1f%%) 도달 — 신규 매수를 중단합니다.", cfg["autotrade_daily_max_loss_pct"])
                 return None
 
-            # 1) 장중 진입 가능 시각(평일 09:01 ~ 15:05): 조건 통과 1순위 종목 즉시 자동 매수
-            if self._is_entry_hours(ref, cfg["autotrade_eod_exit_time"], cfg["autotrade_eod_exit_enabled"]):
+            # 1) 장중 진입 가능 시각(평일 기본 09:08 ~ 14:00): 조건 통과 1순위 종목 즉시 자동 매수
+            if self._is_entry_hours(
+                ref,
+                cfg["autotrade_eod_exit_time"],
+                cfg["autotrade_eod_exit_enabled"],
+                open_entry_time=cfg["autotrade_open_entry_time"],
+                entry_cutoff_time=cfg["autotrade_entry_cutoff_time"],
+            ):
                 for st in ranked:
                     code = str(st.get("code") or "").strip().zfill(6)
                     q = quotes.get(code)
                     if q is None:
+                        continue
+                    sub_blocked, sub_reason = check_substitute_laggard_guard(
+                        st,
+                        ranked,
+                        quotes,
+                        max_change_pct=float(cfg["autotrade_max_change_pct"]),
+                    )
+                    if sub_blocked:
+                        logger.info(
+                            "[모의자동매매] 대리 소외주 진입 차단: %s(%s) — %s",
+                            st.get("name") or code, code, sub_reason,
+                        )
+                        if trace is not None:
+                            trace.emit({
+                                "ts": ref.isoformat(),
+                                "type": "paper_trade_event",
+                                "action": "skip_substitute",
+                                "code": code,
+                                "name": str(st.get("name") or code),
+                                "theme_key": theme_key,
+                                "reason": sub_reason,
+                            })
                         continue
                     bought = self._execute_buy_locked(
                         account,
@@ -922,8 +1041,8 @@ class PaperAutoTrader:
                         return {"action": "bought", "position": bought}
                 return None
 
-            # 2) 평일 장전(07:00 ~ 09:00, 07:50 장전 요약 포함): 09:01 개장 직후 시초가 범위 확인 후 진입하도록 대기열 적재
-            if self._is_premarket_queue_hours(ref):
+            # 2) 평일 장전·시초 안정화 구간(07:00 ~ 09:07, 07:50 장전 요약 포함): 09:08 이후 안정화 시세 확인 후 진입하도록 대기열 적재
+            if self._is_premarket_queue_hours(ref, open_entry_time=cfg["autotrade_open_entry_time"]):
                 top = ranked[0]
                 code = str(top.get("code") or "").strip().zfill(6)
                 if not code or code in (account.get("positions") or {}):
@@ -931,7 +1050,10 @@ class PaperAutoTrader:
                 q_list: list[dict[str, Any]] = [
                     e for e in (account.get("pending_open_entries") or []) if str(e.get("code")) != code
                 ]
-                exp_dt = datetime(ref.year, ref.month, ref.day, 9, 15, tzinfo=radar.KST)
+                oh, om = radar._parse_hhmm(cfg["autotrade_open_entry_time"], default=(9, 8))
+                exp_total_min = min(15 * 60, oh * 60 + om + 17)
+                exp_h, exp_m = divmod(exp_total_min, 60)
+                exp_dt = datetime(ref.year, ref.month, ref.day, exp_h, exp_m, tzinfo=radar.KST)
                 entry_item = {
                     "code": code,
                     "stock": dict(top),
@@ -948,6 +1070,24 @@ class PaperAutoTrader:
                 self._save_account(account, ref)
                 return {"action": "queued_for_open", "entry": entry_item}
 
+            # 3) 평일 오후 진입 마감(기본 14:00) 이후 정규장 알림은 관망 (보유 포지션 청산 감시는 계속 작동)
+            if ref.weekday() < 5 and (9 * 60) <= (ref.hour * 60 + ref.minute) <= (15 * 60 + 30):
+                top_st = ranked[0]
+                logger.info(
+                    "[모의자동매매] 신규 진입 마감 시각(%s) 경과 — 알림만 수신하고 매수는 생략합니다: %s",
+                    cfg["autotrade_entry_cutoff_time"], theme_key,
+                )
+                if trace is not None:
+                    trace.emit({
+                        "ts": ref.isoformat(),
+                        "type": "paper_trade_event",
+                        "action": "skip_cutoff",
+                        "code": str(top_st.get("code") or "").strip().zfill(6),
+                        "name": str(top_st.get("name") or ""),
+                        "theme_key": theme_key,
+                        "cutoff_time": cfg["autotrade_entry_cutoff_time"],
+                    })
+
         return None
 
     def tick_positions(
@@ -960,7 +1100,7 @@ class PaperAutoTrader:
         send_fn: Callable[[str], Any] | None = None,
         trace: radar.TraceLogger | None = None,
     ) -> dict[str, int]:
-        """보유 포지션 익절·트레일링·손절·15:15 시간청산 및 장전 대기 종목 09:01 시초 진입 점검."""
+        """보유 포지션 익절·트레일링·손절·15:15 시간청산 및 장전 대기 종목 09:08 시초 안정화 진입 점검."""
         ref = radar.StateStore._now_kst(now)
         if ref.weekday() >= 5:
             return {"bought": 0, "sold": 0}
@@ -993,15 +1133,17 @@ class PaperAutoTrader:
             sold_cnt = 0
             dirty = False
 
-            # A) 09:01 ~ 09:15 장전 대기 후보 시초 진입 점검 (갭상승 과열 종목은 자동 폐기)
+            # A) 시초 안정화 시각(기본 09:08 ~ 09:25) 장전 대기 후보 진입 점검 (갭상승 과열·급락 종목은 자동 폐기)
             if pending_open:
+                oh_open, om_open = radar._parse_hhmm(cfg["autotrade_open_entry_time"], default=(9, 8))
+                open_entry_min = max(9 * 60, oh_open * 60 + om_open)
                 kept_pending: list[dict[str, Any]] = []
                 for item in pending_open:
                     exp = radar.parse_iso_kst(item.get("expires_at"))
                     if exp is not None and ref > exp:
                         dirty = True
                         continue
-                    if now_min < 9 * 60 + 1:
+                    if now_min < open_entry_min:
                         kept_pending.append(item)
                         continue
                     if not cfg["autotrade_enabled"]:
