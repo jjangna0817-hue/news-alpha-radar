@@ -634,6 +634,60 @@ def compute_cron_jitter(schedule_expr: str | None, started_at: datetime) -> tupl
     return None, None
 
 
+_GIT_COMMIT_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def current_git_commit(repo_dir: Path | None = None) -> str:
+    """현재 저장소의 짧은 git 커밋 해시(7자리)를 서브프로세스 없이 고속 조회."""
+    root = (repo_dir if repo_dir is not None else Path(__file__).resolve().parent).resolve()
+    key = str(root)
+    now_m = time.monotonic()
+    cached = _GIT_COMMIT_CACHE.get(key)
+    if cached is not None and (now_m - cached[0]) < 60.0:
+        return cached[1]
+
+    sha = ""
+    try:
+        git_dir = root / ".git"
+        if git_dir.is_file():
+            txt = git_dir.read_text(encoding="utf-8", errors="ignore").strip()
+            if txt.startswith("gitdir:"):
+                git_dir = (root / txt.split(":", 1)[1].strip()).resolve()
+        head_file = git_dir / "HEAD"
+        if head_file.exists():
+            head_txt = head_file.read_text(encoding="utf-8", errors="ignore").strip()
+            if head_txt.startswith("ref:"):
+                ref_rel = head_txt.split(":", 1)[1].strip()
+                ref_file = git_dir / ref_rel
+                if ref_file.exists():
+                    sha = ref_file.read_text(encoding="utf-8", errors="ignore").strip()[:7]
+                else:
+                    packed = git_dir / "packed-refs"
+                    if packed.exists():
+                        for pl in packed.read_text(encoding="utf-8", errors="ignore").splitlines():
+                            if pl.endswith(" " + ref_rel) and not pl.startswith("#"):
+                                sha = pl.split()[0][:7]
+                                break
+            elif len(head_txt) >= 7:
+                sha = head_txt[:7]
+    except Exception:
+        sha = ""
+
+    _GIT_COMMIT_CACHE[key] = (now_m, sha)
+    return sha
+
+
+def resolve_repo_dir_for_data(data_dir: Path) -> Path:
+    """실운영 data_dir(REPO_DIR/data)이면 REPO_DIR을, 임시 테스트 폴더(/tmp 등)면 해당 폴더를 반환해 단위테스트 중 실서버 .env 간섭을 원천 차단."""
+    repo_root = Path(__file__).resolve().parent
+    try:
+        if data_dir.resolve() == (repo_root / "data").resolve():
+            return repo_root
+    except OSError:
+        pass
+    return data_dir
+
+
 class TraceLogger:
     """기사 상태 전이·판정·실행 지연을 data/trace.jsonl에 기록하고 7일/5MB 기준 로테이션."""
 
@@ -1959,6 +2013,7 @@ class PerformanceTracker:
                     "price_next_close": None,
                     "ret_next_close": None,
                     "ts_next_close": None,
+                    "git_commit": current_git_commit() or None,
                     "complete": alert_price is None,
                 }
                 fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -4136,10 +4191,11 @@ def run_live(
 
     import paper_trader
 
+    eff_repo_dir = resolve_repo_dir_for_data(base_dir)
     state = StateStore(base_dir / "state.json")
     trace = TraceLogger(base_dir / "trace.jsonl")
     perf_tracker = PerformanceTracker(base_dir / "performance.jsonl")
-    auto_trader = paper_trader.PaperAutoTrader(base_dir, Path(__file__).resolve().parent)
+    auto_trader = paper_trader.PaperAutoTrader(base_dir, eff_repo_dir)
 
     def _send_trade_tg(msg_html: str) -> None:
         if not dry_run and tg_token and tg_chat:
@@ -4704,6 +4760,18 @@ def run_live(
                     )
                 except Exception as tr_tick_exc:
                     logger.warning("%s 모의자동매매 포지션 점검 스킵: %s", tag, tr_tick_exc)
+                try:
+                    import report_sync
+
+                    report_sync.maybe_run_daily_report_and_sync(
+                        base_dir,
+                        eff_repo_dir,
+                        now=cycle_now,
+                        daemon_mode=daemon_mode,
+                        send_fn=_send_trade_tg,
+                    )
+                except Exception as rs_exc:
+                    logger.warning("%s 일일 성적표/GitHub 동기화 스킵: %s", tag, rs_exc)
 
             # 0-a) 평일 07:30~07:49 장전 요약 후보 사이클당 1건씩 분산 사전 분석(Pre-warm)
             if offhours_digest_enabled and should_prewarm_premarket_digest(cycle_now, state, offhours_digest_time):
@@ -6034,7 +6102,7 @@ def run_daemon(
                 try:
                     import paper_trader
 
-                    daemon_trader = paper_trader.PaperAutoTrader(base_dir, Path(__file__).resolve().parent)
+                    daemon_trader = paper_trader.PaperAutoTrader(base_dir, resolve_repo_dir_for_data(base_dir))
                     tick_now = _now()
                     if daemon_trader.has_active_work(tick_now):
                         tg_tok = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()

@@ -710,6 +710,7 @@ class PaperAutoTrader:
             "revenue_link": str(stock.get("revenue_link") or ""),
             "broker_mode": broker_mode,
             "kis_order_no": kis_order_no or None,
+            "git_commit": radar.current_git_commit(self.repo_dir) or None,
         }
         positions[code] = pos
         self._save_account(account, now_dt)
@@ -731,12 +732,17 @@ class PaperAutoTrader:
                 "invested_krw": total_cost,
                 "entry_change_pct": pos["entry_change_pct"],
                 "theme_key": theme_key,
+                "git_commit": pos["git_commit"],
             })
         if send_fn is not None:
             try:
                 send_fn(format_buy_telegram_html(pos, account, cfg, now=now_dt))
             except Exception as exc:
                 logger.warning("[모의자동매매] 매수 텔레그램 알림 실패: %s", exc)
+        with contextlib.suppress(Exception):
+            import report_sync
+
+            report_sync.try_background_github_sync(self.data_dir, self.repo_dir, now=now_dt)
         return pos
 
     def _execute_sell_locked(
@@ -823,6 +829,7 @@ class PaperAutoTrader:
             "order_tier": pos.get("order_tier") or "",
             "broker_mode": pos.get("broker_mode") or "builtin_paper",
             "kis_sell_order_no": kis_order_no or None,
+            "git_commit": pos.get("git_commit") or radar.current_git_commit(self.repo_dir) or None,
         }
         self._save_account(account, now_dt)
         self._append_trade(trade_rec)
@@ -844,12 +851,17 @@ class PaperAutoTrader:
                 "net_pnl_krw": net_pnl_krw,
                 "net_pnl_pct": net_pnl_pct,
                 "exit_reason": exit_reason,
+                "git_commit": trade_rec["git_commit"],
             })
         if send_fn is not None:
             try:
                 send_fn(format_sell_telegram_html(trade_rec, account, now=now_dt))
             except Exception as exc:
                 logger.warning("[모의자동매매] 매도 텔레그램 알림 실패: %s", exc)
+        with contextlib.suppress(Exception):
+            import report_sync
+
+            report_sync.try_background_github_sync(self.data_dir, self.repo_dir, now=now_dt)
         return trade_rec
 
     def on_alert_candidates(
@@ -1219,6 +1231,7 @@ class PaperAutoTrader:
             "positions": pos_rows,
             "pending_open_entries": list(account.get("pending_open_entries") or []),
             "recent_trades": self.load_trades(limit=40),
+            "report_sync": __import__("report_sync").get_sync_status_summary(self.data_dir, self.repo_dir),
             "config": cfg,
         }
 

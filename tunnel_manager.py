@@ -57,6 +57,7 @@ MAX_CONSECUTIVE_URL_FAILURES = 3
 
 LINK_COMMANDS = frozenset({"/link", "/url", "/dashboard", "/대시보드", "대시보드", "링크", "접속주소"})
 RECONNECT_COMMANDS = frozenset({"/reconnect", "/reissue", "재연결", "새링크", "링크재발급"})
+REPORT_COMMANDS = frozenset({"/report", "/stats", "리포트", "내역", "매매내역", "성적표"})
 PW_COMMANDS = frozenset({"/pw", "/password", "비밀번호"})
 
 
@@ -565,6 +566,23 @@ def _bot_command_responder_loop(
                         if reconnect_evt is not None:
                             reconnect_evt.set()
                         radar.send_telegram(token, target_chat, "⏳ 외부 접속 보안 터널을 새로 연결하고 있습니다. 5~10초 뒤 새 링크를 보내드립니다.")
+                elif first_tok in REPORT_COMMANDS:
+                    import report_sync
+
+                    parts = text.split()
+                    req_date = parts[1].strip() if (len(parts) >= 2 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", parts[1].strip())) else None
+                    bundle = report_sync.build_analytics_bundle(data_dir, repo_dir, target_date=req_date)
+                    sync_cfg = report_sync.resolve_github_sync_config(repo_dir)
+                    sync_res = (
+                        report_sync.sync_report_to_github(data_dir, repo_dir, target_date=req_date, include_prev_trading_day=False)
+                        if sync_cfg["configured"]
+                        else {"ok": False, "configured": False, "repo": sync_cfg["repo"]}
+                    )
+                    radar.send_telegram(
+                        token,
+                        target_chat,
+                        report_sync.format_daily_telegram_summary_html(bundle, sync_status=sync_res),
+                    )
                 elif first_tok in PW_COMMANDS and str(chat.get("type") or "") == "private":
                     pw = (read_dotenv_value(env_path, "DASHBOARD_PASSWORD") or os.getenv("DASHBOARD_PASSWORD") or "").strip()
                     if pw:

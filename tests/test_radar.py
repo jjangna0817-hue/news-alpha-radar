@@ -28,7 +28,7 @@ _APP_ENV_PREFIXES = (
     "MAX_BULLISH_PREPRICED_", "OFFHOURS_DIGEST_", "STOCK_DEDUP_",
     "THEME_COOLDOWN_", "DEDUP_MODE", "TRIGGER_MODE", "STAGE1_DAILY_",
     "INSTANT_FLASH_", "EXTRA_RSS_", "MARKET_LOOP_",
-    "AUTOTRADE_", "KIS_",
+    "AUTOTRADE_", "KIS_", "GITHUB_REPORT_",
     "GITHUB_EVENT_SCHEDULE", "GITHUB_STEP_SUMMARY",
 )
 _SAVED_ENV: dict[str, str] = {}
@@ -3322,6 +3322,239 @@ class TestPaperAutoTraderAndKISVTS(unittest.TestCase):
                 srv.server_close()
 
 
+class TestReportSyncAndFullSetFeedbackLoop(unittest.TestCase):
+    def test_analytics_bundle_traded_vs_skipped_commit_stats_and_zero_secret_leak(self) -> None:
+        import paper_trader
+        import report_sync
+
+        t_entry = datetime(2026, 11, 23, 10, 5, tzinfo=KST)
+        t_peak = datetime(2026, 11, 23, 10, 40, tzinfo=KST)
+        t_exit = datetime(2026, 11, 23, 11, 10, tzinfo=KST)
+        t_close = datetime(2026, 11, 23, 15, 40, tzinfo=KST)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=False):
+            tmp_dir = Path(tmp)
+            # Populate fake secrets in .env to prove 0% secret leakage in exported bundle & markdown
+            (tmp_dir / ".env").write_text(
+                "GEMINI_API_KEY=SECRET_GEMINI_999\n"
+                "TELEGRAM_BOT_TOKEN=SECRET_TG_888\n"
+                "DASHBOARD_PASSWORD=SECRET_PW_777\n"
+                "GITHUB_REPORT_TOKEN=ghp_SECRET_GH_666\n",
+                encoding="utf-8",
+            )
+            trace = radar.TraceLogger(tmp_dir / "trace.jsonl")
+            trace.emit({"ts": t_entry.isoformat(), "type": "illiquid_skip", "blocked": True, "theme_key": "소형테마", "details": ["초소형(1.2억<5.0억)"]})
+            trace.emit({"ts": t_entry.isoformat(), "type": "prepriced_skip", "theme_key": "급등테마", "details": ["급등주(+19.0%)"]})
+
+            pt = radar.PerformanceTracker(tmp_dir / "performance.jsonl")
+            pt.record_alert(
+                alert_ts=t_entry,
+                theme_key="통신망_해킹",
+                sector="사이버보안",
+                title="통신사 해킹 보안 수혜",
+                catalyst_score=8.9,
+                window="market",
+                stocks=[
+                    {"code": "263860", "name": "지니언스", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                    {"code": "005930", "name": "삼성전자", "direction": "상승수혜", "order_tier": "1차 직접", "revenue_link": "본업직결"},
+                    {"code": "298040", "name": "효성중공업", "direction": "상승수혜", "order_tier": "2차 파급", "revenue_link": "본업직결"},
+                ],
+                quotes={
+                    "263860": radar.StockQuote("263860", 10000, 150, 1.5, 500000, "OPEN", "", trading_value=6_000_000_000),
+                    "005930": radar.StockQuote("005930", 70000, 700, 1.0, 500000, "OPEN", "", trading_value=50_000_000_000),
+                    "298040": radar.StockQuote("298040", 400000, 28000, 7.5, 100000, "OPEN", "", trading_value=15_000_000_000),
+                },
+            )
+            pt.update_pending(
+                now=t_close,
+                fetch_quotes_fn=lambda codes: {
+                    "263860": radar.StockQuote("263860", 10800, 0, 0.0, 600000, "CLOSE", ""),  # +8.0%
+                    "005930": radar.StockQuote("005930", 68600, 0, 0.0, 600000, "CLOSE", ""),  # -2.0%
+                    "298040": radar.StockQuote("298040", 448000, 0, 0.0, 150000, "CLOSE", ""), # +12.0%
+                },
+            )
+
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+            with mock.patch.object(report_sync, "try_background_github_sync"):
+                trader.on_alert_candidates(
+                    alert_ts=t_entry,
+                    theme_key="통신망_해킹",
+                    sector="사이버보안",
+                    title="통신사 해킹 보안 수혜",
+                    catalyst_score=8.9,
+                    stocks=[
+                        {"code": "005930", "name": "삼성전자", "direction": "상승수혜", "order_tier": "1차 직접", "revenue_link": "본업직결"},
+                        {"code": "263860", "name": "지니언스", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                        {"code": "298040", "name": "효성중공업", "direction": "상승수혜", "order_tier": "2차 파급", "revenue_link": "본업직결"},
+                    ],
+                    quotes={
+                        "005930": radar.StockQuote("005930", 70000, 700, 1.0, 500000, "OPEN", "", trading_value=50_000_000_000),
+                        "263860": radar.StockQuote("263860", 10000, 150, 1.5, 500000, "OPEN", "", trading_value=6_000_000_000),
+                        "298040": radar.StockQuote("298040", 400000, 28000, 7.5, 100000, "OPEN", "", trading_value=15_000_000_000),
+                    },
+                    daemon_mode=True,
+                    trace=trace,
+                )
+                # Peak at 10,950 (+9.39%), then trailing pullback to 10,700 -> trailing exit!
+                trader.tick_positions(
+                    now=t_peak,
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda c: {"263860": radar.StockQuote("263860", 10950, 1100, 11.0, 600000, "OPEN", "", trading_value=7_000_000_000)},
+                    trace=trace,
+                )
+                trader.tick_positions(
+                    now=t_exit,
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda c: {"263860": radar.StockQuote("263860", 10700, 850, 8.5, 650000, "OPEN", "", trading_value=7_500_000_000)},
+                    trace=trace,
+                )
+
+            bundle = report_sync.build_analytics_bundle(tmp_dir, tmp_dir, target_date="2026-11-23", now=t_close)
+            md = report_sync.format_ai_feedback_markdown(bundle)
+            raw_json = json.dumps(bundle, ensure_ascii=False)
+
+            # Verify zero secret leakage
+            for secret in ("SECRET_GEMINI_999", "SECRET_TG_888", "SECRET_PW_777", "ghp_SECRET_GH_666"):
+                self.assertNotIn(secret, raw_json)
+                self.assertNotIn(secret, md)
+
+            # Verify trade + peak giveback + commit tracking + traded vs skipped matrix
+            self.assertEqual(bundle["today_trade_summary"]["closed_count"], 1)
+            self.assertEqual(bundle["today_trade_summary"]["wins"], 1)
+            self.assertGreater(bundle["today_closed_trades"][0]["missed_from_peak_pct"], 2.0)
+            self.assertTrue(len(bundle["by_commit"]) >= 1)
+
+            by_code = {r["code"]: r for r in bundle["today_alert_vs_trade_matrix"]}
+            self.assertTrue(by_code["263860"]["was_traded"])
+            self.assertFalse(by_code["005930"]["was_traded"])
+            self.assertIn("1차/단기테마 제외", by_code["005930"]["skip_reason_hint"])
+            self.assertFalse(by_code["298040"]["was_traded"])
+            self.assertIn("진입상한 초과", by_code["298040"]["skip_reason_hint"])
+            self.assertEqual(bundle["today_funnel"]["illiquid_blocked"], 1)
+            self.assertEqual(bundle["today_funnel"]["prepriced_blocked"], 1)
+
+    def test_github_contents_put_dedup_eod_telegram_and_dashboard_sync_routes(self) -> None:
+        import base64 as _b64
+        import threading as _th
+        import dashboard
+        import report_sync
+
+        t_eod = datetime(2026, 11, 23, 15, 40, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GITHUB_REPORT_TOKEN", None)
+            os.environ.pop("GITHUB_REPORT_REPO", None)
+            tmp_dir = Path(tmp)
+            (tmp_dir / ".env").write_text("# 기존 주석 유지\nGEMINI_API_KEY=k\n", encoding="utf-8")
+
+            # Seed 1 alert so EOD summary sees real activity
+            radar.PerformanceTracker(tmp_dir / "performance.jsonl").record_alert(
+                alert_ts=datetime(2026, 11, 23, 10, 0, tzinfo=KST),
+                theme_key="변압기_수주",
+                sector="전력기기·전선",
+                title="변압기 수혜",
+                catalyst_score=8.7,
+                window="market",
+                stocks=[{"code": "267260", "name": "HD현대일렉트릭", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                quotes={"267260": radar.StockQuote("267260", 50000, 500, 1.0, 100000, "OPEN", "", trading_value=5_000_000_000)},
+            )
+
+            gh_store: dict[str, bytes] = {}
+            put_calls: list[str] = []
+
+            def fake_github_api(req, timeout=0):
+                url = req.full_url
+                self.assertTrue(url.startswith("https://api.github.com/repos/jjangna0817-hue/news-alpha-radar-logs/contents/"))
+                rel = urllib.parse.unquote(url.split("/contents/", 1)[1])
+                method = req.get_method()
+                if method == "GET":
+                    if rel not in gh_store:
+                        raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO(b"{}"))
+                    return _FakeResponse(
+                        {
+                            "sha": "sha123",
+                            "content": _b64.b64encode(gh_store[rel]).decode("ascii"),
+                        }
+                    )
+                if method == "PUT":
+                    body = json.loads(req.data.decode("utf-8"))
+                    gh_store[rel] = _b64.b64decode(body["content"])
+                    put_calls.append(rel)
+                    return _FakeResponse({"content": {"path": rel, "sha": "sha456"}}, status=201)
+                raise AssertionError(f"Unexpected GitHub call: {method} {url}")
+
+            srv = dashboard.create_dashboard_server("127.0.0.1", 0, data_dir=tmp_dir, password="")
+            port = srv.server_address[1]
+            th = _th.Thread(target=srv.serve_forever, daemon=True)
+            th.start()
+            base = f"http://127.0.0.1:{port}"
+            try:
+                # 1) GET /api/autotrade/report returns ready-to-paste markdown & bundle
+                with urllib.request.urlopen(f"{base}/api/autotrade/report?date=2026-11-23", timeout=5) as resp:
+                    rep_res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(rep_res["ok"])
+                self.assertIn("News Alpha Radar 일일 통합 성적표", rep_res["markdown"])
+
+                # 2) POST /api/actions/autotrade/github-config saves token to .env and uploads reports/*.{json,md}
+                real_urlopen = urllib.request.urlopen
+
+                def selective_urlopen(req_or_url, *a, **kw):
+                    u = req_or_url.full_url if hasattr(req_or_url, "full_url") else str(req_or_url)
+                    if u.startswith("https://api.github.com/"):
+                        return fake_github_api(req_or_url, *a, **kw)
+                    return real_urlopen(req_or_url, *a, **kw)
+
+                with mock.patch("urllib.request.urlopen", side_effect=selective_urlopen):
+                    req_gh = urllib.request.Request(
+                        f"{base}/api/actions/autotrade/github-config",
+                        data=json.dumps(
+                            {
+                                "repo": "jjangna0817-hue/news-alpha-radar-logs",
+                                "token": "github_pat_TESTTOKEN123456",
+                            }
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with real_urlopen(req_gh, timeout=5) as resp:
+                        gh_res = json.loads(resp.read().decode("utf-8"))
+                    self.assertTrue(gh_res["ok"])
+                    self.assertIn("reports/latest.json", gh_store)
+                    self.assertIn("# 기존 주석 유지", (tmp_dir / ".env").read_text(encoding="utf-8"))
+
+                    # Second sync at exact same timestamp with identical content skips redundant PUTs!
+                    put_calls.clear()
+                    s_same1 = report_sync.sync_report_to_github(tmp_dir, tmp_dir, target_date="2026-11-23", include_prev_trading_day=False, now=t_eod)
+                    put_calls.clear()
+                    s_same2 = report_sync.sync_report_to_github(tmp_dir, tmp_dir, target_date="2026-11-23", include_prev_trading_day=False, now=t_eod)
+                    self.assertTrue(s_same1["ok"] and s_same2["ok"])
+                    self.assertEqual(put_calls, [])
+
+                    # 3) maybe_run_daily_report_and_sync sends 15:35 EOD Telegram summary ONCE per day
+                    eod_tg: list[str] = []
+                    r_first = report_sync.maybe_run_daily_report_and_sync(
+                        tmp_dir,
+                        tmp_dir,
+                        now=t_eod,
+                        daemon_mode=True,
+                        send_fn=eod_tg.append,
+                    )
+                    r_second = report_sync.maybe_run_daily_report_and_sync(
+                        tmp_dir,
+                        tmp_dir,
+                        now=t_eod + timedelta(minutes=10),
+                        daemon_mode=True,
+                        send_fn=eod_tg.append,
+                    )
+                    self.assertTrue(r_first["telegram_sent"])
+                    self.assertFalse(r_second["telegram_sent"])
+                    self.assertEqual(len(eod_tg), 1)
+                    self.assertIn("[일일 자동매매 &amp; 알림 성적표 · 2026-11-23]", eod_tg[0])
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
