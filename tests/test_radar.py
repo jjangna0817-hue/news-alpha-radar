@@ -4081,6 +4081,109 @@ class TestPatch20261125Improvements(unittest.TestCase):
                 assert r_override is not None
                 self.assertEqual(r_override["action"], "bought")
 
+    def test_breakeven_stop_protects_mid_rally_and_allows_trailing_run(self) -> None:
+        import paper_trader
+        import report_sync
+
+        t0 = datetime(2026, 11, 25, 9, 20, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+
+            with mock.patch.object(report_sync, "try_background_github_sync"):
+                # Buy 2 stocks at 10,000 (+1 tick = 10,010 fill)
+                for idx, (code, name) in enumerate([("105740", "디케이락형"), ("079550", "대장주형")]):
+                    trader.on_alert_candidates(
+                        alert_ts=t0 + timedelta(minutes=idx),
+                        theme_key=f"본전테스트_{idx}",
+                        sector="방산·우주항공",
+                        title=f"테스트 {idx}",
+                        catalyst_score=8.5,
+                        stocks=[{"code": code, "name": name, "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                        quotes={code: radar.StockQuote(code, 10000, 50, 0.5, 500000, "OPEN", "", trading_value=8_000_000_000)},
+                        daemon_mode=True,
+                    )
+
+                # Step 1: Both reach +3.6% (10,370 vs 10,010) -> breakeven armed, NOT trailing armed, NOT sold!
+                r1 = trader.tick_positions(
+                    now=t0 + timedelta(minutes=15),
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda codes: {
+                        "105740": radar.StockQuote("105740", 10370, 420, 4.2, 600000, "OPEN", "", trading_value=9_000_000_000),
+                        "079550": radar.StockQuote("079550", 10370, 420, 4.2, 600000, "OPEN", "", trading_value=9_000_000_000),
+                    },
+                )
+                self.assertEqual(r1["sold"], 0)
+                acc1 = trader.load_account(t0 + timedelta(minutes=15))
+                self.assertTrue(acc1["positions"]["105740"]["breakeven_armed"])
+                self.assertFalse(acc1["positions"]["105740"]["trailing_armed"])
+
+                # Step 2: Both pull back to +1.5% (10,160) -> still ABOVE +0.3% floor, so neither is shaken out!
+                r2 = trader.tick_positions(
+                    now=t0 + timedelta(minutes=25),
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda codes: {
+                        "105740": radar.StockQuote("105740", 10160, 210, 2.1, 620000, "OPEN", "", trading_value=9_000_000_000),
+                        "079550": radar.StockQuote("079550", 10160, 210, 2.1, 620000, "OPEN", "", trading_value=9_000_000_000),
+                    },
+                )
+                self.assertEqual(r2["sold"], 0)
+
+                # Step 3: 105740 fades down to +0.2% (10,030 <= +0.3%) -> breakeven exit protects capital!
+                #         079550 resumes rally to +6.5% (10,660) -> trailing armed and held!
+                r3 = trader.tick_positions(
+                    now=t0 + timedelta(minutes=40),
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda codes: {
+                        "105740": radar.StockQuote("105740", 10030, 80, 0.8, 650000, "OPEN", "", trading_value=9_000_000_000),
+                        "079550": radar.StockQuote("079550", 10660, 710, 7.1, 700000, "OPEN", "", trading_value=10_000_000_000),
+                    },
+                )
+                self.assertEqual(r3["sold"], 1)
+                self.assertNotIn("105740", trader.load_account(t0 + timedelta(minutes=40))["positions"])
+                self.assertTrue(trader.load_account(t0 + timedelta(minutes=40))["positions"]["079550"]["trailing_armed"])
+
+                # Step 4: 079550 pulls back from 10,660 to 10,400 (-2.44% pullback) -> exits via trailing TP!
+                r4 = trader.tick_positions(
+                    now=t0 + timedelta(minutes=55),
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda codes: {
+                        "079550": radar.StockQuote("079550", 10400, 450, 4.5, 750000, "OPEN", "", trading_value=10_000_000_000),
+                    },
+                )
+                self.assertEqual(r4["sold"], 1)
+
+                trades = {tr["code"]: tr for tr in trader.load_trades(limit=10)}
+                self.assertIn("본전보호 청산", trades["105740"]["exit_reason"])
+                self.assertIn("트레일링 익절", trades["079550"]["exit_reason"])
+
+                # Step 5: Setting autotrade_breakeven_trigger_pct=0 disables breakeven for instant rollback
+                trader.on_alert_candidates(
+                    alert_ts=t0 + timedelta(minutes=60),
+                    theme_key="본전비활성테스트",
+                    sector="방산·우주항공",
+                    title="비활성 확인",
+                    catalyst_score=8.5,
+                    stocks=[{"code": "394800", "name": "비활성주", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                    quotes={"394800": radar.StockQuote("394800", 10000, 0, 0.0, 500000, "OPEN", "", trading_value=8_000_000_000)},
+                    runtime_cfg={"autotrade_breakeven_trigger_pct": 0.0},
+                    daemon_mode=True,
+                )
+                trader.tick_positions(
+                    now=t0 + timedelta(minutes=70),
+                    runtime_cfg={"autotrade_breakeven_trigger_pct": 0.0},
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda c: {"394800": radar.StockQuote("394800", 10370, 370, 3.7, 600000, "OPEN", "", trading_value=9_000_000_000)},
+                )
+                r_off = trader.tick_positions(
+                    now=t0 + timedelta(minutes=80),
+                    runtime_cfg={"autotrade_breakeven_trigger_pct": 0.0},
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda c: {"394800": radar.StockQuote("394800", 10020, 20, 0.2, 620000, "OPEN", "", trading_value=9_000_000_000)},
+                )
+                self.assertEqual(r_off["sold"], 0)
+                self.assertIn("394800", trader.load_account(t0 + timedelta(minutes=80))["positions"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

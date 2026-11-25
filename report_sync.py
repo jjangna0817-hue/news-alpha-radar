@@ -417,6 +417,7 @@ def build_analytics_bundle(
             "last_price": p.get("last_price"),
             "highest_price": p.get("highest_price"),
             "peak_ret_pct": p.get("peak_ret_pct"),
+            "breakeven_armed": bool(p.get("breakeven_armed")),
             "trailing_armed": bool(p.get("trailing_armed")),
             "unrealized_pnl_krw": p.get("unrealized_pnl_krw"),
             "unrealized_pnl_pct": p.get("unrealized_pnl_pct"),
@@ -578,6 +579,8 @@ def build_analytics_bundle(
             "autotrade_take_profit_pct": at_cfg["autotrade_take_profit_pct"],
             "autotrade_trailing_stop_pct": at_cfg["autotrade_trailing_stop_pct"],
             "autotrade_stop_loss_pct": at_cfg["autotrade_stop_loss_pct"],
+            "autotrade_breakeven_trigger_pct": at_cfg["autotrade_breakeven_trigger_pct"],
+            "autotrade_breakeven_floor_pct": at_cfg["autotrade_breakeven_floor_pct"],
             "autotrade_open_entry_time": at_cfg["autotrade_open_entry_time"],
             "autotrade_entry_cutoff_time": at_cfg["autotrade_entry_cutoff_time"],
             "autotrade_eod_exit_enabled": at_cfg["autotrade_eod_exit_enabled"],
@@ -600,6 +603,10 @@ def format_ai_feedback_markdown(bundle: dict[str, Any]) -> str:
     def _f_pct(v: Any) -> str:
         return f"{float(v):+.2f}%" if v is not None else "-"
 
+    be_trig = float(cfg.get("autotrade_breakeven_trigger_pct") or 0.0)
+    be_flr = float(cfg.get("autotrade_breakeven_floor_pct") or 0.0)
+    be_txt = f" · 본전보호 +{be_trig:.1f}%→{be_flr:+.1f}%" if be_trig > 0.0 else ""
+
     lines = [
         f"# 📊 News Alpha Radar 일일 통합 성적표 ({t_date} · commit `{commit}`)",
         "",
@@ -607,7 +614,7 @@ def format_ai_feedback_markdown(bundle: dict[str, Any]) -> str:
         f"- **총 평가자산**: {int(acc.get('total_equity_krw') or 0):,}원 ({_f_pct(acc.get('total_pnl_pct'))}, 누적 실현 {int(acc.get('cumulative_realized_pnl_krw') or 0):+,}원)",
         f"- **당일 청산 성적**: {ts.get('closed_count', 0)}건 ({ts.get('wins', 0)}승 {ts.get('losses', 0)}패) | 당일 순손익 **{int(ts.get('realized_net_pnl_krw') or 0):+,}원** (평균 {_f_pct(ts.get('avg_net_pnl_pct'))})",
         f"- **보유 중 최고점 대비 반납폭**: 평균 고점 {_f_pct(ts.get('avg_peak_ret_pct'))} / 평균 반납 -{(ts.get('avg_missed_from_peak_pct') or 0.0):.2f}%p",
-        f"- **현재 적용 규칙**: 주문 {int(cfg.get('autotrade_order_amount_krw') or 0)//10000}만원 · 진입창 {cfg.get('autotrade_open_entry_time') or '09:08'}~{cfg.get('autotrade_entry_cutoff_time') or '14:00'} [{cfg.get('autotrade_min_change_pct')}% ~ +{cfg.get('autotrade_max_change_pct')}%] · 익절 +{cfg.get('autotrade_take_profit_pct')}%(트레일링 -{cfg.get('autotrade_trailing_stop_pct')}%) · 손절 -{cfg.get('autotrade_stop_loss_pct')}% · 유동성 ≥{cfg.get('min_trading_value_eok')}억",
+        f"- **현재 적용 규칙**: 주문 {int(cfg.get('autotrade_order_amount_krw') or 0)//10000}만원 · 진입창 {cfg.get('autotrade_open_entry_time') or '09:08'}~{cfg.get('autotrade_entry_cutoff_time') or '14:00'} [{cfg.get('autotrade_min_change_pct')}% ~ +{cfg.get('autotrade_max_change_pct')}%] · 익절 +{cfg.get('autotrade_take_profit_pct')}%(트레일링 -{cfg.get('autotrade_trailing_stop_pct')}%){be_txt} · 손절 -{cfg.get('autotrade_stop_loss_pct')}% · 유동성 ≥{cfg.get('min_trading_value_eok')}억",
         "",
         "## 2. 당일 청산 내역 (`paper_trades.jsonl`)",
     ]
