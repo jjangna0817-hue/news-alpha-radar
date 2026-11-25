@@ -3912,6 +3912,59 @@ class TestPatch20261125Improvements(unittest.TestCase):
             self.assertEqual(day1_after["today_funnel"]["alerts_sent_in_cycles"], 35)
             self.assertEqual(day1_after["today_funnel"]["fresh_articles"], 2779)
 
+    def test_premarket_queue_limit_12_prevents_valid_candidate_eviction(self) -> None:
+        import paper_trader
+        import report_sync
+
+        t_pre = datetime(2026, 11, 25, 8, 15, tzinfo=KST)
+        t_open = datetime(2026, 11, 25, 9, 8, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+
+            # Queue 6 premarket alerts (scores 8.8 down to 8.0); previously the 6th (알테오젠 8.0) was evicted by [:5]
+            cands = [
+                ("163730", "핑거", 8.8),
+                ("079550", "LIG", 8.8),
+                ("011200", "HMM", 8.5),
+                ("060250", "NHN KCP", 8.5),
+                ("420770", "기가비스", 8.5),
+                ("196170", "알테오젠", 8.0),
+            ]
+            for idx, (code, name, score) in enumerate(cands):
+                trader.on_alert_candidates(
+                    alert_ts=t_pre + timedelta(minutes=idx),
+                    theme_key=f"테마_{idx}",
+                    sector="바이오",
+                    title=f"장전 이슈 {idx}",
+                    catalyst_score=score,
+                    stocks=[{"code": code, "name": name, "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                    quotes={},
+                    daemon_mode=True,
+                )
+            self.assertEqual(len(trader.load_account(t_pre)["pending_open_entries"]), 6)
+
+            # At 09:08: 핑거(-4.6%) and 기가비스(-6.1%) fail min_change_pct -> 6th candidate 알테오젠(+0.5%) MUST be bought!
+            open_quotes = {
+                "163730": radar.StockQuote("163730", 10000, -480, -4.6, 200000, "OPEN", "", trading_value=2_000_000_000),
+                "079550": radar.StockQuote("079550", 365000, -1500, -0.4, 50000, "OPEN", "", trading_value=18_000_000_000),
+                "011200": radar.StockQuote("011200", 22000, -300, -1.3, 400000, "OPEN", "", trading_value=12_000_000_000),
+                "060250": radar.StockQuote("060250", 10800, -50, -0.5, 250000, "OPEN", "", trading_value=3_000_000_000),
+                "420770": radar.StockQuote("420770", 30000, -1950, -6.1, 100000, "OPEN", "", trading_value=3_000_000_000),
+                "196170": radar.StockQuote("196170", 300000, 1500, 0.5, 50000, "OPEN", "", trading_value=25_000_000_000),
+            }
+            with mock.patch.object(report_sync, "try_background_github_sync"):
+                res = trader.tick_positions(
+                    now=t_open,
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda codes: {c: open_quotes[c] for c in codes if c in open_quotes},
+                )
+            self.assertEqual(res["bought"], 4)
+            bought_codes = set(trader.load_account(t_open)["positions"].keys())
+            self.assertIn("196170", bought_codes)
+            self.assertNotIn("163730", bought_codes)
+            self.assertNotIn("420770", bought_codes)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

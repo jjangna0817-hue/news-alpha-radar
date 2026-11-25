@@ -51,6 +51,7 @@ DEFAULT_ENTRY_CUTOFF_TIME = "14:00"
 DEFAULT_EOD_EXIT_ENABLED = True
 DEFAULT_EOD_EXIT_TIME = "15:15"
 DEFAULT_DAILY_MAX_LOSS_PCT = 3.0
+DEFAULT_PREMARKET_QUEUE_LIMIT = 12
 
 BUY_FEE_RATE = 0.00015
 SELL_FEE_AND_TAX_RATE = 0.00195
@@ -1066,7 +1067,7 @@ class PaperAutoTrader:
                 }
                 q_list.append(entry_item)
                 q_list.sort(key=lambda x: -float(x.get("catalyst_score") or 0.0))
-                account["pending_open_entries"] = q_list[:5]
+                account["pending_open_entries"] = q_list[:DEFAULT_PREMARKET_QUEUE_LIMIT]
                 self._save_account(account, ref)
                 return {"action": "queued_for_open", "entry": entry_item}
 
