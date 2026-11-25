@@ -42,15 +42,19 @@ DEFAULT_INITIAL_CAPITAL_KRW = 10_000_000
 DEFAULT_ORDER_AMOUNT_KRW = 1_000_000
 DEFAULT_MAX_POSITIONS = 4
 DEFAULT_ENTRY_MIN_CHANGE_PCT = -2.0
-DEFAULT_ENTRY_MAX_CHANGE_PCT = 4.0
+DEFAULT_ENTRY_MAX_CHANGE_PCT = 2.0
 DEFAULT_TAKE_PROFIT_PCT = 5.0
 DEFAULT_TRAILING_STOP_PCT = 2.0
 DEFAULT_STOP_LOSS_PCT = 3.0
+DEFAULT_BREAKEVEN_TRIGGER_PCT = 3.0
+DEFAULT_BREAKEVEN_FLOOR_PCT = 0.3
 DEFAULT_OPEN_ENTRY_TIME = "09:08"
 DEFAULT_ENTRY_CUTOFF_TIME = "14:00"
 DEFAULT_EOD_EXIT_ENABLED = True
 DEFAULT_EOD_EXIT_TIME = "15:15"
 DEFAULT_DAILY_MAX_LOSS_PCT = 3.0
+DEFAULT_PREMARKET_QUEUE_LIMIT = 12
+DEFAULT_PREMARKET_MAX_DROP_PCT = 10.0
 
 BUY_FEE_RATE = 0.00015
 SELL_FEE_AND_TAX_RATE = 0.00195
@@ -260,12 +264,41 @@ def resolve_autotrade_config(
             else radar._env_float("AUTOTRADE_STOP_LOSS_PCT", DEFAULT_STOP_LOSS_PCT)
         )
     )
+    be_trigger_pct = max(
+        0.0,
+        abs(
+            float(
+                cfg["autotrade_breakeven_trigger_pct"]
+                if cfg.get("autotrade_breakeven_trigger_pct") is not None
+                else radar._env_float("AUTOTRADE_BREAKEVEN_TRIGGER_PCT", DEFAULT_BREAKEVEN_TRIGGER_PCT)
+            )
+        ),
+    )
+    be_floor_pct = float(
+        cfg["autotrade_breakeven_floor_pct"]
+        if cfg.get("autotrade_breakeven_floor_pct") is not None
+        else radar._env_float("AUTOTRADE_BREAKEVEN_FLOOR_PCT", DEFAULT_BREAKEVEN_FLOOR_PCT)
+    )
+    be_trigger_pct = round(min(20.0, be_trigger_pct), 1)
+    be_floor_pct = round(max(-5.0, min(10.0, be_floor_pct)), 1)
+    if be_trigger_pct > 0.0 and be_floor_pct >= be_trigger_pct:
+        be_floor_pct = round(max(-5.0, be_trigger_pct - 0.5), 1)
     min_tv_eok = max(
         0.0,
         float(
             cfg["min_trading_value_eok"]
             if cfg.get("min_trading_value_eok") is not None
             else radar._env_float("MIN_TRADING_VALUE_EOK", radar.DEFAULT_MIN_TRADING_VALUE_EOK)
+        ),
+    )
+    premarket_max_drop_pct = max(
+        0.0,
+        abs(
+            float(
+                cfg["autotrade_premarket_max_drop_pct"]
+                if cfg.get("autotrade_premarket_max_drop_pct") is not None
+                else radar._env_float("AUTOTRADE_PREMARKET_MAX_DROP_PCT", DEFAULT_PREMARKET_MAX_DROP_PCT)
+            )
         ),
     )
 
@@ -279,11 +312,14 @@ def resolve_autotrade_config(
         "autotrade_take_profit_pct": round(max(0.5, min(30.0, tp_pct)), 1),
         "autotrade_trailing_stop_pct": round(min(15.0, trail_pct), 1),
         "autotrade_stop_loss_pct": round(max(0.5, min(20.0, sl_pct)), 1),
+        "autotrade_breakeven_trigger_pct": be_trigger_pct,
+        "autotrade_breakeven_floor_pct": be_floor_pct,
         "autotrade_open_entry_time": f"{oh:02d}:{om:02d}",
         "autotrade_entry_cutoff_time": f"{ch:02d}:{cm:02d}",
         "autotrade_eod_exit_enabled": eod_enabled,
         "autotrade_eod_exit_time": f"{eh:02d}:{em:02d}",
         "autotrade_daily_max_loss_pct": DEFAULT_DAILY_MAX_LOSS_PCT,
+        "autotrade_premarket_max_drop_pct": round(min(30.0, premarket_max_drop_pct), 1),
         "min_trading_value_eok": min_tv_eok,
     }
 
@@ -789,6 +825,7 @@ class PaperAutoTrader:
             "last_price": fill_price,
             "highest_price": fill_price,
             "peak_ret_pct": 0.0,
+            "breakeven_armed": False,
             "trailing_armed": False,
             "entry_change_pct": round(chg, 2),
             "entry_ts": now_dt.isoformat(),
@@ -1043,9 +1080,47 @@ class PaperAutoTrader:
 
             # 2) 평일 장전·시초 안정화 구간(07:00 ~ 09:07, 07:50 장전 요약 포함): 09:08 이후 안정화 시세 확인 후 진입하도록 대기열 적재
             if self._is_premarket_queue_hours(ref, open_entry_time=cfg["autotrade_open_entry_time"]):
-                top = ranked[0]
-                code = str(top.get("code") or "").strip().zfill(6)
-                if not code or code in (account.get("positions") or {}):
+                max_drop_pct = float(cfg.get("autotrade_premarket_max_drop_pct") or 0.0)
+                has_any_core = any(
+                    "핵심" in str(s.get("order_tier") or "") and is_second_order_candidate(s)
+                    for s in ranked
+                )
+                top: dict[str, Any] | None = None
+                code = ""
+                held_positions = account.get("positions") or {}
+                for cand in ranked:
+                    c_code = str(cand.get("code") or "").strip().zfill(6)
+                    if not c_code or c_code in held_positions:
+                        continue
+                    if "확산" in str(cand.get("order_tier") or "") and has_any_core:
+                        continue
+                    q_pre = quotes.get(c_code)
+                    if (
+                        max_drop_pct > 0.0
+                        and q_pre is not None
+                        and int(q_pre.price) > 0
+                        and float(q_pre.change_pct) <= -max_drop_pct
+                    ):
+                        logger.info(
+                            "[모의자동매매] 전일 급락주 장전 대기열 제외: %s(%s) %+.2f%% (기준 -%.1f%% 이하)",
+                            cand.get("name") or c_code, c_code, float(q_pre.change_pct), max_drop_pct,
+                        )
+                        if trace is not None:
+                            trace.emit({
+                                "ts": ref.isoformat(),
+                                "type": "paper_trade_event",
+                                "action": "skip_premarket_crash",
+                                "code": c_code,
+                                "name": str(cand.get("name") or c_code),
+                                "theme_key": theme_key,
+                                "change_pct": round(float(q_pre.change_pct), 2),
+                                "max_drop_pct": max_drop_pct,
+                            })
+                        continue
+                    top = cand
+                    code = c_code
+                    break
+                if top is None or not code:
                     return None
                 q_list: list[dict[str, Any]] = [
                     e for e in (account.get("pending_open_entries") or []) if str(e.get("code")) != code
@@ -1066,7 +1141,7 @@ class PaperAutoTrader:
                 }
                 q_list.append(entry_item)
                 q_list.sort(key=lambda x: -float(x.get("catalyst_score") or 0.0))
-                account["pending_open_entries"] = q_list[:5]
+                account["pending_open_entries"] = q_list[:DEFAULT_PREMARKET_QUEUE_LIMIT]
                 self._save_account(account, ref)
                 return {"action": "queued_for_open", "entry": entry_item}
 
@@ -1192,6 +1267,12 @@ class PaperAutoTrader:
             tp_pct = float(cfg["autotrade_take_profit_pct"])
             trail_pct = float(cfg["autotrade_trailing_stop_pct"])
             sl_pct = float(cfg["autotrade_stop_loss_pct"])
+            be_trigger_pct = float(cfg.get("autotrade_breakeven_trigger_pct") or 0.0)
+            be_floor_pct = float(
+                cfg["autotrade_breakeven_floor_pct"]
+                if cfg.get("autotrade_breakeven_floor_pct") is not None
+                else DEFAULT_BREAKEVEN_FLOOR_PCT
+            )
 
             for code in list((account.get("positions") or {}).keys()):
                 pos = account["positions"][code]
@@ -1217,6 +1298,14 @@ class PaperAutoTrader:
                     pos["peak_ret_pct"] = round(peak_ret_pct, 2)
                     dirty = True
 
+                if be_trigger_pct > 0.0 and not pos.get("breakeven_armed") and peak_ret_pct >= be_trigger_pct:
+                    pos["breakeven_armed"] = True
+                    dirty = True
+                    logger.info(
+                        "[모의자동매매] 본전보호 스탑 가동: %s(%s) 고점 +%.2f%% (기준 +%.1f%% → 보호선 %+.1f%%)",
+                        pos["name"], code, peak_ret_pct, be_trigger_pct, be_floor_pct,
+                    )
+
                 if not pos.get("trailing_armed") and peak_ret_pct >= tp_pct:
                     pos["trailing_armed"] = True
                     dirty = True
@@ -1235,6 +1324,8 @@ class PaperAutoTrader:
                     lock_floor = max(0.5, tp_pct - trail_pct)
                     if pullback_pct >= trail_pct or cur_ret_pct <= lock_floor:
                         exit_reason = f"트레일링 익절(고점 +{peak_ret_pct:.1f}% → {cur_ret_pct:+.1f}%)"
+                elif be_trigger_pct > 0.0 and pos.get("breakeven_armed") and cur_ret_pct <= be_floor_pct:
+                    exit_reason = f"본전보호 청산(고점 +{peak_ret_pct:.1f}% → {cur_ret_pct:+.1f}%)"
 
                 if not exit_reason and cfg["autotrade_eod_exit_enabled"]:
                     if now_min >= eod_min or str(pos.get("entry_date") or today_str) < today_str:

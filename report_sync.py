@@ -202,7 +202,7 @@ def _infer_skip_reason(
     chg = rec.get("alert_change_pct")
     if chg is not None:
         chg_f = float(chg)
-        max_chg = float(at_cfg.get("autotrade_max_change_pct", 4.0))
+        max_chg = float(at_cfg.get("autotrade_max_change_pct", 2.0))
         min_chg = float(at_cfg.get("autotrade_min_change_pct", -2.0))
         if chg_f > max_chg:
             return f"진입상한 초과({chg_f:+.2f}% > +{max_chg:.1f}%)"
@@ -252,6 +252,7 @@ def _summarize_traces_for_date(data_dir: Path, target_date: str) -> dict[str, An
         "dedup_blocked": 0,
         "substitute_buy_blocked": 0,
         "cutoff_buy_blocked": 0,
+        "premarket_crash_blocked": 0,
         "paper_buys": 0,
         "paper_sells": 0,
         "kis_errors": 0,
@@ -318,6 +319,8 @@ def _summarize_traces_for_date(data_dir: Path, target_date: str) -> dict[str, An
                 summary["substitute_buy_blocked"] += 1
             elif act == "skip_cutoff":
                 summary["cutoff_buy_blocked"] += 1
+            elif act == "skip_premarket_crash":
+                summary["premarket_crash_blocked"] += 1
             elif "error" in act:
                 summary["kis_errors"] += 1
 
@@ -414,6 +417,7 @@ def build_analytics_bundle(
             "last_price": p.get("last_price"),
             "highest_price": p.get("highest_price"),
             "peak_ret_pct": p.get("peak_ret_pct"),
+            "breakeven_armed": bool(p.get("breakeven_armed")),
             "trailing_armed": bool(p.get("trailing_armed")),
             "unrealized_pnl_krw": p.get("unrealized_pnl_krw"),
             "unrealized_pnl_pct": p.get("unrealized_pnl_pct"),
@@ -575,10 +579,13 @@ def build_analytics_bundle(
             "autotrade_take_profit_pct": at_cfg["autotrade_take_profit_pct"],
             "autotrade_trailing_stop_pct": at_cfg["autotrade_trailing_stop_pct"],
             "autotrade_stop_loss_pct": at_cfg["autotrade_stop_loss_pct"],
+            "autotrade_breakeven_trigger_pct": at_cfg["autotrade_breakeven_trigger_pct"],
+            "autotrade_breakeven_floor_pct": at_cfg["autotrade_breakeven_floor_pct"],
             "autotrade_open_entry_time": at_cfg["autotrade_open_entry_time"],
             "autotrade_entry_cutoff_time": at_cfg["autotrade_entry_cutoff_time"],
             "autotrade_eod_exit_enabled": at_cfg["autotrade_eod_exit_enabled"],
             "autotrade_eod_exit_time": at_cfg["autotrade_eod_exit_time"],
+            "autotrade_premarket_max_drop_pct": at_cfg["autotrade_premarket_max_drop_pct"],
         },
     }
 
@@ -596,6 +603,10 @@ def format_ai_feedback_markdown(bundle: dict[str, Any]) -> str:
     def _f_pct(v: Any) -> str:
         return f"{float(v):+.2f}%" if v is not None else "-"
 
+    be_trig = float(cfg.get("autotrade_breakeven_trigger_pct") or 0.0)
+    be_flr = float(cfg.get("autotrade_breakeven_floor_pct") or 0.0)
+    be_txt = f" · 본전보호 +{be_trig:.1f}%→{be_flr:+.1f}%" if be_trig > 0.0 else ""
+
     lines = [
         f"# 📊 News Alpha Radar 일일 통합 성적표 ({t_date} · commit `{commit}`)",
         "",
@@ -603,7 +614,7 @@ def format_ai_feedback_markdown(bundle: dict[str, Any]) -> str:
         f"- **총 평가자산**: {int(acc.get('total_equity_krw') or 0):,}원 ({_f_pct(acc.get('total_pnl_pct'))}, 누적 실현 {int(acc.get('cumulative_realized_pnl_krw') or 0):+,}원)",
         f"- **당일 청산 성적**: {ts.get('closed_count', 0)}건 ({ts.get('wins', 0)}승 {ts.get('losses', 0)}패) | 당일 순손익 **{int(ts.get('realized_net_pnl_krw') or 0):+,}원** (평균 {_f_pct(ts.get('avg_net_pnl_pct'))})",
         f"- **보유 중 최고점 대비 반납폭**: 평균 고점 {_f_pct(ts.get('avg_peak_ret_pct'))} / 평균 반납 -{(ts.get('avg_missed_from_peak_pct') or 0.0):.2f}%p",
-        f"- **현재 적용 규칙**: 주문 {int(cfg.get('autotrade_order_amount_krw') or 0)//10000}만원 · 진입창 {cfg.get('autotrade_open_entry_time') or '09:08'}~{cfg.get('autotrade_entry_cutoff_time') or '14:00'} [{cfg.get('autotrade_min_change_pct')}% ~ +{cfg.get('autotrade_max_change_pct')}%] · 익절 +{cfg.get('autotrade_take_profit_pct')}%(트레일링 -{cfg.get('autotrade_trailing_stop_pct')}%) · 손절 -{cfg.get('autotrade_stop_loss_pct')}% · 유동성 ≥{cfg.get('min_trading_value_eok')}억",
+        f"- **현재 적용 규칙**: 주문 {int(cfg.get('autotrade_order_amount_krw') or 0)//10000}만원 · 진입창 {cfg.get('autotrade_open_entry_time') or '09:08'}~{cfg.get('autotrade_entry_cutoff_time') or '14:00'} [{cfg.get('autotrade_min_change_pct')}% ~ +{cfg.get('autotrade_max_change_pct')}%] · 익절 +{cfg.get('autotrade_take_profit_pct')}%(트레일링 -{cfg.get('autotrade_trailing_stop_pct')}%){be_txt} · 손절 -{cfg.get('autotrade_stop_loss_pct')}% · 유동성 ≥{cfg.get('min_trading_value_eok')}억",
         "",
         "## 2. 당일 청산 내역 (`paper_trades.jsonl`)",
     ]
@@ -792,6 +803,131 @@ def _github_put_file(
         raise RuntimeError(f"GitHub 업로드 오류 (HTTP {exc.code}): {detail}") from exc
 
 
+def _daily_report_cache_path(data_dir: Path, target_date: str) -> Path:
+    return data_dir / "daily_reports" / f"{target_date}.json"
+
+
+def _save_local_daily_bundle(data_dir: Path, target_date: str, bundle: dict[str, Any]) -> None:
+    try:
+        path = _daily_report_cache_path(data_dir, target_date)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        radar.atomic_write_text(path, json.dumps(bundle, ensure_ascii=False, indent=2) + "\n")
+    except Exception:
+        pass
+
+
+def _load_local_daily_bundle(data_dir: Path, target_date: str) -> dict[str, Any] | None:
+    path = _daily_report_cache_path(data_dir, target_date)
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else None
+    except Exception:
+        return None
+
+
+def _github_get_file_bytes(
+    *,
+    owner_repo: str,
+    rel_path: str,
+    token: str,
+    timeout: int = 15,
+) -> bytes | None:
+    """GitHub Contents REST API로 단일 파일 원본 바이트 조회 (없으면 None)."""
+    encoded_path = "/".join(urllib.parse.quote(seg, safe="") for seg in rel_path.strip("/").split("/"))
+    api_url = f"{GITHUB_API_BASE}/repos/{owner_repo}/contents/{encoded_path}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": radar.USER_AGENT,
+    }
+    get_req = urllib.request.Request(api_url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(get_req, timeout=timeout) as resp:
+            cur_obj = json.loads(resp.read().decode("utf-8"))
+            raw_b64 = str(cur_obj.get("content") or "").replace("\n", "")
+            return base64.b64decode(raw_b64) if raw_b64 else None
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        return None
+    except Exception:
+        return None
+
+
+def _merge_backfill_bundle(existing: dict[str, Any], fresh: dict[str, Any]) -> dict[str, Any]:
+    """직전 거래일 익일종가(ret_next_close) 백필 시 당시 계좌·보유포지션·설정·필터 통계를 보존하고 측정값만 병합."""
+    merged = json.loads(json.dumps(existing, ensure_ascii=False))
+
+    existing_matrix = merged.get("today_alert_vs_trade_matrix") or []
+    fresh_matrix = fresh.get("today_alert_vs_trade_matrix") or []
+    if existing_matrix and fresh_matrix:
+        fresh_by_key = {
+            (str(r.get("alert_ts") or ""), str(r.get("code") or "").zfill(6)): r
+            for r in fresh_matrix
+        }
+        seen_keys: set[tuple[str, str]] = set()
+        updated_matrix: list[dict[str, Any]] = []
+        for row in existing_matrix:
+            key = (str(row.get("alert_ts") or ""), str(row.get("code") or "").zfill(6))
+            seen_keys.add(key)
+            nrow = dict(row)
+            f_row = fresh_by_key.get(key)
+            if f_row is not None:
+                for fld in ("ret_5m", "ret_30m", "ret_close", "ret_next_close"):
+                    if f_row.get(fld) is not None:
+                        nrow[fld] = f_row[fld]
+            updated_matrix.append(nrow)
+        for f_row in fresh_matrix:
+            key = (str(f_row.get("alert_ts") or ""), str(f_row.get("code") or "").zfill(6))
+            if key not in seen_keys:
+                updated_matrix.append(dict(f_row))
+        merged["today_alert_vs_trade_matrix"] = updated_matrix
+        if not merged.get("traded_vs_skipped_summary") and fresh.get("traded_vs_skipped_summary"):
+            merged["traded_vs_skipped_summary"] = fresh["traded_vs_skipped_summary"]
+    elif fresh_matrix:
+        merged["today_alert_vs_trade_matrix"] = fresh_matrix
+        if fresh.get("traded_vs_skipped_summary"):
+            merged["traded_vs_skipped_summary"] = fresh["traded_vs_skipped_summary"]
+
+    if fresh.get("rolling_performance_summary"):
+        merged["rolling_performance_summary"] = fresh["rolling_performance_summary"]
+    if fresh.get("by_commit"):
+        merged["by_commit"] = fresh["by_commit"]
+
+    old_closed = merged.get("today_closed_trades") or []
+    new_closed = fresh.get("today_closed_trades") or []
+    if len(new_closed) > len(old_closed):
+        merged["today_closed_trades"] = new_closed
+        old_ts = dict(merged.get("today_trade_summary") or {})
+        new_ts = dict(fresh.get("today_trade_summary") or {})
+        if "open_positions_count" in old_ts:
+            new_ts["open_positions_count"] = old_ts["open_positions_count"]
+        merged["today_trade_summary"] = new_ts
+
+    # trace.jsonl 로테이션으로 과거 일자 필터 통계가 0으로 유실되는 덮어쓰기 방지
+    old_fn = merged.get("today_funnel") or {}
+    new_fn = fresh.get("today_funnel") or {}
+    old_score = (
+        int(old_fn.get("fresh_articles") or 0)
+        + int(old_fn.get("alerts_sent_in_cycles") or 0) * 100
+        + int(old_fn.get("cycles_run") or 0)
+    )
+    new_score = (
+        int(new_fn.get("fresh_articles") or 0)
+        + int(new_fn.get("alerts_sent_in_cycles") or 0) * 100
+        + int(new_fn.get("cycles_run") or 0)
+    )
+    if new_score > old_score:
+        merged["today_funnel"] = new_fn
+
+    if fresh.get("generated_at"):
+        merged["backfilled_at"] = fresh["generated_at"]
+    return merged
+
+
 def sync_report_to_github(
     data_dir: Path,
     repo_dir: Path | None = None,
@@ -813,6 +949,7 @@ def sync_report_to_github(
 
     try:
         bundle_today = build_analytics_bundle(data_dir, eff_repo, target_date=t_date, now=ref)
+        _save_local_daily_bundle(data_dir, t_date, bundle_today)
         md_today = format_ai_feedback_markdown(bundle_today)
         json_bytes = (json.dumps(bundle_today, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         md_bytes = md_today.encode("utf-8")
@@ -844,13 +981,32 @@ def sync_report_to_github(
         ):
             updated_files.append("reports/latest.json")
 
-        # 직전 거래일의 익일 종가(ret_next_close) 측정값까지 최신화 반영
+        # 직전 거래일의 익일 종가(ret_next_close) 측정값만 최신화 반영 (당시 계좌·보유·설정·필터 통계 보존)
         if include_prev_trading_day:
             try:
                 cur_d = date.fromisoformat(t_date)
                 prev_d = previous_trading_date(cur_d).isoformat()
-                bundle_prev = build_analytics_bundle(data_dir, eff_repo, target_date=prev_d, now=ref)
+                bundle_prev_fresh = build_analytics_bundle(data_dir, eff_repo, target_date=prev_d, now=ref)
+                existing_prev = _load_local_daily_bundle(data_dir, prev_d)
+                if existing_prev is None:
+                    remote_prev_bytes = _github_get_file_bytes(
+                        owner_repo=cfg["repo"],
+                        rel_path=f"reports/{prev_d}.json",
+                        token=cfg["token"],
+                    )
+                    if remote_prev_bytes:
+                        try:
+                            parsed_prev = json.loads(remote_prev_bytes.decode("utf-8"))
+                            if isinstance(parsed_prev, dict):
+                                existing_prev = parsed_prev
+                        except Exception:
+                            existing_prev = None
+                if existing_prev is not None and str(existing_prev.get("target_date") or "") == prev_d:
+                    bundle_prev = _merge_backfill_bundle(existing_prev, bundle_prev_fresh)
+                else:
+                    bundle_prev = bundle_prev_fresh
                 if bundle_prev.get("today_closed_trades") or bundle_prev.get("today_alert_vs_trade_matrix"):
+                    _save_local_daily_bundle(data_dir, prev_d, bundle_prev)
                     prev_json = (json.dumps(bundle_prev, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
                     prev_md = format_ai_feedback_markdown(bundle_prev).encode("utf-8")
                     if _github_put_file(

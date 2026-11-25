@@ -160,10 +160,13 @@ def _effective_config(data_dir: Path) -> dict[str, Any]:
         "autotrade_take_profit_pct": float(at_cfg["autotrade_take_profit_pct"]),
         "autotrade_trailing_stop_pct": float(at_cfg["autotrade_trailing_stop_pct"]),
         "autotrade_stop_loss_pct": float(at_cfg["autotrade_stop_loss_pct"]),
+        "autotrade_breakeven_trigger_pct": float(at_cfg["autotrade_breakeven_trigger_pct"]),
+        "autotrade_breakeven_floor_pct": float(at_cfg["autotrade_breakeven_floor_pct"]),
         "autotrade_open_entry_time": str(at_cfg["autotrade_open_entry_time"]),
         "autotrade_entry_cutoff_time": str(at_cfg["autotrade_entry_cutoff_time"]),
         "autotrade_eod_exit_enabled": bool(at_cfg["autotrade_eod_exit_enabled"]),
         "autotrade_eod_exit_time": str(at_cfg["autotrade_eod_exit_time"]),
+        "autotrade_premarket_max_drop_pct": float(at_cfg["autotrade_premarket_max_drop_pct"]),
         "max_alerts_per_window": int(
             raw["max_alerts_per_window"]
             if raw.get("max_alerts_per_window") is not None
@@ -554,6 +557,12 @@ def validate_and_merge_config(data_dir: Path, patch: dict[str, Any]) -> dict[str
         cur["autotrade_trailing_stop_pct"] = round(min(15.0, abs(float(patch["autotrade_trailing_stop_pct"]))), 1)
     if "autotrade_stop_loss_pct" in patch:
         cur["autotrade_stop_loss_pct"] = round(max(0.5, min(20.0, abs(float(patch["autotrade_stop_loss_pct"])))), 1)
+    if "autotrade_breakeven_trigger_pct" in patch:
+        cur["autotrade_breakeven_trigger_pct"] = round(min(20.0, abs(float(patch["autotrade_breakeven_trigger_pct"]))), 1)
+    if "autotrade_breakeven_floor_pct" in patch:
+        cur["autotrade_breakeven_floor_pct"] = round(max(-5.0, min(10.0, float(patch["autotrade_breakeven_floor_pct"]))), 1)
+    if float(cur.get("autotrade_breakeven_trigger_pct") or 0.0) > 0.0 and float(cur.get("autotrade_breakeven_floor_pct") or 0.0) >= float(cur["autotrade_breakeven_trigger_pct"]):
+        cur["autotrade_breakeven_floor_pct"] = round(max(-5.0, float(cur["autotrade_breakeven_trigger_pct"]) - 0.5), 1)
     if "autotrade_open_entry_time" in patch:
         oh, om = radar._parse_hhmm(str(patch["autotrade_open_entry_time"]), default=(9, 8))
         open_m = max(9 * 60, min(14 * 60, oh * 60 + om))
@@ -568,6 +577,8 @@ def validate_and_merge_config(data_dir: Path, patch: dict[str, Any]) -> dict[str
     if "autotrade_eod_exit_time" in patch:
         eh, em = radar._parse_hhmm(str(patch["autotrade_eod_exit_time"]), default=(15, 15))
         cur["autotrade_eod_exit_time"] = f"{eh:02d}:{em:02d}"
+    if "autotrade_premarket_max_drop_pct" in patch:
+        cur["autotrade_premarket_max_drop_pct"] = round(min(30.0, abs(float(patch["autotrade_premarket_max_drop_pct"]))), 1)
     if "max_alerts_per_window" in patch:
         cur["max_alerts_per_window"] = max(1, min(10, int(patch["max_alerts_per_window"])))
     if "theme_cooldown_hours" in patch:
@@ -1553,6 +1564,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
           <div class="field-row">
             <div class="field">
+              <label for="at-cfg-be-trigger">본전보호 가동 기준 (+%, 0=비활성)</label>
+              <input id="at-cfg-be-trigger" type="number" step="0.5" min="0" max="20" />
+            </div>
+            <div class="field">
+              <label for="at-cfg-be-floor">본전보호 청산선 (+% 이하 이탈 시 매도)</label>
+              <input id="at-cfg-be-floor" type="number" step="0.1" min="-5" max="10" />
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
               <label for="at-cfg-sl">칼손절 기준 (-%)</label>
               <input id="at-cfg-sl" type="number" step="0.5" min="0.5" max="20" />
             </div>
@@ -2302,9 +2323,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById("at-cfg-open-time").value = cfg.autotrade_open_entry_time || acfg.autotrade_open_entry_time || "09:08";
         document.getElementById("at-cfg-cutoff-time").value = cfg.autotrade_entry_cutoff_time || acfg.autotrade_entry_cutoff_time || "14:00";
         document.getElementById("at-cfg-min-chg").value = cfg.autotrade_min_change_pct ?? acfg.autotrade_min_change_pct ?? -2.0;
-        document.getElementById("at-cfg-max-chg").value = cfg.autotrade_max_change_pct ?? acfg.autotrade_max_change_pct ?? 4.0;
+        document.getElementById("at-cfg-max-chg").value = cfg.autotrade_max_change_pct ?? acfg.autotrade_max_change_pct ?? 2.0;
         document.getElementById("at-cfg-tp").value = cfg.autotrade_take_profit_pct ?? acfg.autotrade_take_profit_pct ?? 5.0;
         document.getElementById("at-cfg-trail").value = cfg.autotrade_trailing_stop_pct ?? acfg.autotrade_trailing_stop_pct ?? 2.0;
+        document.getElementById("at-cfg-be-trigger").value = cfg.autotrade_breakeven_trigger_pct ?? acfg.autotrade_breakeven_trigger_pct ?? 3.0;
+        document.getElementById("at-cfg-be-floor").value = cfg.autotrade_breakeven_floor_pct ?? acfg.autotrade_breakeven_floor_pct ?? 0.3;
         document.getElementById("at-cfg-sl").value = cfg.autotrade_stop_loss_pct ?? acfg.autotrade_stop_loss_pct ?? 3.0;
         document.getElementById("at-cfg-eod-enabled").value = (cfg.autotrade_eod_exit_enabled ?? acfg.autotrade_eod_exit_enabled ?? true) ? "true" : "false";
         document.getElementById("at-cfg-eod-time").value = cfg.autotrade_eod_exit_time || acfg.autotrade_eod_exit_time || "15:15";
@@ -2764,6 +2787,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         autotrade_max_change_pct: parseFloat(document.getElementById("at-cfg-max-chg").value),
         autotrade_take_profit_pct: parseFloat(document.getElementById("at-cfg-tp").value),
         autotrade_trailing_stop_pct: parseFloat(document.getElementById("at-cfg-trail").value),
+        autotrade_breakeven_trigger_pct: parseFloat(document.getElementById("at-cfg-be-trigger").value),
+        autotrade_breakeven_floor_pct: parseFloat(document.getElementById("at-cfg-be-floor").value),
         autotrade_stop_loss_pct: parseFloat(document.getElementById("at-cfg-sl").value),
         autotrade_eod_exit_enabled: document.getElementById("at-cfg-eod-enabled").value === "true",
         autotrade_eod_exit_time: document.getElementById("at-cfg-eod-time").value.trim() || "15:15",

@@ -3818,6 +3818,373 @@ class TestStructuralGuardsNov23Fixes(unittest.TestCase):
             self.assertEqual(funnel["caution_only_blocked"], 1)
 
 
+class TestPatch20261125Improvements(unittest.TestCase):
+    def test_prev_day_backfill_preserves_historical_snapshot_and_funnel(self) -> None:
+        import base64 as _b64
+        import report_sync
+
+        t_day1_alert = datetime(2026, 11, 24, 10, 0, tzinfo=KST)
+        t_day1_eod = datetime(2026, 11, 24, 15, 37, tzinfo=KST)
+        t_day2_eod = datetime(2026, 11, 25, 15, 37, tzinfo=KST)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=False):
+            tmp_dir = Path(tmp)
+            (tmp_dir / ".env").write_text(
+                "GITHUB_REPORT_REPO=jjangna0817-hue/news-alpha-radar-logs\n"
+                "GITHUB_REPORT_TOKEN=github_pat_TEST_BACKFILL_123\n",
+                encoding="utf-8",
+            )
+            trace = radar.TraceLogger(tmp_dir / "trace.jsonl")
+            trace.emit({"ts": t_day1_alert.isoformat(), "type": "cycle_summary", "fresh_count": 2779, "cluster_count": 4657, "alerts_sent": 35})
+            trace.emit({"ts": t_day1_alert.isoformat(), "type": "caution_only_skip", "theme_key": "노이즈테마", "details": ["X"]})
+
+            pt = radar.PerformanceTracker(tmp_dir / "performance.jsonl")
+            pt.record_alert(
+                alert_ts=t_day1_alert,
+                theme_key="보안_이슈",
+                sector="사이버보안",
+                title="보안 수혜",
+                catalyst_score=8.5,
+                window="market",
+                stocks=[{"code": "263860", "name": "지니언스", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                quotes={"263860": radar.StockQuote("263860", 10000, 150, 1.5, 200000, "OPEN", "", trading_value=6_000_000_000)},
+            )
+            pt.update_pending(
+                now=t_day1_eod,
+                fetch_quotes_fn=lambda codes: {"263860": radar.StockQuote("263860", 10300, 0, 0.0, 300000, "CLOSE", "")},
+            )
+
+            gh_store: dict[str, bytes] = {}
+
+            def fake_gh(req, timeout=0):
+                url = req.full_url
+                rel = urllib.parse.unquote(url.split("/contents/", 1)[1])
+                if req.get_method() == "GET":
+                    if rel not in gh_store:
+                        raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO(b"{}"))
+                    return _FakeResponse({"sha": "s1", "content": _b64.b64encode(gh_store[rel]).decode("ascii")})
+                body = json.loads(req.data.decode("utf-8"))
+                gh_store[rel] = _b64.b64decode(body["content"])
+                return _FakeResponse({"content": {"path": rel, "sha": "s2"}}, status=201)
+
+            with mock.patch("urllib.request.urlopen", side_effect=fake_gh):
+                # Day 1 EOD sync: 0 open positions, EOD exit True, funnel has 35 alerts
+                res1 = report_sync.sync_report_to_github(tmp_dir, tmp_dir, target_date="2026-11-24", include_prev_trading_day=False, now=t_day1_eod)
+                self.assertTrue(res1["ok"])
+
+                # Simulate Day 2 changes: trace rotated (Day 1 gone), config changed (EOD False),
+                # new Day 2 open position added, and Day 1 alert gets next-day close (+16.5%)
+                (tmp_dir / "trace.jsonl").write_text("", encoding="utf-8")
+                radar.save_runtime_config(tmp_dir, {"autotrade_eod_exit_enabled": False})
+                import paper_trader
+                trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+                with mock.patch.object(report_sync, "try_background_github_sync"):
+                    trader.on_alert_candidates(
+                        alert_ts=datetime(2026, 11, 25, 9, 15, tzinfo=KST),
+                        theme_key="해운_이슈",
+                        sector="조선·해운·물류",
+                        title="해운 수혜",
+                        catalyst_score=8.5,
+                        stocks=[{"code": "011200", "name": "HMM", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                        quotes={"011200": radar.StockQuote("011200", 22000, -100, -0.45, 500000, "OPEN", "", trading_value=15_000_000_000)},
+                        runtime_cfg={"autotrade_eod_exit_enabled": False},
+                        daemon_mode=True,
+                    )
+                pt.update_pending(
+                    now=t_day2_eod,
+                    fetch_quotes_fn=lambda codes: {"263860": radar.StockQuote("263860", 11650, 0, 0.0, 500000, "CLOSE", "")},
+                )
+                # Also remove local cache to verify GitHub remote fallback works cleanly
+                cache_day1 = tmp_dir / "daily_reports" / "2026-11-24.json"
+                if cache_day1.exists():
+                    cache_day1.unlink()
+
+                res2 = report_sync.sync_report_to_github(tmp_dir, tmp_dir, target_date="2026-11-25", include_prev_trading_day=True, now=t_day2_eod)
+                self.assertTrue(res2["ok"])
+
+            day1_after = json.loads(gh_store["reports/2026-11-24.json"].decode("utf-8"))
+            # ret_next_close was backfilled!
+            self.assertAlmostEqual(day1_after["today_alert_vs_trade_matrix"][0]["ret_next_close"], 16.5, places=1)
+            self.assertEqual(day1_after["backfilled_at"], t_day2_eod.isoformat())
+            # Historical Day 1 snapshot MUST NOT be clobbered by Day 2's state!
+            self.assertEqual(day1_after["open_positions"], [])
+            self.assertTrue(day1_after["config_snapshot"]["autotrade_eod_exit_enabled"])
+            self.assertEqual(day1_after["today_funnel"]["alerts_sent_in_cycles"], 35)
+            self.assertEqual(day1_after["today_funnel"]["fresh_articles"], 2779)
+
+    def test_premarket_queue_limit_12_prevents_valid_candidate_eviction(self) -> None:
+        import paper_trader
+        import report_sync
+
+        t_pre = datetime(2026, 11, 25, 8, 15, tzinfo=KST)
+        t_open = datetime(2026, 11, 25, 9, 8, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+
+            # Queue 6 premarket alerts (scores 8.8 down to 8.0); previously the 6th (알테오젠 8.0) was evicted by [:5]
+            cands = [
+                ("163730", "핑거", 8.8),
+                ("079550", "LIG", 8.8),
+                ("011200", "HMM", 8.5),
+                ("060250", "NHN KCP", 8.5),
+                ("420770", "기가비스", 8.5),
+                ("196170", "알테오젠", 8.0),
+            ]
+            for idx, (code, name, score) in enumerate(cands):
+                trader.on_alert_candidates(
+                    alert_ts=t_pre + timedelta(minutes=idx),
+                    theme_key=f"테마_{idx}",
+                    sector="바이오",
+                    title=f"장전 이슈 {idx}",
+                    catalyst_score=score,
+                    stocks=[{"code": code, "name": name, "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                    quotes={},
+                    daemon_mode=True,
+                )
+            self.assertEqual(len(trader.load_account(t_pre)["pending_open_entries"]), 6)
+
+            # At 09:08: 핑거(-4.6%) and 기가비스(-6.1%) fail min_change_pct -> 6th candidate 알테오젠(+0.5%) MUST be bought!
+            open_quotes = {
+                "163730": radar.StockQuote("163730", 10000, -480, -4.6, 200000, "OPEN", "", trading_value=2_000_000_000),
+                "079550": radar.StockQuote("079550", 365000, -1500, -0.4, 50000, "OPEN", "", trading_value=18_000_000_000),
+                "011200": radar.StockQuote("011200", 22000, -300, -1.3, 400000, "OPEN", "", trading_value=12_000_000_000),
+                "060250": radar.StockQuote("060250", 10800, -50, -0.5, 250000, "OPEN", "", trading_value=3_000_000_000),
+                "420770": radar.StockQuote("420770", 30000, -1950, -6.1, 100000, "OPEN", "", trading_value=3_000_000_000),
+                "196170": radar.StockQuote("196170", 300000, 1500, 0.5, 50000, "OPEN", "", trading_value=25_000_000_000),
+            }
+            with mock.patch.object(report_sync, "try_background_github_sync"):
+                res = trader.tick_positions(
+                    now=t_open,
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda codes: {c: open_quotes[c] for c in codes if c in open_quotes},
+                )
+            self.assertEqual(res["bought"], 4)
+            bought_codes = set(trader.load_account(t_open)["positions"].keys())
+            self.assertIn("196170", bought_codes)
+            self.assertNotIn("163730", bought_codes)
+            self.assertNotIn("420770", bought_codes)
+
+    def test_premarket_crash_guard_blocks_severe_drop_and_allows_healthy_core_peer(self) -> None:
+        import paper_trader
+        import report_sync
+
+        t_digest = datetime(2026, 11, 24, 7, 51, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trace = radar.TraceLogger(tmp_dir / "trace.jsonl")
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+
+            # 1) Exact reproduction of 하나에어로(-18.6%) vs 한국카본(-5.06%):
+            #    하나에어로 is blocked (<= -10%), so healthy 2nd core peer 한국카본 is queued instead!
+            res1 = trader.on_alert_candidates(
+                alert_ts=t_digest,
+                theme_key="항공우주방산투자",
+                sector="방산·우주항공",
+                title="KAI 경남 투자협약",
+                catalyst_score=8.5,
+                stocks=[
+                    {"code": "271160", "name": "하나에어로", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                    {"code": "017960", "name": "한국카본", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                ],
+                quotes={
+                    "271160": radar.StockQuote("271160", 5070, -1160, -18.6, 800000, "CLOSE", "", trading_value=36_900_000_000),
+                    "017960": radar.StockQuote("017960", 12000, -640, -5.06, 400000, "CLOSE", "", trading_value=12_000_000_000),
+                },
+                daemon_mode=True,
+                trace=trace,
+            )
+            self.assertIsNotNone(res1)
+            assert res1 is not None
+            self.assertEqual(res1["action"], "queued_for_open")
+            self.assertEqual(res1["entry"]["code"], "017960")
+
+            # 2) If core crashed (-15%) and only a diffusion peer remains, do NOT substitute diffusion!
+            res2 = trader.on_alert_candidates(
+                alert_ts=t_digest + timedelta(minutes=1),
+                theme_key="급락테마",
+                sector="방산·우주항공",
+                title="급락 핵심주와 확산주",
+                catalyst_score=8.4,
+                stocks=[
+                    {"code": "999001", "name": "급락핵심주", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                    {"code": "999002", "name": "대리확산주", "direction": "상승수혜", "order_tier": "2차 파급(확산)", "revenue_link": "부분연관"},
+                ],
+                quotes={
+                    "999001": radar.StockQuote("999001", 8500, -1500, -15.0, 500000, "CLOSE", "", trading_value=10_000_000_000),
+                    "999002": radar.StockQuote("999002", 10000, 100, 1.0, 300000, "CLOSE", "", trading_value=5_000_000_000),
+                },
+                daemon_mode=True,
+                trace=trace,
+            )
+            self.assertIsNone(res2)
+
+            funnel = report_sync._summarize_traces_for_date(tmp_dir, "2026-11-24")
+            self.assertEqual(funnel["premarket_crash_blocked"], 2)
+
+            # 3) Setting autotrade_premarket_max_drop_pct=0 disables the guard for instant rollback
+            res_off = trader.on_alert_candidates(
+                alert_ts=t_digest + timedelta(minutes=2),
+                theme_key="가드해제테스트",
+                sector="방산·우주항공",
+                title="가드 비활성 확인",
+                catalyst_score=8.5,
+                stocks=[{"code": "271160", "name": "하나에어로", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "검토필요"}],
+                quotes={"271160": radar.StockQuote("271160", 5070, -1160, -18.6, 800000, "CLOSE", "", trading_value=36_900_000_000)},
+                runtime_cfg={"autotrade_premarket_max_drop_pct": 0.0},
+                daemon_mode=True,
+            )
+            self.assertIsNotNone(res_off)
+            assert res_off is not None
+            self.assertEqual(res_off["entry"]["code"], "271160")
+
+    def test_default_entry_max_change_2pct_blocks_chasing_and_is_overridable(self) -> None:
+        import paper_trader
+        import report_sync
+
+        t_mid = datetime(2026, 11, 25, 10, 0, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+            self.assertEqual(paper_trader.resolve_autotrade_config()["autotrade_max_change_pct"], 2.0)
+
+            stock = [{"code": "214430", "name": "아이쓰리시스템", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}]
+            q_chase = {"214430": radar.StockQuote("214430", 54200, 1600, 3.05, 50000, "OPEN", "", trading_value=3_000_000_000)}
+
+            with mock.patch.object(report_sync, "try_background_github_sync"):
+                # Default +2.0% cap blocks +3.05% chasing entry
+                r_blocked = trader.on_alert_candidates(
+                    alert_ts=t_mid,
+                    theme_key="추격차단테스트",
+                    sector="화재·재난안전",
+                    title="이미 +3% 상승 종목",
+                    catalyst_score=8.5,
+                    stocks=stock,
+                    quotes=q_chase,
+                    daemon_mode=True,
+                )
+                self.assertIsNone(r_blocked)
+
+                # Explicit runtime_cfg override to 4.0% allows instant rollback without code revert
+                r_override = trader.on_alert_candidates(
+                    alert_ts=t_mid + timedelta(minutes=1),
+                    theme_key="롤백오버라이드테스트",
+                    sector="화재·재난안전",
+                    title="설정 오버라이드 허용",
+                    catalyst_score=8.5,
+                    stocks=stock,
+                    quotes=q_chase,
+                    runtime_cfg={"autotrade_max_change_pct": 4.0},
+                    daemon_mode=True,
+                )
+                self.assertIsNotNone(r_override)
+                assert r_override is not None
+                self.assertEqual(r_override["action"], "bought")
+
+    def test_breakeven_stop_protects_mid_rally_and_allows_trailing_run(self) -> None:
+        import paper_trader
+        import report_sync
+
+        t0 = datetime(2026, 11, 25, 9, 20, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+
+            with mock.patch.object(report_sync, "try_background_github_sync"):
+                # Buy 2 stocks at 10,000 (+1 tick = 10,010 fill)
+                for idx, (code, name) in enumerate([("105740", "디케이락형"), ("079550", "대장주형")]):
+                    trader.on_alert_candidates(
+                        alert_ts=t0 + timedelta(minutes=idx),
+                        theme_key=f"본전테스트_{idx}",
+                        sector="방산·우주항공",
+                        title=f"테스트 {idx}",
+                        catalyst_score=8.5,
+                        stocks=[{"code": code, "name": name, "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                        quotes={code: radar.StockQuote(code, 10000, 50, 0.5, 500000, "OPEN", "", trading_value=8_000_000_000)},
+                        daemon_mode=True,
+                    )
+
+                # Step 1: Both reach +3.6% (10,370 vs 10,010) -> breakeven armed, NOT trailing armed, NOT sold!
+                r1 = trader.tick_positions(
+                    now=t0 + timedelta(minutes=15),
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda codes: {
+                        "105740": radar.StockQuote("105740", 10370, 420, 4.2, 600000, "OPEN", "", trading_value=9_000_000_000),
+                        "079550": radar.StockQuote("079550", 10370, 420, 4.2, 600000, "OPEN", "", trading_value=9_000_000_000),
+                    },
+                )
+                self.assertEqual(r1["sold"], 0)
+                acc1 = trader.load_account(t0 + timedelta(minutes=15))
+                self.assertTrue(acc1["positions"]["105740"]["breakeven_armed"])
+                self.assertFalse(acc1["positions"]["105740"]["trailing_armed"])
+
+                # Step 2: Both pull back to +1.5% (10,160) -> still ABOVE +0.3% floor, so neither is shaken out!
+                r2 = trader.tick_positions(
+                    now=t0 + timedelta(minutes=25),
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda codes: {
+                        "105740": radar.StockQuote("105740", 10160, 210, 2.1, 620000, "OPEN", "", trading_value=9_000_000_000),
+                        "079550": radar.StockQuote("079550", 10160, 210, 2.1, 620000, "OPEN", "", trading_value=9_000_000_000),
+                    },
+                )
+                self.assertEqual(r2["sold"], 0)
+
+                # Step 3: 105740 fades down to +0.2% (10,030 <= +0.3%) -> breakeven exit protects capital!
+                #         079550 resumes rally to +6.5% (10,660) -> trailing armed and held!
+                r3 = trader.tick_positions(
+                    now=t0 + timedelta(minutes=40),
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda codes: {
+                        "105740": radar.StockQuote("105740", 10030, 80, 0.8, 650000, "OPEN", "", trading_value=9_000_000_000),
+                        "079550": radar.StockQuote("079550", 10660, 710, 7.1, 700000, "OPEN", "", trading_value=10_000_000_000),
+                    },
+                )
+                self.assertEqual(r3["sold"], 1)
+                self.assertNotIn("105740", trader.load_account(t0 + timedelta(minutes=40))["positions"])
+                self.assertTrue(trader.load_account(t0 + timedelta(minutes=40))["positions"]["079550"]["trailing_armed"])
+
+                # Step 4: 079550 pulls back from 10,660 to 10,400 (-2.44% pullback) -> exits via trailing TP!
+                r4 = trader.tick_positions(
+                    now=t0 + timedelta(minutes=55),
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda codes: {
+                        "079550": radar.StockQuote("079550", 10400, 450, 4.5, 750000, "OPEN", "", trading_value=10_000_000_000),
+                    },
+                )
+                self.assertEqual(r4["sold"], 1)
+
+                trades = {tr["code"]: tr for tr in trader.load_trades(limit=10)}
+                self.assertIn("본전보호 청산", trades["105740"]["exit_reason"])
+                self.assertIn("트레일링 익절", trades["079550"]["exit_reason"])
+
+                # Step 5: Setting autotrade_breakeven_trigger_pct=0 disables breakeven for instant rollback
+                trader.on_alert_candidates(
+                    alert_ts=t0 + timedelta(minutes=60),
+                    theme_key="본전비활성테스트",
+                    sector="방산·우주항공",
+                    title="비활성 확인",
+                    catalyst_score=8.5,
+                    stocks=[{"code": "394800", "name": "비활성주", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                    quotes={"394800": radar.StockQuote("394800", 10000, 0, 0.0, 500000, "OPEN", "", trading_value=8_000_000_000)},
+                    runtime_cfg={"autotrade_breakeven_trigger_pct": 0.0},
+                    daemon_mode=True,
+                )
+                trader.tick_positions(
+                    now=t0 + timedelta(minutes=70),
+                    runtime_cfg={"autotrade_breakeven_trigger_pct": 0.0},
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda c: {"394800": radar.StockQuote("394800", 10370, 370, 3.7, 600000, "OPEN", "", trading_value=9_000_000_000)},
+                )
+                r_off = trader.tick_positions(
+                    now=t0 + timedelta(minutes=80),
+                    runtime_cfg={"autotrade_breakeven_trigger_pct": 0.0},
+                    daemon_mode=True,
+                    fetch_quotes_fn=lambda c: {"394800": radar.StockQuote("394800", 10020, 20, 0.2, 620000, "OPEN", "", trading_value=9_000_000_000)},
+                )
+                self.assertEqual(r_off["sold"], 0)
+                self.assertIn("394800", trader.load_account(t0 + timedelta(minutes=80))["positions"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
