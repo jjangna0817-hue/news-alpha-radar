@@ -792,6 +792,131 @@ def _github_put_file(
         raise RuntimeError(f"GitHub 업로드 오류 (HTTP {exc.code}): {detail}") from exc
 
 
+def _daily_report_cache_path(data_dir: Path, target_date: str) -> Path:
+    return data_dir / "daily_reports" / f"{target_date}.json"
+
+
+def _save_local_daily_bundle(data_dir: Path, target_date: str, bundle: dict[str, Any]) -> None:
+    try:
+        path = _daily_report_cache_path(data_dir, target_date)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        radar.atomic_write_text(path, json.dumps(bundle, ensure_ascii=False, indent=2) + "\n")
+    except Exception:
+        pass
+
+
+def _load_local_daily_bundle(data_dir: Path, target_date: str) -> dict[str, Any] | None:
+    path = _daily_report_cache_path(data_dir, target_date)
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else None
+    except Exception:
+        return None
+
+
+def _github_get_file_bytes(
+    *,
+    owner_repo: str,
+    rel_path: str,
+    token: str,
+    timeout: int = 15,
+) -> bytes | None:
+    """GitHub Contents REST API로 단일 파일 원본 바이트 조회 (없으면 None)."""
+    encoded_path = "/".join(urllib.parse.quote(seg, safe="") for seg in rel_path.strip("/").split("/"))
+    api_url = f"{GITHUB_API_BASE}/repos/{owner_repo}/contents/{encoded_path}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": radar.USER_AGENT,
+    }
+    get_req = urllib.request.Request(api_url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(get_req, timeout=timeout) as resp:
+            cur_obj = json.loads(resp.read().decode("utf-8"))
+            raw_b64 = str(cur_obj.get("content") or "").replace("\n", "")
+            return base64.b64decode(raw_b64) if raw_b64 else None
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        return None
+    except Exception:
+        return None
+
+
+def _merge_backfill_bundle(existing: dict[str, Any], fresh: dict[str, Any]) -> dict[str, Any]:
+    """직전 거래일 익일종가(ret_next_close) 백필 시 당시 계좌·보유포지션·설정·필터 통계를 보존하고 측정값만 병합."""
+    merged = json.loads(json.dumps(existing, ensure_ascii=False))
+
+    existing_matrix = merged.get("today_alert_vs_trade_matrix") or []
+    fresh_matrix = fresh.get("today_alert_vs_trade_matrix") or []
+    if existing_matrix and fresh_matrix:
+        fresh_by_key = {
+            (str(r.get("alert_ts") or ""), str(r.get("code") or "").zfill(6)): r
+            for r in fresh_matrix
+        }
+        seen_keys: set[tuple[str, str]] = set()
+        updated_matrix: list[dict[str, Any]] = []
+        for row in existing_matrix:
+            key = (str(row.get("alert_ts") or ""), str(row.get("code") or "").zfill(6))
+            seen_keys.add(key)
+            nrow = dict(row)
+            f_row = fresh_by_key.get(key)
+            if f_row is not None:
+                for fld in ("ret_5m", "ret_30m", "ret_close", "ret_next_close"):
+                    if f_row.get(fld) is not None:
+                        nrow[fld] = f_row[fld]
+            updated_matrix.append(nrow)
+        for f_row in fresh_matrix:
+            key = (str(f_row.get("alert_ts") or ""), str(f_row.get("code") or "").zfill(6))
+            if key not in seen_keys:
+                updated_matrix.append(dict(f_row))
+        merged["today_alert_vs_trade_matrix"] = updated_matrix
+        if not merged.get("traded_vs_skipped_summary") and fresh.get("traded_vs_skipped_summary"):
+            merged["traded_vs_skipped_summary"] = fresh["traded_vs_skipped_summary"]
+    elif fresh_matrix:
+        merged["today_alert_vs_trade_matrix"] = fresh_matrix
+        if fresh.get("traded_vs_skipped_summary"):
+            merged["traded_vs_skipped_summary"] = fresh["traded_vs_skipped_summary"]
+
+    if fresh.get("rolling_performance_summary"):
+        merged["rolling_performance_summary"] = fresh["rolling_performance_summary"]
+    if fresh.get("by_commit"):
+        merged["by_commit"] = fresh["by_commit"]
+
+    old_closed = merged.get("today_closed_trades") or []
+    new_closed = fresh.get("today_closed_trades") or []
+    if len(new_closed) > len(old_closed):
+        merged["today_closed_trades"] = new_closed
+        old_ts = dict(merged.get("today_trade_summary") or {})
+        new_ts = dict(fresh.get("today_trade_summary") or {})
+        if "open_positions_count" in old_ts:
+            new_ts["open_positions_count"] = old_ts["open_positions_count"]
+        merged["today_trade_summary"] = new_ts
+
+    # trace.jsonl 로테이션으로 과거 일자 필터 통계가 0으로 유실되는 덮어쓰기 방지
+    old_fn = merged.get("today_funnel") or {}
+    new_fn = fresh.get("today_funnel") or {}
+    old_score = (
+        int(old_fn.get("fresh_articles") or 0)
+        + int(old_fn.get("alerts_sent_in_cycles") or 0) * 100
+        + int(old_fn.get("cycles_run") or 0)
+    )
+    new_score = (
+        int(new_fn.get("fresh_articles") or 0)
+        + int(new_fn.get("alerts_sent_in_cycles") or 0) * 100
+        + int(new_fn.get("cycles_run") or 0)
+    )
+    if new_score > old_score:
+        merged["today_funnel"] = new_fn
+
+    if fresh.get("generated_at"):
+        merged["backfilled_at"] = fresh["generated_at"]
+    return merged
+
+
 def sync_report_to_github(
     data_dir: Path,
     repo_dir: Path | None = None,
@@ -813,6 +938,7 @@ def sync_report_to_github(
 
     try:
         bundle_today = build_analytics_bundle(data_dir, eff_repo, target_date=t_date, now=ref)
+        _save_local_daily_bundle(data_dir, t_date, bundle_today)
         md_today = format_ai_feedback_markdown(bundle_today)
         json_bytes = (json.dumps(bundle_today, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         md_bytes = md_today.encode("utf-8")
@@ -844,13 +970,32 @@ def sync_report_to_github(
         ):
             updated_files.append("reports/latest.json")
 
-        # 직전 거래일의 익일 종가(ret_next_close) 측정값까지 최신화 반영
+        # 직전 거래일의 익일 종가(ret_next_close) 측정값만 최신화 반영 (당시 계좌·보유·설정·필터 통계 보존)
         if include_prev_trading_day:
             try:
                 cur_d = date.fromisoformat(t_date)
                 prev_d = previous_trading_date(cur_d).isoformat()
-                bundle_prev = build_analytics_bundle(data_dir, eff_repo, target_date=prev_d, now=ref)
+                bundle_prev_fresh = build_analytics_bundle(data_dir, eff_repo, target_date=prev_d, now=ref)
+                existing_prev = _load_local_daily_bundle(data_dir, prev_d)
+                if existing_prev is None:
+                    remote_prev_bytes = _github_get_file_bytes(
+                        owner_repo=cfg["repo"],
+                        rel_path=f"reports/{prev_d}.json",
+                        token=cfg["token"],
+                    )
+                    if remote_prev_bytes:
+                        try:
+                            parsed_prev = json.loads(remote_prev_bytes.decode("utf-8"))
+                            if isinstance(parsed_prev, dict):
+                                existing_prev = parsed_prev
+                        except Exception:
+                            existing_prev = None
+                if existing_prev is not None and str(existing_prev.get("target_date") or "") == prev_d:
+                    bundle_prev = _merge_backfill_bundle(existing_prev, bundle_prev_fresh)
+                else:
+                    bundle_prev = bundle_prev_fresh
                 if bundle_prev.get("today_closed_trades") or bundle_prev.get("today_alert_vs_trade_matrix"):
+                    _save_local_daily_bundle(data_dir, prev_d, bundle_prev)
                     prev_json = (json.dumps(bundle_prev, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
                     prev_md = format_ai_feedback_markdown(bundle_prev).encode("utf-8")
                     if _github_put_file(

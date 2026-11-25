@@ -3818,6 +3818,101 @@ class TestStructuralGuardsNov23Fixes(unittest.TestCase):
             self.assertEqual(funnel["caution_only_blocked"], 1)
 
 
+class TestPatch20261125Improvements(unittest.TestCase):
+    def test_prev_day_backfill_preserves_historical_snapshot_and_funnel(self) -> None:
+        import base64 as _b64
+        import report_sync
+
+        t_day1_alert = datetime(2026, 11, 24, 10, 0, tzinfo=KST)
+        t_day1_eod = datetime(2026, 11, 24, 15, 37, tzinfo=KST)
+        t_day2_eod = datetime(2026, 11, 25, 15, 37, tzinfo=KST)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=False):
+            tmp_dir = Path(tmp)
+            (tmp_dir / ".env").write_text(
+                "GITHUB_REPORT_REPO=jjangna0817-hue/news-alpha-radar-logs\n"
+                "GITHUB_REPORT_TOKEN=github_pat_TEST_BACKFILL_123\n",
+                encoding="utf-8",
+            )
+            trace = radar.TraceLogger(tmp_dir / "trace.jsonl")
+            trace.emit({"ts": t_day1_alert.isoformat(), "type": "cycle_summary", "fresh_count": 2779, "cluster_count": 4657, "alerts_sent": 35})
+            trace.emit({"ts": t_day1_alert.isoformat(), "type": "caution_only_skip", "theme_key": "노이즈테마", "details": ["X"]})
+
+            pt = radar.PerformanceTracker(tmp_dir / "performance.jsonl")
+            pt.record_alert(
+                alert_ts=t_day1_alert,
+                theme_key="보안_이슈",
+                sector="사이버보안",
+                title="보안 수혜",
+                catalyst_score=8.5,
+                window="market",
+                stocks=[{"code": "263860", "name": "지니언스", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                quotes={"263860": radar.StockQuote("263860", 10000, 150, 1.5, 200000, "OPEN", "", trading_value=6_000_000_000)},
+            )
+            pt.update_pending(
+                now=t_day1_eod,
+                fetch_quotes_fn=lambda codes: {"263860": radar.StockQuote("263860", 10300, 0, 0.0, 300000, "CLOSE", "")},
+            )
+
+            gh_store: dict[str, bytes] = {}
+
+            def fake_gh(req, timeout=0):
+                url = req.full_url
+                rel = urllib.parse.unquote(url.split("/contents/", 1)[1])
+                if req.get_method() == "GET":
+                    if rel not in gh_store:
+                        raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO(b"{}"))
+                    return _FakeResponse({"sha": "s1", "content": _b64.b64encode(gh_store[rel]).decode("ascii")})
+                body = json.loads(req.data.decode("utf-8"))
+                gh_store[rel] = _b64.b64decode(body["content"])
+                return _FakeResponse({"content": {"path": rel, "sha": "s2"}}, status=201)
+
+            with mock.patch("urllib.request.urlopen", side_effect=fake_gh):
+                # Day 1 EOD sync: 0 open positions, EOD exit True, funnel has 35 alerts
+                res1 = report_sync.sync_report_to_github(tmp_dir, tmp_dir, target_date="2026-11-24", include_prev_trading_day=False, now=t_day1_eod)
+                self.assertTrue(res1["ok"])
+
+                # Simulate Day 2 changes: trace rotated (Day 1 gone), config changed (EOD False),
+                # new Day 2 open position added, and Day 1 alert gets next-day close (+16.5%)
+                (tmp_dir / "trace.jsonl").write_text("", encoding="utf-8")
+                radar.save_runtime_config(tmp_dir, {"autotrade_eod_exit_enabled": False})
+                import paper_trader
+                trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+                with mock.patch.object(report_sync, "try_background_github_sync"):
+                    trader.on_alert_candidates(
+                        alert_ts=datetime(2026, 11, 25, 9, 15, tzinfo=KST),
+                        theme_key="해운_이슈",
+                        sector="조선·해운·물류",
+                        title="해운 수혜",
+                        catalyst_score=8.5,
+                        stocks=[{"code": "011200", "name": "HMM", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                        quotes={"011200": radar.StockQuote("011200", 22000, -100, -0.45, 500000, "OPEN", "", trading_value=15_000_000_000)},
+                        runtime_cfg={"autotrade_eod_exit_enabled": False},
+                        daemon_mode=True,
+                    )
+                pt.update_pending(
+                    now=t_day2_eod,
+                    fetch_quotes_fn=lambda codes: {"263860": radar.StockQuote("263860", 11650, 0, 0.0, 500000, "CLOSE", "")},
+                )
+                # Also remove local cache to verify GitHub remote fallback works cleanly
+                cache_day1 = tmp_dir / "daily_reports" / "2026-11-24.json"
+                if cache_day1.exists():
+                    cache_day1.unlink()
+
+                res2 = report_sync.sync_report_to_github(tmp_dir, tmp_dir, target_date="2026-11-25", include_prev_trading_day=True, now=t_day2_eod)
+                self.assertTrue(res2["ok"])
+
+            day1_after = json.loads(gh_store["reports/2026-11-24.json"].decode("utf-8"))
+            # ret_next_close was backfilled!
+            self.assertAlmostEqual(day1_after["today_alert_vs_trade_matrix"][0]["ret_next_close"], 16.5, places=1)
+            self.assertEqual(day1_after["backfilled_at"], t_day2_eod.isoformat())
+            # Historical Day 1 snapshot MUST NOT be clobbered by Day 2's state!
+            self.assertEqual(day1_after["open_positions"], [])
+            self.assertTrue(day1_after["config_snapshot"]["autotrade_eod_exit_enabled"])
+            self.assertEqual(day1_after["today_funnel"]["alerts_sent_in_cycles"], 35)
+            self.assertEqual(day1_after["today_funnel"]["fresh_articles"], 2779)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
