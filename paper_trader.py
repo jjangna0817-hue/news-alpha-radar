@@ -52,6 +52,7 @@ DEFAULT_EOD_EXIT_ENABLED = True
 DEFAULT_EOD_EXIT_TIME = "15:15"
 DEFAULT_DAILY_MAX_LOSS_PCT = 3.0
 DEFAULT_PREMARKET_QUEUE_LIMIT = 12
+DEFAULT_PREMARKET_MAX_DROP_PCT = 10.0
 
 BUY_FEE_RATE = 0.00015
 SELL_FEE_AND_TAX_RATE = 0.00195
@@ -269,6 +270,16 @@ def resolve_autotrade_config(
             else radar._env_float("MIN_TRADING_VALUE_EOK", radar.DEFAULT_MIN_TRADING_VALUE_EOK)
         ),
     )
+    premarket_max_drop_pct = max(
+        0.0,
+        abs(
+            float(
+                cfg["autotrade_premarket_max_drop_pct"]
+                if cfg.get("autotrade_premarket_max_drop_pct") is not None
+                else radar._env_float("AUTOTRADE_PREMARKET_MAX_DROP_PCT", DEFAULT_PREMARKET_MAX_DROP_PCT)
+            )
+        ),
+    )
 
     return {
         "autotrade_enabled": enabled,
@@ -285,6 +296,7 @@ def resolve_autotrade_config(
         "autotrade_eod_exit_enabled": eod_enabled,
         "autotrade_eod_exit_time": f"{eh:02d}:{em:02d}",
         "autotrade_daily_max_loss_pct": DEFAULT_DAILY_MAX_LOSS_PCT,
+        "autotrade_premarket_max_drop_pct": round(min(30.0, premarket_max_drop_pct), 1),
         "min_trading_value_eok": min_tv_eok,
     }
 
@@ -1044,9 +1056,47 @@ class PaperAutoTrader:
 
             # 2) 평일 장전·시초 안정화 구간(07:00 ~ 09:07, 07:50 장전 요약 포함): 09:08 이후 안정화 시세 확인 후 진입하도록 대기열 적재
             if self._is_premarket_queue_hours(ref, open_entry_time=cfg["autotrade_open_entry_time"]):
-                top = ranked[0]
-                code = str(top.get("code") or "").strip().zfill(6)
-                if not code or code in (account.get("positions") or {}):
+                max_drop_pct = float(cfg.get("autotrade_premarket_max_drop_pct") or 0.0)
+                has_any_core = any(
+                    "핵심" in str(s.get("order_tier") or "") and is_second_order_candidate(s)
+                    for s in ranked
+                )
+                top: dict[str, Any] | None = None
+                code = ""
+                held_positions = account.get("positions") or {}
+                for cand in ranked:
+                    c_code = str(cand.get("code") or "").strip().zfill(6)
+                    if not c_code or c_code in held_positions:
+                        continue
+                    if "확산" in str(cand.get("order_tier") or "") and has_any_core:
+                        continue
+                    q_pre = quotes.get(c_code)
+                    if (
+                        max_drop_pct > 0.0
+                        and q_pre is not None
+                        and int(q_pre.price) > 0
+                        and float(q_pre.change_pct) <= -max_drop_pct
+                    ):
+                        logger.info(
+                            "[모의자동매매] 전일 급락주 장전 대기열 제외: %s(%s) %+.2f%% (기준 -%.1f%% 이하)",
+                            cand.get("name") or c_code, c_code, float(q_pre.change_pct), max_drop_pct,
+                        )
+                        if trace is not None:
+                            trace.emit({
+                                "ts": ref.isoformat(),
+                                "type": "paper_trade_event",
+                                "action": "skip_premarket_crash",
+                                "code": c_code,
+                                "name": str(cand.get("name") or c_code),
+                                "theme_key": theme_key,
+                                "change_pct": round(float(q_pre.change_pct), 2),
+                                "max_drop_pct": max_drop_pct,
+                            })
+                        continue
+                    top = cand
+                    code = c_code
+                    break
+                if top is None or not code:
                     return None
                 q_list: list[dict[str, Any]] = [
                     e for e in (account.get("pending_open_entries") or []) if str(e.get("code")) != code

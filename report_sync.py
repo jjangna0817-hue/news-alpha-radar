@@ -252,6 +252,7 @@ def _summarize_traces_for_date(data_dir: Path, target_date: str) -> dict[str, An
         "dedup_blocked": 0,
         "substitute_buy_blocked": 0,
         "cutoff_buy_blocked": 0,
+        "premarket_crash_blocked": 0,
         "paper_buys": 0,
         "paper_sells": 0,
         "kis_errors": 0,
@@ -318,6 +319,8 @@ def _summarize_traces_for_date(data_dir: Path, target_date: str) -> dict[str, An
                 summary["substitute_buy_blocked"] += 1
             elif act == "skip_cutoff":
                 summary["cutoff_buy_blocked"] += 1
+            elif act == "skip_premarket_crash":
+                summary["premarket_crash_blocked"] += 1
             elif "error" in act:
                 summary["kis_errors"] += 1
 
@@ -579,6 +582,7 @@ def build_analytics_bundle(
             "autotrade_entry_cutoff_time": at_cfg["autotrade_entry_cutoff_time"],
             "autotrade_eod_exit_enabled": at_cfg["autotrade_eod_exit_enabled"],
             "autotrade_eod_exit_time": at_cfg["autotrade_eod_exit_time"],
+            "autotrade_premarket_max_drop_pct": at_cfg["autotrade_premarket_max_drop_pct"],
         },
     }
 

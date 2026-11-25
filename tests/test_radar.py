@@ -3965,6 +3965,79 @@ class TestPatch20261125Improvements(unittest.TestCase):
             self.assertNotIn("163730", bought_codes)
             self.assertNotIn("420770", bought_codes)
 
+    def test_premarket_crash_guard_blocks_severe_drop_and_allows_healthy_core_peer(self) -> None:
+        import paper_trader
+        import report_sync
+
+        t_digest = datetime(2026, 11, 24, 7, 51, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trace = radar.TraceLogger(tmp_dir / "trace.jsonl")
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+
+            # 1) Exact reproduction of 하나에어로(-18.6%) vs 한국카본(-5.06%):
+            #    하나에어로 is blocked (<= -10%), so healthy 2nd core peer 한국카본 is queued instead!
+            res1 = trader.on_alert_candidates(
+                alert_ts=t_digest,
+                theme_key="항공우주방산투자",
+                sector="방산·우주항공",
+                title="KAI 경남 투자협약",
+                catalyst_score=8.5,
+                stocks=[
+                    {"code": "271160", "name": "하나에어로", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                    {"code": "017960", "name": "한국카본", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                ],
+                quotes={
+                    "271160": radar.StockQuote("271160", 5070, -1160, -18.6, 800000, "CLOSE", "", trading_value=36_900_000_000),
+                    "017960": radar.StockQuote("017960", 12000, -640, -5.06, 400000, "CLOSE", "", trading_value=12_000_000_000),
+                },
+                daemon_mode=True,
+                trace=trace,
+            )
+            self.assertIsNotNone(res1)
+            assert res1 is not None
+            self.assertEqual(res1["action"], "queued_for_open")
+            self.assertEqual(res1["entry"]["code"], "017960")
+
+            # 2) If core crashed (-15%) and only a diffusion peer remains, do NOT substitute diffusion!
+            res2 = trader.on_alert_candidates(
+                alert_ts=t_digest + timedelta(minutes=1),
+                theme_key="급락테마",
+                sector="방산·우주항공",
+                title="급락 핵심주와 확산주",
+                catalyst_score=8.4,
+                stocks=[
+                    {"code": "999001", "name": "급락핵심주", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"},
+                    {"code": "999002", "name": "대리확산주", "direction": "상승수혜", "order_tier": "2차 파급(확산)", "revenue_link": "부분연관"},
+                ],
+                quotes={
+                    "999001": radar.StockQuote("999001", 8500, -1500, -15.0, 500000, "CLOSE", "", trading_value=10_000_000_000),
+                    "999002": radar.StockQuote("999002", 10000, 100, 1.0, 300000, "CLOSE", "", trading_value=5_000_000_000),
+                },
+                daemon_mode=True,
+                trace=trace,
+            )
+            self.assertIsNone(res2)
+
+            funnel = report_sync._summarize_traces_for_date(tmp_dir, "2026-11-24")
+            self.assertEqual(funnel["premarket_crash_blocked"], 2)
+
+            # 3) Setting autotrade_premarket_max_drop_pct=0 disables the guard for instant rollback
+            res_off = trader.on_alert_candidates(
+                alert_ts=t_digest + timedelta(minutes=2),
+                theme_key="가드해제테스트",
+                sector="방산·우주항공",
+                title="가드 비활성 확인",
+                catalyst_score=8.5,
+                stocks=[{"code": "271160", "name": "하나에어로", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "검토필요"}],
+                quotes={"271160": radar.StockQuote("271160", 5070, -1160, -18.6, 800000, "CLOSE", "", trading_value=36_900_000_000)},
+                runtime_cfg={"autotrade_premarket_max_drop_pct": 0.0},
+                daemon_mode=True,
+            )
+            self.assertIsNotNone(res_off)
+            assert res_off is not None
+            self.assertEqual(res_off["entry"]["code"], "271160")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -164,6 +164,7 @@ def _effective_config(data_dir: Path) -> dict[str, Any]:
         "autotrade_entry_cutoff_time": str(at_cfg["autotrade_entry_cutoff_time"]),
         "autotrade_eod_exit_enabled": bool(at_cfg["autotrade_eod_exit_enabled"]),
         "autotrade_eod_exit_time": str(at_cfg["autotrade_eod_exit_time"]),
+        "autotrade_premarket_max_drop_pct": float(at_cfg["autotrade_premarket_max_drop_pct"]),
         "max_alerts_per_window": int(
             raw["max_alerts_per_window"]
             if raw.get("max_alerts_per_window") is not None
@@ -568,6 +569,8 @@ def validate_and_merge_config(data_dir: Path, patch: dict[str, Any]) -> dict[str
     if "autotrade_eod_exit_time" in patch:
         eh, em = radar._parse_hhmm(str(patch["autotrade_eod_exit_time"]), default=(15, 15))
         cur["autotrade_eod_exit_time"] = f"{eh:02d}:{em:02d}"
+    if "autotrade_premarket_max_drop_pct" in patch:
+        cur["autotrade_premarket_max_drop_pct"] = round(min(30.0, abs(float(patch["autotrade_premarket_max_drop_pct"]))), 1)
     if "max_alerts_per_window" in patch:
         cur["max_alerts_per_window"] = max(1, min(10, int(patch["max_alerts_per_window"])))
     if "theme_cooldown_hours" in patch:
