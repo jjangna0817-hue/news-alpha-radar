@@ -202,7 +202,7 @@ def _infer_skip_reason(
     chg = rec.get("alert_change_pct")
     if chg is not None:
         chg_f = float(chg)
-        max_chg = float(at_cfg.get("autotrade_max_change_pct", 4.0))
+        max_chg = float(at_cfg.get("autotrade_max_change_pct", 2.0))
         min_chg = float(at_cfg.get("autotrade_min_change_pct", -2.0))
         if chg_f > max_chg:
             return f"진입상한 초과({chg_f:+.2f}% > +{max_chg:.1f}%)"

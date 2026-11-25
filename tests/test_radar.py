@@ -4038,6 +4038,49 @@ class TestPatch20261125Improvements(unittest.TestCase):
             assert res_off is not None
             self.assertEqual(res_off["entry"]["code"], "271160")
 
+    def test_default_entry_max_change_2pct_blocks_chasing_and_is_overridable(self) -> None:
+        import paper_trader
+        import report_sync
+
+        t_mid = datetime(2026, 11, 25, 10, 0, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+            self.assertEqual(paper_trader.resolve_autotrade_config()["autotrade_max_change_pct"], 2.0)
+
+            stock = [{"code": "214430", "name": "아이쓰리시스템", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}]
+            q_chase = {"214430": radar.StockQuote("214430", 54200, 1600, 3.05, 50000, "OPEN", "", trading_value=3_000_000_000)}
+
+            with mock.patch.object(report_sync, "try_background_github_sync"):
+                # Default +2.0% cap blocks +3.05% chasing entry
+                r_blocked = trader.on_alert_candidates(
+                    alert_ts=t_mid,
+                    theme_key="추격차단테스트",
+                    sector="화재·재난안전",
+                    title="이미 +3% 상승 종목",
+                    catalyst_score=8.5,
+                    stocks=stock,
+                    quotes=q_chase,
+                    daemon_mode=True,
+                )
+                self.assertIsNone(r_blocked)
+
+                # Explicit runtime_cfg override to 4.0% allows instant rollback without code revert
+                r_override = trader.on_alert_candidates(
+                    alert_ts=t_mid + timedelta(minutes=1),
+                    theme_key="롤백오버라이드테스트",
+                    sector="화재·재난안전",
+                    title="설정 오버라이드 허용",
+                    catalyst_score=8.5,
+                    stocks=stock,
+                    quotes=q_chase,
+                    runtime_cfg={"autotrade_max_change_pct": 4.0},
+                    daemon_mode=True,
+                )
+                self.assertIsNotNone(r_override)
+                assert r_override is not None
+                self.assertEqual(r_override["action"], "bought")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
