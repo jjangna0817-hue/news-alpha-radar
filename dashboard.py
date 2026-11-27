@@ -153,6 +153,7 @@ def _effective_config(data_dir: Path) -> dict[str, Any]:
         "min_trading_value_eok": float(at_cfg["min_trading_value_eok"]),
         "autotrade_enabled": bool(at_cfg["autotrade_enabled"]),
         "autotrade_only_second_order": bool(at_cfg["autotrade_only_second_order"]),
+        "autotrade_block_diffusion": bool(at_cfg["autotrade_block_diffusion"]),
         "autotrade_order_amount_krw": int(at_cfg["autotrade_order_amount_krw"]),
         "autotrade_max_positions": int(at_cfg["autotrade_max_positions"]),
         "autotrade_min_change_pct": float(at_cfg["autotrade_min_change_pct"]),
@@ -538,6 +539,8 @@ def validate_and_merge_config(data_dir: Path, patch: dict[str, Any]) -> dict[str
         cur["autotrade_enabled"] = bool(patch["autotrade_enabled"])
     if "autotrade_only_second_order" in patch:
         cur["autotrade_only_second_order"] = bool(patch["autotrade_only_second_order"])
+    if "autotrade_block_diffusion" in patch:
+        cur["autotrade_block_diffusion"] = bool(patch["autotrade_block_diffusion"])
     if "autotrade_order_amount_krw" in patch:
         cur["autotrade_order_amount_krw"] = max(100_000, min(50_000_000, int(patch["autotrade_order_amount_krw"])))
     if "autotrade_max_positions" in patch:
@@ -1524,6 +1527,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
           <div class="field-row">
             <div class="field">
+              <label for="at-cfg-block-diffusion">2차 파급(확산) 단독 알림 차단</label>
+              <select id="at-cfg-block-diffusion">
+                <option value="true">켜짐 — 2차 핵심만 자동매수 · 확산 단독 알림 차단 (권장)</option>
+                <option value="false">꺼짐 — 2차 확산 단독 알림도 허용</option>
+              </select>
+            </div>
+            <div class="field"></div>
+          </div>
+          <div class="field-row">
+            <div class="field">
               <label for="at-cfg-order-manwon">1회 종목당 최대 주문금액 (만 원)</label>
               <input id="at-cfg-order-manwon" type="number" step="10" min="10" max="5000" />
             </div>
@@ -2317,6 +2330,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (!autotradeDirty) {
         document.getElementById("at-cfg-enabled").value = (cfg.autotrade_enabled ?? enabled) ? "true" : "false";
         document.getElementById("at-cfg-second-only").value = (cfg.autotrade_only_second_order ?? acfg.autotrade_only_second_order ?? true) ? "true" : "false";
+        document.getElementById("at-cfg-block-diffusion").value = (cfg.autotrade_block_diffusion ?? acfg.autotrade_block_diffusion ?? true) ? "true" : "false";
         const ordKrw = cfg.autotrade_order_amount_krw ?? acfg.autotrade_order_amount_krw ?? 1000000;
         document.getElementById("at-cfg-order-manwon").value = Math.max(10, Math.round(Number(ordKrw) / 10000));
         document.getElementById("at-cfg-max-pos").value = cfg.autotrade_max_positions ?? acfg.autotrade_max_positions ?? 4;
@@ -2779,6 +2793,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const payload = {
         autotrade_enabled: document.getElementById("at-cfg-enabled").value === "true",
         autotrade_only_second_order: document.getElementById("at-cfg-second-only").value === "true",
+        autotrade_block_diffusion: document.getElementById("at-cfg-block-diffusion").value === "true",
         autotrade_order_amount_krw: Math.round((isNaN(manwon) ? 100 : manwon) * 10000),
         autotrade_max_positions: parseInt(document.getElementById("at-cfg-max-pos").value, 10),
         autotrade_open_entry_time: document.getElementById("at-cfg-open-time").value.trim() || "09:08",

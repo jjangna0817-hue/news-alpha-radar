@@ -4184,6 +4184,85 @@ class TestPatch20261125Improvements(unittest.TestCase):
                 self.assertEqual(r_off["sold"], 0)
                 self.assertIn("394800", trader.load_account(t0 + timedelta(minutes=80))["positions"])
 
+    def test_block_standalone_diffusion_intraday_premarket_and_toggle(self) -> None:
+        import paper_trader
+        import report_sync
+
+        t_pre = datetime(2026, 11, 27, 9, 6, tzinfo=KST)
+        t_mid = datetime(2026, 11, 27, 9, 33, tzinfo=KST)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            trace = radar.TraceLogger(tmp_dir / "trace.jsonl")
+            trader = paper_trader.PaperAutoTrader(tmp_dir, tmp_dir)
+
+            self.assertTrue(paper_trader.resolve_autotrade_config()["autotrade_block_diffusion"])
+
+            # 1) Premarket diffusion-only alert (삼성전기/팬오션 case): blocked by default!
+            r_pre_blocked = trader.on_alert_candidates(
+                alert_ts=t_pre,
+                theme_key="자율주행_로봇_5G통신",
+                sector="전기전자",
+                title="삼성전기 확산 단독",
+                catalyst_score=8.2,
+                stocks=[{"code": "009150", "name": "삼성전기", "direction": "상승수혜", "order_tier": "2차 파급(확산)", "revenue_link": "부분연관"}],
+                quotes={"009150": radar.StockQuote("009150", 787000, 2000, 0.25, 200000, "OPEN", "", trading_value=600_000_000_000)},
+                daemon_mode=True,
+                trace=trace,
+            )
+            self.assertIsNone(r_pre_blocked)
+            self.assertEqual(trader.load_account(t_pre)["pending_open_entries"], [])
+
+            # 2) Intraday diffusion-only alert (현대로템/BNK금융 case): blocked by default!
+            with mock.patch.object(report_sync, "try_background_github_sync"):
+                r_mid_blocked = trader.on_alert_candidates(
+                    alert_ts=t_mid,
+                    theme_key="해외철도수주",
+                    sector="철도/인프라",
+                    title="현대로템 확산 단독",
+                    catalyst_score=8.5,
+                    stocks=[{"code": "064350", "name": "현대로템", "direction": "상승수혜", "order_tier": "2차 파급(확산)", "revenue_link": "부분연관"}],
+                    quotes={"064350": radar.StockQuote("064350", 59400, 400, 0.68, 300000, "OPEN", "", trading_value=20_000_000_000)},
+                    daemon_mode=True,
+                    trace=trace,
+                )
+                self.assertIsNone(r_mid_blocked)
+
+                # 3) Core 2nd-order stock buys normally!
+                r_core_ok = trader.on_alert_candidates(
+                    alert_ts=t_mid + timedelta(minutes=1),
+                    theme_key="철도노조_대체교통",
+                    sector="조선·해운·물류",
+                    title="동양고속 핵심 수혜",
+                    catalyst_score=8.0,
+                    stocks=[{"code": "084670", "name": "동양고속", "direction": "상승수혜", "order_tier": "2차 파급(핵심)", "revenue_link": "본업직결"}],
+                    quotes={"084670": radar.StockQuote("084670", 25900, 200, 0.78, 120000, "OPEN", "", trading_value=6_000_000_000)},
+                    daemon_mode=True,
+                    trace=trace,
+                )
+                self.assertIsNotNone(r_core_ok)
+                assert r_core_ok is not None
+                self.assertEqual(r_core_ok["action"], "bought")
+
+                # 4) Instant rollback via runtime_cfg={"autotrade_block_diffusion": False} re-allows standalone diffusion
+                r_mid_override = trader.on_alert_candidates(
+                    alert_ts=t_mid + timedelta(minutes=2),
+                    theme_key="해외철도수주_재허용",
+                    sector="철도/인프라",
+                    title="확산 허용 토글 테스트",
+                    catalyst_score=8.5,
+                    stocks=[{"code": "064350", "name": "현대로템", "direction": "상승수혜", "order_tier": "2차 파급(확산)", "revenue_link": "부분연관"}],
+                    quotes={"064350": radar.StockQuote("064350", 59400, 400, 0.68, 300000, "OPEN", "", trading_value=20_000_000_000)},
+                    runtime_cfg={"autotrade_block_diffusion": False},
+                    daemon_mode=True,
+                    trace=trace,
+                )
+                self.assertIsNotNone(r_mid_override)
+                assert r_mid_override is not None
+                self.assertEqual(r_mid_override["action"], "bought")
+
+            funnel = report_sync._summarize_traces_for_date(tmp_dir, "2026-11-27")
+            self.assertEqual(funnel["substitute_buy_blocked"], 2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

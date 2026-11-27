@@ -55,6 +55,7 @@ DEFAULT_EOD_EXIT_TIME = "15:15"
 DEFAULT_DAILY_MAX_LOSS_PCT = 3.0
 DEFAULT_PREMARKET_QUEUE_LIMIT = 12
 DEFAULT_PREMARKET_MAX_DROP_PCT = 10.0
+DEFAULT_BLOCK_DIFFUSION = True
 
 BUY_FEE_RATE = 0.00015
 SELL_FEE_AND_TAX_RATE = 0.00195
@@ -193,6 +194,12 @@ def resolve_autotrade_config(
         so_env = (os.getenv("AUTOTRADE_ONLY_SECOND_ORDER") or "true").strip().lower()
         only_2nd = so_env not in ("0", "false", "no", "off")
 
+    if cfg.get("autotrade_block_diffusion") is not None:
+        block_diffusion = bool(cfg["autotrade_block_diffusion"])
+    else:
+        bd_env = (os.getenv("AUTOTRADE_BLOCK_DIFFUSION") or ("true" if DEFAULT_BLOCK_DIFFUSION else "false")).strip().lower()
+        block_diffusion = bd_env not in ("0", "false", "no", "off")
+
     if cfg.get("autotrade_eod_exit_enabled") is not None:
         eod_enabled = bool(cfg["autotrade_eod_exit_enabled"])
     else:
@@ -305,6 +312,7 @@ def resolve_autotrade_config(
     return {
         "autotrade_enabled": enabled,
         "autotrade_only_second_order": only_2nd,
+        "autotrade_block_diffusion": block_diffusion,
         "autotrade_order_amount_krw": max(100_000, min(50_000_000, order_amt)),
         "autotrade_max_positions": max(1, min(15, max_pos)),
         "autotrade_min_change_pct": round(max(-15.0, min(15.0, min_chg)), 1),
@@ -477,11 +485,13 @@ def check_substitute_laggard_guard(
     quotes: dict[str, radar.StockQuote],
     *,
     max_change_pct: float = DEFAULT_ENTRY_MAX_CHANGE_PCT,
+    block_diffusion: bool = DEFAULT_BLOCK_DIFFUSION,
 ) -> tuple[bool, str]:
     """대리 소외주(확산·주변주) 추격 진입 차단 가드:
     1) 동일 알림 내 '핵심' 2차 후보가 1개 이상 존재하는데 모두 진입 불가였을 때,
        후순위 '확산' 주변주를 대리 매수하지 않는다.
-    2) 동일 알림 내 2차 파급 선도주가 이미 진입 상한(> max_change_pct)을 돌파했거나 상한가 잠김일 때,
+    2) block_diffusion=True(기본)이면 동일 알림에 '핵심' 후보가 없는 '2차 파급(확산)' 단독 진입도 차단한다.
+    3) 동일 알림 내 2차 파급 선도주가 이미 진입 상한(> max_change_pct)을 돌파했거나 상한가 잠김일 때,
        비핵심 주변주('확산'·일반 '2차') 대리 진입 및 역행 하락(< 0%) 소외주 진입을 차단한다.
     - '1차 직접' 종목만 급등하고 '2차 파급(핵심)'이 미반영인 구간은 본 봇의 핵심 알파 구간이므로 허용한다.
     """
@@ -496,6 +506,8 @@ def check_substitute_laggard_guard(
 
     if is_diffusion and has_any_core:
         return True, f"핵심후보 미체결 시 확산주 대리매수 금지({tier})"
+    if is_diffusion and block_diffusion:
+        return True, f"2차 확산 단독 종목 자동매수 차단({tier})"
 
     overheated_peers: list[str] = []
     overheated_core_peers: list[str] = []
@@ -1043,6 +1055,7 @@ class PaperAutoTrader:
                         ranked,
                         quotes,
                         max_change_pct=float(cfg["autotrade_max_change_pct"]),
+                        block_diffusion=bool(cfg.get("autotrade_block_diffusion", DEFAULT_BLOCK_DIFFUSION)),
                     )
                     if sub_blocked:
                         logger.info(
@@ -1081,6 +1094,7 @@ class PaperAutoTrader:
             # 2) 평일 장전·시초 안정화 구간(07:00 ~ 09:07, 07:50 장전 요약 포함): 09:08 이후 안정화 시세 확인 후 진입하도록 대기열 적재
             if self._is_premarket_queue_hours(ref, open_entry_time=cfg["autotrade_open_entry_time"]):
                 max_drop_pct = float(cfg.get("autotrade_premarket_max_drop_pct") or 0.0)
+                block_diffusion = bool(cfg.get("autotrade_block_diffusion", DEFAULT_BLOCK_DIFFUSION))
                 has_any_core = any(
                     "핵심" in str(s.get("order_tier") or "") and is_second_order_candidate(s)
                     for s in ranked
@@ -1092,7 +1106,24 @@ class PaperAutoTrader:
                     c_code = str(cand.get("code") or "").strip().zfill(6)
                     if not c_code or c_code in held_positions:
                         continue
-                    if "확산" in str(cand.get("order_tier") or "") and has_any_core:
+                    cand_tier = str(cand.get("order_tier") or "").strip()
+                    if "확산" in cand_tier and (has_any_core or block_diffusion):
+                        if block_diffusion and not has_any_core:
+                            reason = f"장전 대기열 2차 확산 단독 종목 차단({cand_tier})"
+                            logger.info(
+                                "[모의자동매매] 대리 소외주 진입 차단: %s(%s) — %s",
+                                cand.get("name") or c_code, c_code, reason,
+                            )
+                            if trace is not None:
+                                trace.emit({
+                                    "ts": ref.isoformat(),
+                                    "type": "paper_trade_event",
+                                    "action": "skip_substitute",
+                                    "code": c_code,
+                                    "name": str(cand.get("name") or c_code),
+                                    "theme_key": theme_key,
+                                    "reason": reason,
+                                })
                         continue
                     q_pre = quotes.get(c_code)
                     if (
